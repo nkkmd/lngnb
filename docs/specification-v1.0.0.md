@@ -1,6 +1,3 @@
-Warning: truncated output (original token count: 47923)
-Total output lines: 1589
-
 # lngnb 分散図書館・知識基盤 仕様設計書
 
 - **文書ID:** LNGNB-SPEC-001
@@ -704,7 +701,335 @@ HTTPSと証明書検査を標準とする。内蔵HTTPSと外部リバースプ�
 | 非公開情報の集計・状態応答 | 404、件数、pending、欠落、エラーに非公開情報を含めず、不明をゼロ/完全としない |
 | CBORとUnicode | CBOR符号化違反を拒否し、署名済みUnicodeの異なる文字列を勝手に同一化しない |
 
-同じ一次集合・本文検査根拠・pin・公開条件・規則・処理完了…7923 tokens truncated…、元CBORを書き換えない。candidate_countはその開示scopeの現在候補数の十進文字列。履歴query等で現在評価ができなければnullであり、0としない。searchの行にはmatched_revision_id、matched_fields、matched_languagesを追加し、すべて同じRevisionについて示す。schema/extensionsは初期JSON行に展開せず、固定RecordのCBORから取得する。
+同じ一次集合・本文検査根拠・pin・公開条件・規則・処理完了条件なら、到着順によらず同じ意味上の検査・候補集合になることを確認する。世代番号や観測時刻の一致は要求しない。
+
+### 18.2 軽量性と操作性の正式な合格条件（測定未実行）
+
+利用者の採用により、以下を初期版の正式な合格条件とする。性能達成済み・推奨本番スペックの保証ではない。詳細fixture・測定・判定手順は付録A12。
+
+| 項目 | 合格条件 |
+|---|---|
+| 環境 | Linux、1 vCPU相当、RAM 1 GiB、swapなし、ローカルSSD。試験ホストと構成を記録 |
+| 規模 | 1,000 Knowledge、10,000 Revision、本文合計1 GiB。分岐・多言語・16 MiB直前の本文を含む |
+| 待機RSS | 128 MiB以下 |
+| 通常閲覧・検索RSS | 256 MiB以下 |
+| 同期・再索引・起動検査RSS | 512 MiB以下。cgroup全体1 GiBでOOMしない |
+| 応答 | 同時5利用、ウォーム時の検索・固定参照メタデータが各p95 500 ms以下。本文全体転送を除く |
+| 操作 | 閲覧WebとCLIで三利用場面を完了し、通常作成にKR/Checkpoint/第二鍵を要求しない |
+
+不合格なら実装・処理方法・初期範囲を見直す。基準変更が必要なら結果と理由を示して利用者が判断する。参考値へ黙って格下げしない。保存・安全性・正直な表示を削って数値だけ合わせない。
+
+## 19. 仕様確定範囲と実装後の検証
+
+v0.1.5のD01〜D06は、本版で仕様と受入手順を確定した。実行結果を必要とする製品適合・性能・相互運用の判定は未実施であり、設計確定と混同しない。
+
+| ID | 確定内容 | 規範箇所 |
+|---|---|---|
+| D01 | Recordの厳密スキーマ、CBOR、型、上限 | 付録A1〜A2 |
+| D02 | 署名、domain、ID、鍵、受理条件、固定計算例 | 付録A3、A11、A13〜A14 |
+| D03 | Record/API/検証規則の版、未知形式の停止 | §0、付録A4 |
+| D04 | 公開scope、状態、世代、受付、一覧、引用、検索 | 付録A4〜A8 |
+| D05 | Linux保存、排他、確定順、遮断、根拠、復元 | §13〜§16、付録A9〜A10、A15 |
+| D06 | 軽量性・操作性の正式合格値、測定手順 | §18.2、付録A12 |
+
+| 実装ゲート | 対象 | 状態 |
+|---|---|---|
+| G1 | 署名・CBOR・ID・境界・未知形式の製品適合 | 未実行。仕様計算例だけでは合格としない |
+| G2 | 単体公開・検索・分岐・pin・隔離の利用場面 | 未実行 |
+| G3 | 二リレー独立検証・部分照合・再開・公開制約 | 未実行 |
+| G4 | 容量不足・障害注入・履歴・復元・索引整合 | 未実行 |
+| G5 | 小規模ホストの性能と通常操作 | 未実行 |
+
+内部の関数名、テーブル配置、索引方式、CLIのコマンド名、画面配置は、規範動作・保存境界・予算・受入条件を満たす範囲で実装裁量とする。未定義の外部形式を実装側が勝手に補うこととは区別する。
+
+v1.0.0は本版のプロファイルと規範を実装開始の基準として確定した版であり、欠陥不在や稼働検証済みの認証ではない。実装で問題が判明した場合は仕様の変更理由・ID/署名/APIへの影響を記録し、互換性を変えるなら適切な技術プロファイル版を更新する。規範を実装都合で黙って変更しない。
+
+## 20. 機能整理案51件の反映
+
+分類はA=中核維持、B=簡略化、C=後段化、D=初期対象外。整理案の分類を維持しつつ、初期規範への適用箇所を本書へ置き換えた。
+
+| ID | 機能 | 分類 | 本版の適用箇所 |
+|---|---|---|---|
+| F01 | 単一バイナリ・単体運用・SQLite | A | I-4、I-8、§13 |
+| F02 | Knowledge IDと不変Revision | A | §1、§4 |
+| F03 | Record/Blob分離・内容ハッシュ | A | §2、§13 |
+| F04 | 署名・決定的符号化・ID規則 | A | §1〜§2、付録A1〜A3 |
+| F05 | 固定参照・引用・履歴閲覧・別リレーでの固定ID指定 | A | §7.3、§8 |
+| F06 | Revision分岐と由来付き派生 | A | §4 |
+| F07 | 複数親による内容上の統合 | B | §4.2 |
+| F08 | 公開Catalog・タイトル/要約/タグ検索 | A | §8 |
+| F09 | Information Type/Resource Type/Schema分離 | A | I-6、§8 |
+| F10 | Schema参照の保持。型固有検査・表示は任意 | B | §8 |
+| F11 | 本文全文検索・高度な言語解析 | C | §22.1 |
+| F12 | 既知テキストの安全表示・未知媒体の取得 | A | §8、§16 |
+| F13 | 一件の作成から公開までのCLI支援 | B | I-7〜I-8、§7.2.1、§8、§17.1 |
+| F14 | 分岐ごとのメタデータ表示 | A | §8〜§9 |
+| F15 | KnowledgeとGenesisのローカルpin | A | §5 |
+| F16 | 初期発行者を定めるGenesis | B | §3 |
+| F17 | 原著者側の同一Knowledge改訂 | B | §3〜§4 |
+| F18 | 未確認Knowledgeの隔離・限定利用 | A | §5.2 |
+| F19 | Trust Anchorの変更・解除・訂正 | A | §5.3 |
+| F20 | Grant/Revokeと付与単位 | C | §22.2 |
+| F21 | 同一KnowledgeのTransfer/Rotate | C | §17.2、§22.2 |
+| F22 | 必須KR・RecoveryKeyRotate・Recovery | C | I-9、§22.2 |
+| F23 | 独立Checkpointと二段階正式確定 | C | §6.1、§22.2 |
+| F24 | 複数の独立承認経路 | C | §22.2 |
+| F25 | 失効境界・保護ペア集合 | C | §22.2 |
+| F26 | Authority分岐・Recovery優先の判定 | C | §22.2 |
+| F27 | 親逆依存による再評価へ簡略化 | B | §4.2、§6.3 |
+| F28 | Open/Restricted投稿 | A | §7.1 |
+| F29 | リレー固有投稿トークン | A | §7.1 |
+| F30 | 手動リレー登録・選択的Pull | A | §10 |
+| F31 | Record一覧・安定ページング・差分取得 | A | §10.2 |
+| F32 | 目録だけ/本文も含む複製 | B | §10.1 |
+| F33 | 高度なRevision選択条件による複製 | C | §22.1 |
+| F34 | 明示有効化の定期同期 | B | §10.2 |
+| F35 | 共通Record API・独立Blob API | A | §12 |
+| F36 | 独立した検証・完全性・鮮度・起点の表示 | B | §6、§9、§11 |
+| F37 | ローカル世代と一貫した応答 | A | §9.2 |
+| F38 | 公開根拠と配布制約の表示へ簡略化 | B | §7.2〜§7.3、§22.2 |
+| F39 | Blob全体転送・再開不可 | A | §2.2 |
+| F40 | Range・分割アップロード | C | §22.1 |
+| F41 | バックアップ/復元・索引再構築 | A | §13 |
+| F42 | 容量/CPU/通信/隔離の上限 | A | §15 |
+| F43 | 投稿途中・DB/Blobの障害回復、異常終了後の手動再開 | A | §13.1、§15.1〜§15.2 |
+| F44 | 重要な管理・判定変更の履歴 | B | §14 |
+| F45 | 監査ハッシュ連鎖・別保管ヘッド | C | §14、§22.2 |
+| F46 | 保持・アーカイブ・容量不足動作 | B | §13.4、§15 |
+| F47 | ローカル管理・秘密鍵の非送信 | A | I-4、§12、§17 |
+| F48 | 非公開リレー・細粒度閲覧ACL | C | §22.1 |
+| F49 | 連邦検索・推薦・ランキング | D | §22 |
+| F50 | クラスタ・分散合意・中央登録基盤 | D | I-1、§22 |
+| F51 | SNS・全世界の最新版・内容の真偽判定 | D | I-1、I-9、§22 |
+
+## 21. 変更来歴と本版の判断
+
+本節は来歴。現在の規範は第I〜II部・§18〜§20・§22の初期境界・第IV部である。
+
+| 版 | 主な変更 |
+|---|---|
+| v0.1.2 | 高度な権限管理、KR、Authority、Checkpoint等を初期条件に含む旧草案 |
+| v0.1.3 | 図書館中核を優先し、固定発行鍵・独立した状態軸・選択的Pullへ整理。高度機能は後段へ分離 |
+| v0.1.4 | 親本文矛盾の伝播、手動公開既定＋明示自動化、停止失敗時の遮断、閲覧Web＋管理CLI、一覧先行確定、別リレーの固定引用を具体化 |
+| v0.1.5 | 異常終了後の手動再開、復元token、非開示、不正根拠の保全、公開許可と配信可否を補正。意味上の文書レビュー合格と、未凍結形式・未実施試験を区別 |
+| v1.0.0 | 未確定だった①〜⑨を具体化し、バイト形式・API・保存・試験契約を統合。独自metadata、部分一致AND検索、仮保存、内蔵HTTPS、Linux、暗号化署名鍵、明示内部同期、正式性能合格値を採用 |
+
+旧Checkpointは同じ発行者が作ることも可能だったため、旧草案を常に第三者審査だったとは説明しない。高度版の署名や権限Recordを単純版へ降格して受理しない。v0.1.5の合格は当時の初期構想・意味上の規則に限定された評価であり、本版の実装ゲートG1〜G5の合格へ読み替えない。
+
+本版は軽量でシンプルな分散図書館という目的を維持する。技術的な詳細の増加は相互運用・判定・障害時の解釈を揃えるためであり、委任・連邦検索・分散合意等を初期機能へ追加するものではない。
+
+## 22. 後段の検討対象（初期規範ではない）
+
+### 22.1 利用後の改善候補
+
+本文全文検索、言語解析、管理Web画面、大容量BlobのRange/分割転送、Revision選択条件を持つ部分複製、細粒度の閲覧ACL等は、初期版で実際の必要が確認されたものから検討する。初期必須として予告しない。
+
+### 22.2 高度な権限管理
+
+委任、独立した承認Record、同じKnowledgeの鍵交代、鍵失効、復旧専用鍵とRecovery、失効前承認の維持、Authority競合解消、耐改ざん監査等は別の保証を持つ設計対象である。v0.1.2の保護ペア方式や上限をそのまま将来必須にせず、必要性・安全性・運営負担・保存版の継続性を再評価する。
+
+導入するなら、プロファイルと状態遷移、未対応実装の停止条件、既存署名の意味、IDを保つ/変える条件、事故時の限界、初期資料の移行方法を定め、適合試験を行う。初期版の単純な署名を後から独立承認や時刻証明へ格上げしない。
+
+SNS、中央登録基盤の必須化、クラスタ・全体合意、世界共通最新版、内容真偽の自動判定、連邦推薦等は初期対象外で、将来提供も約束しない。高度機能が未実装でも、初期版の分散図書館としての完成を妨げない。
+
+
+## 第IV部 実装契約・形式・試験入力
+
+本部は規範であり、概念例だけではない。第II部の意味上の規則を正確な形式・境界へ落とし込む。計算例は示した入力に対する期待値、試験手順は製品適合の確認方法である。ソフトウェア内部のコード構成は規定しない。
+
+## 付録A1 決定的CBOR
+
+プロファイルIDはASCIIの `lngnb-library-core-1` とする。Recordの署名対象と保存形式はCBOR。JSON表現は署名対象にせず、API表現は別途定義する。
+
+RFC 8949 §4.2.1のcore deterministic encodingを用いる。mapのキーは、そのキー自体を決定的CBORで符号化したバイト列の辞書順とし、長さ優先方式を別途選択しない。整数と長さの表現は最短、不定長形式は禁止。一つの入力は一つの完全なCBOR項目だけで、前後の追加バイト、CBOR sequence、自己記述tagを許さない。
+
+全mapのキーはUTF-8 text stringだけ。UTF-8の不正列、サロゲート、重複キーは禁止。Unicode文字列の正規化・大文字小文字変換・改行変換を署名済みデータへ適用しない。異なるUnicode文字列は異なる値であり、同形・正規化同値だけでは重複としない。
+
+使用できる値は整数、text string、byte string、配列、map、true、false、null。整数は -2^63 以上 2^63-1 以下。float、NaN、Infinity、CBOR tag、undefined、その他のsimple valueは禁止。boolは整数として受理しない。decimal等を独自情報として記録するときは文字列またはextensions内の明示構造で表し、リレーは意味を解釈しない。
+
+既知構造の未知キーは拒否する。独自キーを置ける場所はmetadata.extensionsと、その内部の自由mapだけ。省略可能なキーを省略した場合と、空の値を明示した場合は異なる署名データである。受信側は省略値を挿入せず、元バイトを保持する。
+
+### A1.1 規範上限
+
+| 対象 | 上限・定義 |
+|---|---|
+| Record全体 | 2,097,152 bytes。envelope全体の符号化長 |
+| container深さ | 16。最外mapを1とし、map/arrayへ入るたび1増加。primitiveは増加させない |
+| 一map | 1,024組 |
+| 一array | 4,096要素。項目別の小さい上限を優先 |
+| 一text / byte string | 1,048,576 bytes。textはUTF-8符号化長 |
+| metadata全体 | 262,144 bytes。metadata mapのCBOR符号化長 |
+| 親集合 | 256 ID |
+| origins | 128参照 |
+| タイトル・要約の言語map | 各64組 |
+| タイトル一値 | 4,096 bytes |
+| 要約一値 | 65,536 bytes |
+| tags | 128個、一個256 bytes。空文字不可 |
+| languages | 64個、一個64 ASCII bytes |
+| 自由mapのキー | 1〜256 UTF-8 bytes |
+
+小さいローカル受付予算はこれらの規範上限とは別に設定できる。ローカル予算超過を署名不正・形式不正としない。正当な親履歴の総長へ上限を追加せず、本書の規則どおり予算付きジョブで再開する。上記上限内でも全体長・metadata長を同時に満たす必要がある。
+
+## 付録A2 Recordスキーマ
+
+以下のフィールド名はASCII textの正確なキー。`b32`は長さ32のCBOR byte string、`u63`は0〜2^63-1の整数を意味する。表示用接頭辞をCBORへ埋め込まない。
+
+### A2.1 envelopeとsignature
+
+envelopeは必須キー `body`、`signature` だけを持つmap。
+
+signatureは必須キー `key_id`（b32）、`algorithm`（正確に `ed25519`）、`public_key_bytes`（b32）、`signature_bytes`（64 bytes）だけを持つmap。配列や追加署名は認めない。
+
+### A2.2 Genesis body
+
+必須キーは以下の四つだけ。
+
+| キー | 値 |
+|---|---|
+| profile_id | `lngnb-library-core-1` |
+| record_kind | `genesis` |
+| knowledge_id | b32。作成時にCSPRNGで生成 |
+| publisher_public_key | b32。signature.public_key_bytesと完全一致 |
+
+Genesisはその発行秘密鍵で自己署名する。受信者がKnowledge IDの乱数生成過程を証明できるとはしない。全ゼロを含む32 bytesという理由だけでは拒否しない。衝突・なりすましはGenesis別分離とpinで扱う。
+
+### A2.3 Revision body
+
+| キー | 必須性・型 |
+|---|---|
+| profile_id | 必須。`lngnb-library-core-1` |
+| record_kind | 必須。`revision` |
+| knowledge_id | 必須。b32 |
+| genesis_record_id | 必須。b32 |
+| parents | 必須。b32の配列。重複なし、生32 bytesの昇順。初版は空 |
+| payload | 必須。下記のmap |
+| metadata | 必須。下記のmap |
+| origins | 任意。下記の配列 |
+
+payloadは必須キー `blob_id`（b32）、`byte_length`（u63）、`media_type`（text）だけを持つ。ゼロ長本文は有効であり、空の本文も別BlobとしてIDを計算する。byte_lengthはローカルの16 MiB既定上限より大きくても、直ちにRecord不正とはしない。
+
+media_typeの未指定値は空文字 `""` とする。指定値は255 bytes以下のASCII `type/subtype` とし、両tokenは小文字 `[a-z0-9!#$&^_.+-]+`。前後空白、パラメーター、ワイルドカードは禁止。媒体が不明なら作成ツールは空文字を入れ、text/plain等を推測しない。未知の有効なtype/subtypeは保存し、安全なダウンロードとして扱える。文字コード等の補足はextensionsへ記録できるが、初期の表示処理を変更する命令とはしない。
+
+### A2.4 metadata
+
+| キー | 必須性・型 |
+|---|---|
+| information_type | 必須。必須キーnamespace（text）とcode（u63）だけのmap |
+| resource_type | 必須。後述の名前空間付きtext |
+| titles | 任意。言語ラベル→textのmap |
+| summaries | 任意。言語ラベル→textのmap |
+| tags | 任意。textの配列 |
+| languages | 任意。言語ラベルの配列 |
+| schema | 任意。後述のmap |
+| extensions | 任意。自由map |
+
+namespaceは `[a-z][a-z0-9._-]{0,63}`。codeはu63であり、9999等の小さい上限を設けない。`lngnb`の0〜9はI-6の標準表、10〜999は予約、1000以上は標準表未定義として保持する。予約・未知の番号だけで共通検証を拒否しない。作成ツールの既定は明示された `{namespace: "lngnb", code: 0}`。他名前空間の同じ番号と同一視しない。名前空間名自体は所有者や標準化機関への所属を証明しない。
+
+resource_typeは `namespace:name`。namespaceは上記、nameは `[a-z][a-z0-9._-]{0,63}`。初期標準名は `lngnb:unspecified`、`lngnb:text`、`lngnb:image`、`lngnb:audio`、`lngnb:video`、`lngnb:dataset`、`lngnb:software`、`lngnb:other`。未知の適合名も保持する。媒体不明の作成ツール既定はlngnb:unspecified。Resource Typeとmedia_typeが一致することを署名検証要件にしない。
+
+言語ラベルは1〜64 ASCII bytes、`[a-z0-9]{1,8}(-[a-z0-9]{1,8})*`。BCP 47に沿うラベルの使用を推奨するが、登録簿のオンライン照合を必須にせず、上記構文を共通受理条件とする。無指定のタイトル・要約はキー `und` を使う。作成ツールは入力ラベルを署名前にASCII小文字へ変換し、変換でキーが衝突したら利用者へ訂正を求める。受信側は大文字ラベルを黙って書き換えない。
+
+tagsとlanguagesは集合として扱い、各要素のUTF-8生バイト昇順、完全一致の重複は禁止。検索用正規化で同じになるタグは、原表記が異なれば別値として保持する。titles/summariesの値は空文字を許す。無指定のlanguagesはキー省略または空配列とし、titlesの言語から勝手に補わない。
+
+schemaは任意キー `name`、`version`（各1〜256 UTF-8 bytes）、`reference`（下記参照map）だけを持ち、少なくとも一項目を必要とする。リレーは外部取得・型固有実行を行わず保持する。自由項目はextensionsへ置く。
+
+extensions内部は付録A1の値と上限に従い、配列や入れ子mapも使える。キーを予約の共通フィールドとして解釈しない。接頭辞等による衝突回避は作成者の運用とし、中央登録・DNS到達性を必須にしない。
+
+### A2.5 originsと参照map
+
+参照mapは必須キー `knowledge_id`（b32）、任意キー `genesis_record_id`（b32）、`revision_record_id`（b32）だけ。revision_record_idがあればgenesis_record_idも必須。Knowledgeだけ、Knowledge/Genesis、完全固定参照の三形を許す。参照を親・権限・承認として解釈せず、自動取得もしない。
+
+originsは参照mapの配列で、各mapの決定的CBOR符号化バイト列の昇順、同じ符号化の重複は禁止。親集合とは別。完全形の引用にはKnowledge/Genesis/Revisionの三IDを使う。
+
+## 付録A3 署名・ハッシュ・ID
+
+`C(x)`は付録A1による決定的CBOR、`||`はバイト連結。以下のdomainは表示上の文字列ではなくASCII bytesで、末尾の `\x00` は一個のNUL byte。改行・空白・長さ接頭辞を加えない。
+
+```text
+DS = ASCII("lngnb:signature:library-core-1") || 0x00
+DR = ASCII("lngnb:record:library-core-1")    || 0x00
+DB = ASCII("lngnb:blob:1")                  || 0x00
+DK = ASCII("lngnb:key:ed25519:1")           || 0x00
+
+message        = DS || C(body)
+signature      = Ed25519.Sign(seed, message)
+key_id         = SHA-256(DK || public_key_bytes)
+record_id      = SHA-256(DR || C(envelope))
+blob_id        = SHA-256(DB || raw_blob_bytes)
+```
+
+Ed25519はRFC 8032のpure Ed25519。Ed25519ph/Ed25519ctxを選ばず、messageを事前にSHA-256へ置換しない。秘密鍵の論理入力は32 bytesのseed。拡張秘密鍵等のライブラリ内部形式を交換形式にしない。SHA-512はEd25519内部の処理であり、ID用SHA-256と取り違えない。
+
+Genesis IDとRevision IDは同じrecord_id計算。profile_idはbodyとdomainに結び付く。blob_idは資料・profile・media_type・ファイル名に依存せず、同じraw bytesなら同じID。key_idもKnowledgeやGenesisに依存せず、同じ鍵を複数資料で使える。ID計算ができることと、Record検証成功は別である。
+
+### A3.1 厳格な署名受理
+
+ライブラリ名や「strict」オプション名に受理条件を委ねない。以下をすべて満たす。
+
+1. 公開鍵Aは32 bytes、署名は64 bytes。署名をR（先頭32 bytes）とS（後半32 bytes）へ分ける。
+2. Sをlittle endian整数として解釈し、0 <= S < L。L = 2^252 + 27742317777372353535851937790883648493。
+3. AとRはRFC 8032 §5.1.3に従って点へ復号でき、再符号化が元bytesと完全一致する。非正規のy座標や、x=0で符号bit=1を許さない。
+4. AとRはともに単位元ではなく、[L]A = O、[L]R = O。小位数点と素数位数部分群外の点を拒否する。
+5. k = LE_integer(SHA-512(R_bytes || A_bytes || message)) mod L とし、[S]B = R + [k]Aを確認する。cofactorを掛けた等式だけで代用しない。
+6. key_id再計算、Genesis公開鍵一致、Revision発行鍵・Knowledge/Genesis・必要親の検査を別途行う。署名成功だけでvalid/pin/公開にならない。
+
+4の追加制約は本プロファイルの受理条件であり、RFC 8032のすべての実装が同じ追加制約を備えるとは主張しない。作成ツールもこの条件を検査し、例外的に自身の生成署名が拒否される場合は公開しない。暗号演算は実績あるライブラリを利用し、補足検査が必要なら同じ数学的条件を満たすAPIを選ぶ。
+
+### A3.2 外部ID表記
+
+RFC 4648 §6 Base32のalphabetをASCII小文字にし、paddingなしで32 bytesを表す。payload部分は正確に52文字。未使用末尾bitはゼロで、復号後の再符号化が元表記と完全一致しなければ拒否する。
+
+| 種類 | 正確な表記 |
+|---|---|
+| Knowledge | `kn1_` + 52文字 |
+| Record（Genesis/Revision） | `rc1_` + 52文字 |
+| Blob | `bl1_` + 52文字 |
+| 発行鍵 | `ky1_` + 52文字 |
+
+空白、padding、ASCII大文字、別alphabet、別接頭辞、過不足長を受理しない。Web/CLIは補正せず入力エラーを案内できる。CBOR内は種別フィールドが意味を与える生32 bytesで、接頭辞込みtextを代わりに受理しない。
+
+## 付録A4 HTTP APIと公開状態
+
+### A4.1 共通表現
+
+API版は正確に `lngnb-http-1`、意味上の検証規則版は `lngnb-validation-1`。Recordプロファイルと別に扱う。URLの/v1はこのAPI版に対応する。機能追加時に必須既存フィールドの意味を黙って変えず、未知のAPI版には対応を主張しない。
+
+通常の応答はapplication/json、UTF-8。JSONの重複キー、不正UTF-8、NaN/Infinityは禁止。CBORを返すGET /v1/records/{id}だけはapplication/cbor。Blobは付録A10のダウンロード形式。Record POSTは追加せずPUTを使う。未知のメソッドは405。未知のqueryキー・同一キーの重複・値域違反は400。queryのキー順には意味を持たせず、値はUTF-8をpercent decodeして一回だけ解釈する。全snapshot/cursorは発行時の経路・目的・既定値補完後のqueryへ束縛し、別の一覧種別で流用しない。PUTのContent-Encodingはidentityまたは省略だけとし、他は415。同期クライアントのinfo/Record-ID一覧JSONは一応答65,536 bytes、深さ16をローカル既定上限として読み、上限超過は送信元応答のpolicy_limitとして停止し、不変Recordの暗号学的不正にしない。HTTP request targetは16 KiB、request header合計は32 KiBをサービス上限既定とする。一般GETも全体毎秒100要求、接続元毎秒20要求、同時要求32件、キュー128件を既定予算にし、超過は429/503。設定は変更できるが無制限Openを既定にしない。
+
+IDは付録A3.2。u63相当の値、世代、件数、byte数はJSONでは十進文字列 `0|[1-9][0-9]*`。booleanはJSON bool、取得を要求しない状態は文字列not_requested、非開示/評価不能/未知はnull。欠落情報を0やtrueへ変換しない。page_size、HTTP status、retry_after_seconds等の小さい運用整数はJSON numberで0〜2^31-1。時刻はUTC、RFC 3339の `YYYY-MM-DDTHH:MM:SS.sssZ` に固定する。相手時刻は署名時刻証明にしない。
+
+一般応答のJSONオブジェクトへの将来の任意フィールド追加は無視できるが、未知の状態値・必須欄欠落を既知の成功に読み替えない。CBORの未知キー拒否とは別である。JSONで署名済みRecord全体の再構成を要求せず、独自byte値を取得する場合も元のCBORを使う。
+
+### A4.2 scopeと経路
+
+scopeはpublic（既定）またはuntrusted。untrustedではgenesis_idを必須とし、専用の未確認公開許可のあるものだけ返す。publicでもgenesis_idを指定した場合は現在の公開pinと一致を要求する。一般閲覧者が管理用scopeを指定する手段はない。untrustedのheads/candidate_countは、指定Genesisを仮定してvalidかつpublication=untrusted_publicで現在提示停止のない集合の極大要素を、§9.1と同じ検査済み親経路で求める。条件付きの候補でありpublisher_verified=false、trust_anchor=untrustedとする。publicの候補と混ぜない。許可されない対象と未存在対象は同じ404/not_available。Knowledgeが公開Genesisまたは公開Revisionのいずれも持たなければ、そのKnowledgeの一般状態を返さない。
+
+| メソッド・経路 | 許可query / 入力 | 応答の必須内容 |
+|---|---|---|
+| GET /v1/info | なし | api_version, record_profiles配列, validation_rules, features配列, limits |
+| GET /v1/catalog | scope, genesis_id（untrustedの場合）, page_size, snapshot_id, cursor | items, next_cursor, snapshot_id |
+| GET /v1/search | q, history, knowledge_id, information_type, resource_type, language, scope, genesis_id, page_size, snapshot_id, cursor | 同上。itemsにmatched_revision_idを含む |
+| GET /v1/knowledge/{knowledge_id} | scope, genesis_id | api_version, knowledge_id, local_state, genesis_record_id, heads, scope |
+| GET /v1/knowledge/{knowledge_id}/resolve | scope, genesis_id | 付録A4.3の四領域 |
+| GET /v1/knowledge/{knowledge_id}/records | genesis_id（必須）, scope, mode, page_size, snapshot_id, cursor | 付録A6の一覧 |
+| GET /v1/records | knowledge_idとgenesis_id（必須）、scope, mode, page_size, snapshot_id, cursor | 直上と同じ。全リレー内部Recordの無条件一覧にはしない |
+| GET /v1/records/{record_id} | scope, genesis_id（untrusted時必須） | 元の正規CBOR。Knowledge/GenesisはRecordから照合 |
+| GET /v1/records/{record_id}/verification | scope, genesis_id | record_id, knowledge_id, genesis_record_id, local_state, record_validation, trust_anchor, payload_status, reasons |
+| GET /v1/blobs/{blob_id} | scope, genesis_id（untrusted時必須） | 現在の公開根拠のある生本文 |
+| PUT /v1/records | application/cborの完成envelope。queryなし | 付録A4.4の受付票 |
+| PUT /v1/blobs/{blob_id} | application/octet-streamの全体本文。queryなし | 付録A4.4の受付票 |
+| GET /v1/receipts/{receipt_id} | queryなし、receipt secretをBearerで提示 | 自分の受付状態のみ |
+| GET /v1/knowledge/{knowledge_id}/genesis-candidates | page_size, snapshot_id, cursor | 明示未確認公開を持つ候補Genesisとその公開情報のみ |
+
+info.limitsはmax_record_bytes、max_blob_bytes、max_page_size、snapshot_ttl_secondsだけを数値/十進文字列の共通規則で返す。内部容量・隔離件数・秘密URLは含めない。featuresの初期必須値はcatalog、metadata_search、fixed_reference、pull_listing、staged_upload、receipt_status。mode既定はmetadata。historyは文字列true/falseで既定false。information_typeフィルタはnamespace:十進code。resource_typeは付録A2の正確な値。languageは付録A2の正確なラベルで、metadata.languagesへの厳密な包含を要求する。フィルタ同士はANDで同一Revisionへ適用する。qは省略可能だが、searchはqまたは少なくとも一つの厳密フィルタを必須とする。qを省略した場合は文字列条件だけを課さず、指定したフィルタで検索する。明示された空のqは400。
+
+infoのapi_version/validation_rulesはそれぞれ版IDの文字列、record_profilesは対応プロファイルIDの配列。limitsのbyte数は十進文字列、max_page_size/snapshot_ttl_secondsは小さい運用整数。genesis-candidates応答の必須キーはapi_version、knowledge_id、items、snapshot_id、next_cursor。各itemはgenesis_record_id、trust_anchor（常にuntrusted）、revision_ids（その経路から配布できるRevisionのID配列）、local_state。候補の内部総数は返さない。一itemのrevision_idsも最大500件とし、全Revisionは当該Genesisのrecords一覧を使う。この配列は先頭500件の生ID順で、revision_ids_truncatedというboolを必須とする。
+
+一覧の初回はsnapshot_id/cursorなし。後続は初回応答のsnapshot_idとnext_cursorを両方指定し、その他queryを同一に保つ。一覧応答はapi_version, profile_id, knowledge_id, genesis_record_id, scope, mode, snapshot_id, expires_at, record_ids, next_cursor, listing_complete。record_idsは外部表記の配列。cursorのないsnapshot_id指定で最初のページを再取得できる。page_sizeを途中変更しない。token/cursorはそれぞれst1_/cu1_ + CSPRNG32 bytesの小文字Base32。秘匿情報をtoken文字列へ埋め込まない。
+
+Catalog/searchは公開された `(knowledge_id, genesis_id, revision_id)` 行の固定リストでページングする。初期の一行は一Revisionとし、通常は現在候補、history=trueなら同じ公開スコープの全保持公開版。並び順は生Knowledge ID、Genesis ID、Revision IDの昇順。代表語を合成しない。固定cursorはscope/query/行ID集合に束縛し、付録A6と同じ期限・件数・容量予算を使う。横断一覧は複数Knowledgeの状態を一世代であるとは主張せず、各行の現在公開条件を検査する。現在候補を求めるqueryで、必要な公開範囲の現在評価が確定できなければ503とし、不明な集合を完全な結果としない。履歴queryは独立して安全に評価できる版を対象にできる。非公開だけの評価待ちを一般queryの失敗条件へ加えない。公開範囲の縮小を検出したら旧cursorを失効する。検索索引が未完了なら古い候補を返さず、一次メタデータから同じ条件で再評価するか503/index_unavailableとする。
+
+Catalog/searchの各行はknowledge_id、genesis_record_id、revision_id、local_state、titles、summaries、tags、information_type、resource_type、languages、payload_status、candidate_countを持つ。未設定の任意metadataは空map/空配列として表示用に返せるが、元CBORを書き換えない。candidate_countはその開示scopeの現在候補数の十進文字列。履歴query等で現在評価ができなければnullであり、0としない。searchの行にはmatched_revision_id、matched_fields、matched_languagesを追加し、すべて同じRevisionについて示す。schema/extensionsは初期JSON行に展開せず、固定RecordのCBORから取得する。
 
 ### A4.3 四領域と非開示の世代
 
