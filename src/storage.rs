@@ -16,7 +16,7 @@ use std::{
 };
 
 pub const IMPLEMENTATION: &str = "lngnb-rust-sqlite-1";
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 const DB: &str = "database.sqlite";
 const SCHEMA: &str = "
 CREATE TABLE storage_state (
@@ -83,9 +83,23 @@ CREATE TABLE evaluation_state (
  singleton INTEGER PRIMARY KEY CHECK(singleton=1),
  dirty INTEGER NOT NULL CHECK(dirty IN (0,1)),
  generation INTEGER,
- job_started INTEGER NOT NULL CHECK(job_started IN (0,1))
+ job_started INTEGER NOT NULL CHECK(job_started IN (0,1)),
+ input_started INTEGER NOT NULL CHECK(input_started IN (0,1)),
+ record_epoch INTEGER NOT NULL CHECK(record_epoch>=0)
 ) STRICT;
-INSERT INTO evaluation_state VALUES(1,1,NULL,0);
+INSERT INTO evaluation_state VALUES(1,1,NULL,0,0,0);
+CREATE TABLE evaluation_input (
+ singleton INTEGER PRIMARY KEY CHECK(singleton=1), epoch INTEGER NOT NULL CHECK(epoch>=0),
+ cursor BLOB CHECK(cursor IS NULL OR length(cursor)=32),
+ records INTEGER NOT NULL CHECK(records>=0), bytes INTEGER NOT NULL CHECK(bytes>=0),
+ edges INTEGER NOT NULL CHECK(edges>=0), complete INTEGER NOT NULL CHECK(complete IN (0,1)),
+ digest BLOB NOT NULL CHECK(length(digest)=32), checkpoint_generation INTEGER NOT NULL CHECK(checkpoint_generation>=0)
+) STRICT;
+CREATE TABLE evaluation_nodes (
+ record_id BLOB PRIMARY KEY NOT NULL REFERENCES records(id),
+ source_length INTEGER NOT NULL CHECK(source_length BETWEEN 1 AND 2097152),
+ summary BLOB NOT NULL CHECK(length(summary) BETWEEN 1 AND 16384)
+) STRICT;
 CREATE TABLE evaluation_job (
  singleton INTEGER PRIMARY KEY CHECK(singleton=1),
  input BLOB NOT NULL CHECK(length(input)=32),
@@ -98,7 +112,7 @@ CREATE TABLE evaluation_work (
  record_id BLOB PRIMARY KEY NOT NULL REFERENCES records(id),
  result BLOB NOT NULL CHECK(length(result) BETWEEN 1 AND 1024)
 ) STRICT;
-CREATE TRIGGER record_invalidates_evaluation AFTER INSERT ON records BEGIN UPDATE evaluation_state SET dirty=1; END;
+CREATE TRIGGER record_invalidates_evaluation AFTER INSERT ON records BEGIN UPDATE evaluation_state SET dirty=1,record_epoch=record_epoch+1; END;
 CREATE TRIGGER blob_invalidates_evaluation AFTER INSERT ON blobs BEGIN UPDATE evaluation_state SET dirty=1; END;
 CREATE TRIGGER failed_blob_invalidates_evaluation AFTER INSERT ON blob_failures BEGIN UPDATE evaluation_state SET dirty=1; END;
 CREATE TRIGGER changed_blob_failure_invalidates_evaluation AFTER UPDATE ON blob_failures BEGIN UPDATE evaluation_state SET dirty=1; END;
@@ -147,6 +161,7 @@ pub enum StorageError {
     BlobHashMismatch,
     InvalidBlobId,
     InspectionPending,
+    EvaluationInputPending,
 }
 impl std::fmt::Display for StorageError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -164,6 +179,7 @@ impl std::fmt::Display for StorageError {
             Self::BlobHashMismatch => "transfer_hash_mismatch",
             Self::InvalidBlobId => "invalid_blob_id",
             Self::InspectionPending => "startup_inspection_pending",
+            Self::EvaluationInputPending => "evaluation_input_pending",
         })
     }
 }
@@ -392,6 +408,8 @@ fn check_format(conn: &Connection) -> Result<()> {
         "record_inspection_complete",
         "evaluation_job_pending",
         "evaluation_job_complete",
+        "evaluation_input_pending",
+        "evaluation_input_complete",
     ]
     .contains(&audit_state.as_str())
     {
@@ -809,8 +827,9 @@ pub use blobs::{BlobRecovery, BlobStored};
 #[path = "evaluation.rs"]
 mod evaluation;
 pub use evaluation::{
-    Assessment, EvaluationJob, EvaluationLimits, EvaluationProgress, EvaluationSnapshot,
-    EvaluationStepBudget, PayloadReason, PayloadStatus, Reason, Validation,
+    Assessment, EvaluationInputBudget, EvaluationInputProgress, EvaluationJob, EvaluationLimits,
+    EvaluationProgress, EvaluationSnapshot, EvaluationStepBudget, PayloadReason, PayloadStatus,
+    Reason, Validation,
 };
 
 #[path = "record_inspection.rs"]
