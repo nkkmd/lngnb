@@ -283,6 +283,7 @@ fn blob_result_and_record_checkpoint_rollback_with_history_failure() {
     for (table, operation) in [
         ("blob_inspection_files", "INSERT"),
         ("blob_inspection_files", "UPDATE"),
+        ("blob_inspection_inventory", "UPDATE"),
         ("record_inspection", "UPDATE"),
         ("history", "INSERT"),
     ] {
@@ -401,4 +402,53 @@ fn retained_ledger_length_change_cannot_reuse_an_old_manifest() {
         .unwrap();
     drop(conn);
     assert!(RecordInspection::open(&t.data(), Limits::default()).is_err());
+}
+
+#[test]
+fn a_changed_valid_result_value_cannot_erase_a_persisted_recovery_finding() {
+    for finding in 0..3 {
+        let t = Temp::new();
+        let mut w = t.store().begin().unwrap();
+        if finding == 0 {
+            w.put_blob(id::blob_id(b"bad"), Cursor::new(b"bad"))
+                .unwrap();
+        }
+        w.finish().unwrap();
+        let p = if finding == 0 {
+            let p = blob_path(&t, b"bad");
+            std::fs::write(&p, b"BAD").unwrap();
+            p
+        } else if finding == 1 {
+            let p = blob_path(&t, b"free");
+            std::fs::write(&p, b"free").unwrap();
+            p
+        } else {
+            let p = path(&t, "staging", &format!("{}.part", "c".repeat(64)));
+            std::fs::write(&p, b"part").unwrap();
+            p
+        };
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut check = start(&t);
+        assert!(
+            check
+                .step(InspectionBudget {
+                    blob_bytes: 4,
+                    ..budget()
+                })
+                .unwrap()
+                .checks_complete
+        );
+        assert!(check.store.blob_recovery().needs_review());
+        drop(check);
+        let conn = Connection::open(t.data().join(DB)).unwrap();
+        assert_eq!(
+            conn.execute("UPDATE blob_inspection_files SET result='verified'", [])
+                .unwrap(),
+            1
+        );
+        drop(conn);
+        let before = std::fs::read(t.data().join(DB)).unwrap();
+        assert!(RecordInspection::open(&t.data(), Limits::default()).is_err());
+        assert_eq!(before, std::fs::read(t.data().join(DB)).unwrap());
+    }
 }

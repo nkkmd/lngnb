@@ -57,12 +57,14 @@ fn digest(rows: &[Entry]) -> [u8; 32] {
             &row.area,
             &row.name,
             row.fingerprint.as_deref().unwrap_or(""),
+            &row.result,
         ] {
             h.update((s.len() as u64).to_be_bytes());
             h.update(s.as_bytes());
         }
         h.update(row.expected.unwrap_or(-1).to_be_bytes());
         h.update(row.size.unwrap_or(-1).to_be_bytes());
+        h.update(row.examined.to_be_bytes());
     }
     h.finalize().into()
 }
@@ -263,7 +265,7 @@ pub(super) fn prepare(
     budget: InspectionBudget,
     start: Instant,
 ) -> Result<BlobPlan> {
-    let (saved, mut rows, fresh) = match load(store, epoch)? {
+    let (mut saved, mut rows, fresh) = match load(store, epoch)? {
         Some((saved, rows)) => (saved, rows, false),
         None => {
             let (s, r) = inventory(store, epoch)?;
@@ -330,7 +332,7 @@ pub(super) fn prepare(
     if pending && work == 0 {
         return Err(StorageError::BudgetExceeded);
     }
-    let done = !pending && start.elapsed() < budget.elapsed;
+    let mut done = !pending && start.elapsed() < budget.elapsed;
     if done {
         let check: String = store
             .conn
@@ -338,7 +340,12 @@ pub(super) fn prepare(
         if check != "ok" {
             return Err(StorageError::Corrupt);
         }
+        done = start.elapsed() < budget.elapsed;
     }
+    if !done && work == 0 {
+        return Err(StorageError::BudgetExceeded);
+    }
+    saved.digest = digest(&rows);
     let (files, bytes) = totals(&rows)?;
     Ok(BlobPlan {
         inventory: saved,
@@ -387,6 +394,13 @@ impl BlobPlan {
                 let row = &self.rows[*index];
                 if tx.execute("UPDATE blob_inspection_files SET result=?1,examined_bytes=?2 WHERE area=?3 AND name=?4 AND result='pending'",params![&row.result,row.examined,&row.area,&row.name])?!=1{return Err(StorageError::Corrupt);}
             }
+        }
+        if tx.execute(
+            "UPDATE blob_inspection_inventory SET digest=?1 WHERE singleton=1 AND epoch=?2",
+            params![&self.inventory.digest, self.inventory.epoch],
+        )? != 1
+        {
+            return Err(StorageError::Corrupt);
         }
         Ok(())
     }
