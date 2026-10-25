@@ -98,11 +98,12 @@ pub(super) fn verify_file(
 ) -> Result<(File, u64)> {
     let mut file = checked_file(dir, &hex(&id.bytes))?;
     let expected_len = file.metadata()?.len();
-    if expected_len > budget {
-        return Err(StorageError::BudgetExceeded);
-    }
+    // 台帳/確定転送と異なる物理長は破損。検査の予算不足と混同しない。
     if length.is_some_and(|n| n != expected_len) {
         return Err(StorageError::Corrupt);
+    }
+    if expected_len > budget {
+        return Err(StorageError::BudgetExceeded);
     }
     let mut hash = BlobHasher::default();
     let mut total = 0u64;

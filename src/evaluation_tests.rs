@@ -833,3 +833,51 @@ fn process_kill_before_evaluation_commit_keeps_old_snapshot_dirty_and_requires_r
         Some(Reason::DeclaredLengthMismatch),
     );
 }
+
+#[test]
+fn appended_retained_blob_is_corruption_not_a_policy_limit() {
+    use std::io::Write;
+    let t = Temp::new();
+    let mut w = t.store().begin().unwrap();
+    w.insert(&fixture()).unwrap();
+    let bad = rev(&[], 15, "bad");
+    let child = rev(&[bad.id()], 14, "child");
+    for r in [&bad, &child] {
+        w.insert(r).unwrap();
+    }
+    w.put_blob(id::blob_id(&bytes()), Cursor::new(bytes()))
+        .unwrap();
+    snapshot(&mut w);
+    // 台帳14 bytes、物理15 bytes。全体予算には余裕があり、不正根拠を再検査できない破損。
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(blob_path(&t))
+        .unwrap()
+        .write_all(b"x")
+        .unwrap();
+    let s = w.store.evaluate(EvaluationLimits::default()).unwrap();
+    for r in [&bad, &child] {
+        assert_state(
+            &s,
+            r,
+            Validation::Pending,
+            Some(Reason::EvidenceUnavailable),
+        );
+    }
+    assert!(matches!(
+        w.revalidate(EvaluationLimits::default()),
+        Err(StorageError::Corrupt)
+    ));
+    assert!(matches!(w.finish(), Err(StorageError::UnresolvedFailure)));
+    let store = RecordStore::open(&t.data(), Limits::default()).unwrap();
+    assert_eq!(store.startup_state().unwrap(), StartupState::NeedsReview);
+    let s = store.evaluate(EvaluationLimits::default()).unwrap();
+    for r in [&bad, &child] {
+        assert_state(
+            &s,
+            r,
+            Validation::Pending,
+            Some(Reason::EvidenceUnavailable),
+        );
+    }
+}
