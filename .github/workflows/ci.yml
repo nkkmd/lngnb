@@ -1,0 +1,41 @@
+name: Rust CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  rust:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install pinned toolchain
+        run: |
+          rustup toolchain install 1.85.0 --profile minimal --component rustfmt --component clippy
+          rustc --version --verbose
+          cargo --version
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Lint
+        run: cargo clippy --locked --offline --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --locked --offline --all-targets
+      - name: Release build
+        run: cargo build --locked --offline --release
+      - name: CLI smoke test
+        run: |
+          ./target/release/lngnb --help
+          ./target/release/lngnb --version
+          ./target/release/lngnb config show
+          if ./target/release/lngnb serve; then
+            echo 'Unimplemented operation returned success' >&2
+            exit 1
+          fi
+      - name: No tracked changes or runtime data
+        run: |
+          git diff --exit-code
+          test ! -e lngnb-data
