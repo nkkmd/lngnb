@@ -266,7 +266,10 @@ fn altered_checkpoint_metadata_or_audit_is_rejected_without_reinitializing() {
         // CHECK制約そのものが拒否する不正値も、無断修復せず保持する。
         let changed = conn.execute(sql, []);
         drop(conn);
-        if changed.is_ok() {
+        if sql == "UPDATE record_inspection SET source_epoch=-1" {
+            assert!(changed.is_err());
+        } else {
+            changed.unwrap();
             let before = std::fs::read(t.data().join(DB)).unwrap();
             assert!(RecordInspection::open(&t.data(), Limits::default()).is_err());
             assert_eq!(before, std::fs::read(t.data().join(DB)).unwrap());
