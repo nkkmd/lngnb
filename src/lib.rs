@@ -1,7 +1,9 @@
-//! 初期プロファイルの局所検査。親履歴・pin・公開・保存の判定は含まない。
+//! 初期プロファイルの局所検査と開発中の保存基盤。親履歴・pin・公開の判定は未実装。
 pub mod cbor;
 pub mod id;
 pub mod record;
+#[cfg(target_os = "linux")]
+pub mod storage;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {

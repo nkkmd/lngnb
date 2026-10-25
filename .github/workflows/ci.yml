@@ -29,7 +29,14 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Lint
         run: cargo clippy --locked --offline --all-targets -- -D warnings
+      - name: Storage test environment
+        run: |
+          uname -srmo
+          df -T "$RUNNER_TEMP"
+          stat -f -c 'filesystem=%T block_size=%S' "$RUNNER_TEMP"
       - name: Test
+        env:
+          TMPDIR: ${{ runner.temp }}
         run: cargo test --locked --offline --all-targets
       - name: Release build
         run: cargo build --locked --offline --release
