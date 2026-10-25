@@ -178,6 +178,8 @@ pub enum StorageError {
     InvalidBlobId,
     InspectionPending,
     EvaluationInputPending,
+    StaleRecoveryReview,
+    InvalidRecoveryReview,
 }
 impl std::fmt::Display for StorageError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -196,6 +198,8 @@ impl std::fmt::Display for StorageError {
             Self::InvalidBlobId => "invalid_blob_id",
             Self::InspectionPending => "startup_inspection_pending",
             Self::EvaluationInputPending => "evaluation_input_pending",
+            Self::StaleRecoveryReview => "stale_recovery_review",
+            Self::InvalidRecoveryReview => "invalid_recovery_review",
         })
     }
 }
@@ -847,7 +851,8 @@ mod evaluation;
 pub use evaluation::{
     Assessment, EvaluationBlobBudget, EvaluationBlobProgress, EvaluationInputBudget,
     EvaluationInputProgress, EvaluationJob, EvaluationLimits, EvaluationProgress,
-    EvaluationSnapshot, EvaluationStepBudget, PayloadReason, PayloadStatus, Reason, Validation,
+    EvaluationSnapshot, EvaluationStepBudget, EvidenceRecoveryReview, PayloadReason, PayloadStatus,
+    Reason, Validation,
 };
 
 #[path = "record_inspection.rs"]

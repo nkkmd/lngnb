@@ -768,3 +768,7 @@ pub use preparation::{EvaluationInputBudget, EvaluationInputProgress};
 #[path = "evaluation_blob_input.rs"]
 mod blob_preparation;
 pub use blob_preparation::{EvaluationBlobBudget, EvaluationBlobProgress};
+
+#[path = "recovery_review.rs"]
+mod recovery_review;
+pub use recovery_review::EvidenceRecoveryReview;
