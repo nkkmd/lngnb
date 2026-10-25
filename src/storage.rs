@@ -16,7 +16,7 @@ use std::{
 };
 
 pub const IMPLEMENTATION: &str = "lngnb-rust-sqlite-1";
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 const DB: &str = "database.sqlite";
 const SCHEMA: &str = "
 CREATE TABLE storage_state (
@@ -39,18 +39,39 @@ CREATE TABLE record_inspection (
  cursor BLOB CHECK(cursor IS NULL OR length(cursor)=32),
  checked_records INTEGER NOT NULL CHECK(checked_records>=0),
  checked_bytes INTEGER NOT NULL CHECK(checked_bytes>=0),
- checkpoint_generation INTEGER
+ checkpoint_generation INTEGER,
+ checked_blob_files INTEGER NOT NULL CHECK(checked_blob_files>=0),
+ checked_blob_bytes INTEGER NOT NULL CHECK(checked_blob_bytes>=0)
 ) STRICT;
-INSERT INTO record_inspection VALUES(1,0,'idle',NULL,0,0,NULL);
+INSERT INTO record_inspection VALUES(1,0,'idle',NULL,0,0,NULL,0,0);
+CREATE TABLE blob_inspection_inventory (
+ singleton INTEGER PRIMARY KEY CHECK(singleton=1), epoch INTEGER NOT NULL CHECK(epoch>=0),
+ blobs_fingerprint TEXT NOT NULL, staging_fingerprint TEXT NOT NULL, digest BLOB NOT NULL CHECK(length(digest)=32)
+) STRICT;
+CREATE TABLE blob_inspection_files (
+ area TEXT NOT NULL CHECK(area IN ('blobs','staging')), name TEXT NOT NULL,
+ expected_length INTEGER CHECK(expected_length IS NULL OR expected_length>=0),
+ size INTEGER CHECK(size IS NULL OR size>=0), fingerprint TEXT,
+ result TEXT NOT NULL CHECK(result IN ('pending','verified','orphaned','missing','corrupt','incomplete')),
+ examined_bytes INTEGER NOT NULL CHECK(examined_bytes>=0),
+ PRIMARY KEY(area,name)
+) STRICT;
 CREATE TRIGGER record_invalidates_inspection AFTER INSERT ON records BEGIN
  UPDATE record_inspection SET source_epoch=source_epoch+1,
  phase=CASE WHEN phase IN ('records','blobs') THEN 'records' ELSE 'idle' END,
- cursor=NULL,checked_records=0,checked_bytes=0,checkpoint_generation=NULL;
+ cursor=NULL,checked_records=0,checked_bytes=0,checkpoint_generation=NULL,checked_blob_files=0,checked_blob_bytes=0;
+ DELETE FROM blob_inspection_files; DELETE FROM blob_inspection_inventory;
 END;
 CREATE TABLE blobs (
  id BLOB PRIMARY KEY NOT NULL CHECK(length(id)=32),
  byte_length INTEGER NOT NULL CHECK(byte_length>=0)
 ) STRICT;
+CREATE TRIGGER blob_invalidates_inspection AFTER INSERT ON blobs BEGIN
+ UPDATE record_inspection SET source_epoch=source_epoch+1,
+ phase=CASE WHEN phase IN ('records','blobs') THEN 'records' ELSE 'idle' END,
+ cursor=NULL,checked_records=0,checked_bytes=0,checkpoint_generation=NULL,checked_blob_files=0,checked_blob_bytes=0;
+ DELETE FROM blob_inspection_files; DELETE FROM blob_inspection_inventory;
+END;
 CREATE TRIGGER blobs_no_update BEFORE UPDATE ON blobs BEGIN SELECT RAISE(ABORT,'immutable_blob'); END;
 CREATE TRIGGER blobs_no_delete BEFORE DELETE ON blobs BEGIN SELECT RAISE(ABORT,'immutable_blob'); END;
 CREATE TABLE blob_failures (
@@ -482,6 +503,7 @@ impl RecordStore {
     /// 欠損DB・未知保存版を作成/移行しない。稼働中印は読取りで解除しない。
     pub fn open(path: &Path, limits: Limits) -> Result<Self> {
         let mut store = Self::open_locked(path, limits)?;
+        inspection::validate_aux(&store)?;
         store.check_records()?;
         store.records_checked = true;
         store.blob_recovery = store.scan_blobs()?;

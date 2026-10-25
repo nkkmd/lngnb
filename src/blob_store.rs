@@ -51,14 +51,14 @@ pub(super) fn blob_directory(root: &OwnedFd, name: &str) -> Result<OwnedFd> {
     }
     Ok(fd)
 }
-fn hex(bytes: &[u8; 32]) -> String {
+pub(super) fn hex(bytes: &[u8; 32]) -> String {
     use std::fmt::Write;
     bytes.iter().fold(String::with_capacity(64), |mut text, b| {
         write!(text, "{b:02x}").expect("writing to String");
         text
     })
 }
-fn parse_name(name: &str) -> Result<Id> {
+pub(super) fn parse_name(name: &str) -> Result<Id> {
     if name.len() != 64
         || !name
             .bytes()
@@ -76,7 +76,7 @@ fn parse_name(name: &str) -> Result<Id> {
         bytes,
     })
 }
-fn checked_file(dir: &OwnedFd, name: &str) -> Result<File> {
+pub(super) fn checked_file(dir: &OwnedFd, name: &str) -> Result<File> {
     let file: File = fs::openat(
         dir,
         name,
@@ -125,7 +125,7 @@ pub(super) fn verify_file(
     file.seek(SeekFrom::Start(0))?;
     Ok((file, total))
 }
-fn entries(dir: &OwnedFd, remaining: &mut u64) -> Result<Vec<String>> {
+pub(super) fn entries(dir: &OwnedFd, remaining: &mut u64) -> Result<Vec<String>> {
     let mut names = Vec::new();
     for entry in std::fs::read_dir(anchored(dir, "."))? {
         if *remaining == 0 {
