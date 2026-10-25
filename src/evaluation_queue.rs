@@ -26,7 +26,7 @@ pub struct EvaluationProgress {
 }
 pub struct EvaluationJob {
     pub(super) writer: RecordWriter,
-    started_clean: bool,
+    pub(super) started_clean: bool,
     #[cfg(test)]
     pub(super) pause_at: Option<&'static str>,
 }
@@ -383,14 +383,7 @@ impl EvaluationJob {
         let start = Instant::now();
         // 旧台帳の不整合を入力変更によるリセットで隠さない。
         let saved = load(&self.writer.store, &Budget { start, limits })?;
-        let mut c = match preparation::ready(&self.writer.store, &Budget { start, limits })? {
-            Some((record_epoch, nodes)) => self.writer.store.evaluation_from_nodes(
-                nodes,
-                Budget { start, limits },
-                record_epoch,
-            )?,
-            None => self.writer.store.load_evaluation(limits, start)?,
-        };
+        let mut c = self.writer.store.load_job_evaluation(limits, start)?;
         if c.storage_fault {
             return Err(StorageError::Corrupt);
         }

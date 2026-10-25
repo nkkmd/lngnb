@@ -162,7 +162,7 @@ impl Node {
         })
     }
 }
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BlobFact {
     TransferFailed(PayloadReason),
     Missing,
@@ -177,9 +177,7 @@ struct Computed {
     known: BTreeMap<Key, (Key, u64)>,
     storage_fault: bool,
     record_epoch: i64,
-    blob_dir: OwnedFd,
-    directory_stamp: String,
-    files: BTreeMap<Key, Option<String>>,
+    evidence: blob_preparation::Evidence,
     budget: Budget,
 }
 impl RecordStore {
@@ -201,6 +199,19 @@ impl RecordStore {
     }
     fn load_evaluation(&self, limits: EvaluationLimits, start: Instant) -> Result<Computed> {
         let budget = Budget { start, limits };
+        let (nodes, record_epoch) = self.collect_evaluation_nodes(&budget)?;
+        self.evaluation_from_nodes(nodes, budget, record_epoch, false)
+    }
+    fn load_job_evaluation(&self, limits: EvaluationLimits, start: Instant) -> Result<Computed> {
+        let budget = Budget { start, limits };
+        let (nodes, record_epoch) = match preparation::ready(self, &budget)? {
+            Some((epoch, nodes)) => (nodes, epoch),
+            None => self.collect_evaluation_nodes(&budget)?,
+        };
+        self.evaluation_from_nodes(nodes, budget, record_epoch, true)
+    }
+    fn collect_evaluation_nodes(&self, budget: &Budget) -> Result<(BTreeMap<Key, Node>, i64)> {
+        let limits = budget.limits;
         budget.check()?;
         let record_epoch = preparation::epoch(&self.conn)?;
         let mut nodes = BTreeMap::new();
@@ -231,108 +242,25 @@ impl RecordStore {
                 .ok_or(StorageError::BudgetExceeded)?;
             nodes.insert(key, node);
         }
-        self.evaluation_from_nodes(nodes, budget, record_epoch)
+        Ok((nodes, record_epoch))
     }
     fn evaluation_from_nodes(
         &self,
         nodes: BTreeMap<Key, Node>,
         budget: Budget,
         record_epoch: i64,
+        allow_prepared: bool,
     ) -> Result<Computed> {
-        let limits = budget.limits;
-        // 既知不正の根拠を入力集合とは別に保持する。再投稿・再索引で消さない。
-        let mut known = BTreeMap::new();
-        let mut stmt = self.conn.prepare(
-            "SELECT record_id,blob_id,actual_length,rules FROM known_invalid ORDER BY record_id",
-        )?;
-        let mut rows = stmt.query([])?;
-        while let Some(row) = rows.next()? {
-            budget.check()?;
-            if known.len() >= nodes.len() {
-                return Err(StorageError::Corrupt);
-            }
-            let key: Vec<u8> = row.get(0)?;
-            let key: Key = key.try_into().map_err(|_| StorageError::Corrupt)?;
-            let blob: Vec<u8> = row.get(1)?;
-            let blob: Key = blob.try_into().map_err(|_| StorageError::Corrupt)?;
-            let n: i64 = row.get(2)?;
-            let rules: String = row.get(3)?;
-            let node = nodes.get(&key).ok_or(StorageError::Corrupt)?;
-            if n < 0
-                || rules != "lngnb-validation-1"
-                || !node
-                    .payload
-                    .is_some_and(|(id, declared)| id == blob && declared != n as u64)
-            {
-                return Err(StorageError::Corrupt);
-            }
-            known.insert(key, (blob, n as u64));
-        }
-        let mut blobs = BTreeMap::new();
-        let requested: BTreeSet<Key> = nodes
-            .values()
-            .filter_map(|n| n.payload.map(|(id, _)| id))
-            .collect();
-        let dir = blobs::blob_directory(&self.dir, "blobs")?;
-        let directory_stamp = fingerprint(&std::fs::metadata(anchored(&dir, "."))?);
-        let mut files = BTreeMap::new();
-        let mut remaining = limits.blob_bytes;
-        for key in requested {
-            budget.check()?;
-            let length: Option<i64> = self
-                .conn
-                .query_row("SELECT byte_length FROM blobs WHERE id=?1", [&key], |r| {
-                    r.get(0)
-                })
-                .optional()?;
-            let fact = match length {
-                None => {
-                    let reason: Option<String> = self
-                        .conn
-                        .query_row(
-                            "SELECT reason FROM blob_failures WHERE id=?1",
-                            [&key],
-                            |r| r.get(0),
-                        )
-                        .optional()?;
-                    match reason.as_deref() {
-                        Some("transfer_hash_mismatch") => {
-                            BlobFact::TransferFailed(PayloadReason::TransferHashMismatch)
-                        }
-                        Some("transfer_failed") => {
-                            BlobFact::TransferFailed(PayloadReason::TransferFailed)
-                        }
-                        Some(_) => return Err(StorageError::Corrupt),
-                        None => BlobFact::Missing,
-                    }
-                }
-                Some(n) if n >= 0 => {
-                    // 共有Blobの検査は一度だけ。hash計算前に全体量を予算へ計上する。
-                    remaining = remaining
-                        .checked_sub(n as u64)
-                        .ok_or(StorageError::BudgetExceeded)?;
-                    let before = blob_stamp(&dir, key)?;
-                    let fact =
-                        match blobs::verify_file(&dir, blob_id(key), Some(n as u64), n as u64) {
-                            Ok(_) => BlobFact::Verified(n as u64),
-                            Err(StorageError::Corrupt) => BlobFact::Unavailable,
-                            Err(StorageError::Io(e))
-                                if e.kind() == std::io::ErrorKind::NotFound =>
-                            {
-                                BlobFact::Unavailable
-                            }
-                            Err(e) => return Err(e),
-                        };
-                    if blob_stamp(&dir, key)? != before {
-                        return Err(StorageError::Corrupt);
-                    }
-                    files.insert(key, before);
-                    fact
-                }
-                _ => return Err(StorageError::Corrupt),
-            };
-            blobs.insert(key, fact);
-        }
+        let known = self.load_known(&nodes, &budget)?;
+        let prepared = if allow_prepared {
+            blob_preparation::ready(self, &nodes, &budget, record_epoch)?
+        } else {
+            None
+        };
+        let (blobs, evidence) = match prepared {
+            Some(inputs) => inputs,
+            None => blob_preparation::fresh(self, &nodes, &budget, record_epoch)?,
+        };
         let mut conflicts = BTreeMap::new();
         for (key, node) in &nodes {
             if let Some((id, declared)) = node.payload {
@@ -361,11 +289,44 @@ impl RecordStore {
             known,
             storage_fault,
             record_epoch,
-            blob_dir: dir,
-            directory_stamp,
-            files,
+            evidence,
             budget,
         })
+    }
+    fn load_known(
+        &self,
+        nodes: &BTreeMap<Key, Node>,
+        budget: &Budget,
+    ) -> Result<BTreeMap<Key, (Key, u64)>> {
+        // 既知不正の根拠を入力集合とは別に保持する。再投稿・再索引で消さない。
+        let mut known = BTreeMap::new();
+        let mut stmt = self.conn.prepare(
+            "SELECT record_id,blob_id,actual_length,rules FROM known_invalid ORDER BY record_id",
+        )?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            budget.check()?;
+            if known.len() >= nodes.len() {
+                return Err(StorageError::Corrupt);
+            }
+            let key: Vec<u8> = row.get(0)?;
+            let key: Key = key.try_into().map_err(|_| StorageError::Corrupt)?;
+            let blob: Vec<u8> = row.get(1)?;
+            let blob: Key = blob.try_into().map_err(|_| StorageError::Corrupt)?;
+            let n: i64 = row.get(2)?;
+            let rules: String = row.get(3)?;
+            let node = nodes.get(&key).ok_or(StorageError::Corrupt)?;
+            if n < 0
+                || rules != "lngnb-validation-1"
+                || !node
+                    .payload
+                    .is_some_and(|(id, declared)| id == blob && declared != n as u64)
+            {
+                return Err(StorageError::Corrupt);
+            }
+            known.insert(key, (blob, n as u64));
+        }
+        Ok(known)
     }
 }
 
@@ -796,20 +757,14 @@ impl Computed {
         if preparation::epoch(conn)? != self.record_epoch {
             return Err(StorageError::Corrupt);
         }
-        let current = blobs::blob_directory(root, "blobs")?;
-        if fingerprint(&std::fs::metadata(anchored(&current, "."))?) != self.directory_stamp {
-            return Err(StorageError::Corrupt);
-        }
-        for (key, stamp) in &self.files {
-            self.budget.check()?;
-            if blob_stamp(&self.blob_dir, *key)? != *stamp {
-                return Err(StorageError::Corrupt);
-            }
-        }
-        self.budget.check()
+        self.evidence.validate(root, conn, &self.budget)
     }
 }
 
 #[path = "evaluation_input.rs"]
 mod preparation;
 pub use preparation::{EvaluationInputBudget, EvaluationInputProgress};
+
+#[path = "evaluation_blob_input.rs"]
+mod blob_preparation;
+pub use blob_preparation::{EvaluationBlobBudget, EvaluationBlobProgress};
