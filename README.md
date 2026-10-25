@@ -6,18 +6,22 @@ lngnbは、資料を保存し、見つけ、読み、引用し、改訂履歴を
 
 ## 現在の状態
 
-Rustの最小CLIとCIを用意した開発初期段階です。現在実行できるのはヘルプ・版表示・設定候補の表示だけです。資料の作成・公開、リレー起動などは未実装で、G1〜G5の製品試験も未実行です。
+Record形式・ID・署名の局所検査基盤と、最小CLI・CIを用意した開発初期段階です。現在実行できるのはヘルプ・版表示・設定候補の表示だけです。資料の作成・公開、リレー起動などは未実装で、工程③の対象試験は実行済みですが、G1〜G5全体は未合格です。
 
 **仕様書・実装計画書の v1.0.0 は文書の版です。** ソフトウェアの開発版は `0.1.0-dev` で、初期版完成やリリースを意味しません。
 
 ## 開発用のビルドと確認
 
-現在のビルド確認対象はLinux x86_64（Ubuntu 24.04）です。RustupとCリンカー（Ubuntuでは`build-essential`）を用意し、取得したリポジトリ内で実行します。Rust 1.85.0・edition 2024を採用し、ツールチェーンと構成を固定しています。現在は外部クレート依存がなく、ツールチェーン導入後のビルド・試験にネット接続は不要です。
+現在のビルド確認対象はLinux x86_64（Ubuntu 24.04）です。RustupとCリンカー（Ubuntuでは`build-essential`）を用意し、取得したリポジトリ内で実行します。Rust 1.85.0・edition 2024を採用し、ツールチェーンと構成を固定しています。依存版はCargo.tomlとCargo.lockで固定しています。初回の依存取得にはネット接続が必要です。独立照合試験にはPython 3.12とvenvを用います（Ubuntuでは`python3-venv`）。取得後のRustビルド・試験はofflineで実行します。
 
 ```sh
 git clone https://github.com/nkkmd/lngnb.git
 cd lngnb
 rustup toolchain install 1.85.0 --profile minimal --component rustfmt --component clippy
+cargo fetch --locked
+python3 -m venv /tmp/lngnb-reference
+/tmp/lngnb-reference/bin/pip install -r tests/requirements.txt
+export LNGNB_REFERENCE_PYTHON=/tmp/lngnb-reference/bin/python
 cargo fmt --all -- --check
 cargo clippy --locked --offline --all-targets -- -D warnings
 cargo test --locked --offline --all-targets
@@ -29,6 +33,8 @@ cargo build --locked --offline --release
 ```
 
 `config show`は未保存・未適用の設定候補を表示します。既定のデータ領域候補はカレントディレクトリの`./lngnb-data`で、指定したパスの読込み・作成、設定保存、ネットワーク接続は行いません。既存リレーの状態確認や初期化コマンドではありません。未対応操作・不正引数は終了コード2、出力失敗は1となり、成功とは表示しません。
+
+局所検査の成功は、親履歴の検査完了・pin採用・公開許可を意味しません。資料作成・署名の利用者向けCLIや保存機能は後続工程で実装します。
 
 実行時データや秘密情報はリポジトリ外で管理してください。正式な保存保証・性能評価の対象条件は仕様書に従い、ビルド成功と区別します。WSL2等の対応は未判定です。
 

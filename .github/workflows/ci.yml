@@ -18,6 +18,13 @@ jobs:
           rustup toolchain install 1.85.0 --profile minimal --component rustfmt --component clippy
           rustc --version --verbose
           cargo --version
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+      - name: Prepare independent reference checker
+        run: |
+          python3 -m venv /tmp/lngnb-reference
+          /tmp/lngnb-reference/bin/pip install -r tests/requirements.txt
+          echo "LNGNB_REFERENCE_PYTHON=/tmp/lngnb-reference/bin/python" >> "$GITHUB_ENV"
       - name: Format
         run: cargo fmt --all -- --check
       - name: Lint
