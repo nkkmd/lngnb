@@ -1,7 +1,7 @@
 //! RecordInspectionのBlob段階。上限付き一覧を固定し、全体hashをファイル単位で再開。
 use super::*;
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, fs::Metadata};
+use std::collections::BTreeMap;
 
 #[derive(Clone)]
 struct Entry {
@@ -27,20 +27,6 @@ pub(super) struct BlobPlan {
     pub(super) done: bool,
     pub(super) files: i64,
     pub(super) bytes: i64,
-}
-fn fingerprint(m: &Metadata) -> String {
-    format!(
-        "{}:{}:{}:{}:{}:{}:{}:{}:{}",
-        m.dev(),
-        m.ino(),
-        m.len(),
-        m.mtime(),
-        m.mtime_nsec(),
-        m.ctime(),
-        m.ctime_nsec(),
-        m.mode(),
-        m.nlink()
-    )
 }
 fn directories(store: &RecordStore) -> Result<(OwnedFd, OwnedFd, String, String)> {
     let blobs = blobs::blob_directory(&store.dir, "blobs")?;

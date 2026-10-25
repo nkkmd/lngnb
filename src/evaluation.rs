@@ -1,5 +1,5 @@
 //! R07/R08/R10/R26/R27: 保存集合の管理用評価。pin・公開・候補選択は扱わない。
-//! 全集合を予算内で再計算し、未完了時は結果を返さない。キューの永続再開は後続。
+//! 集合評価と、入力照合後の親評価cursor再開。部分結果を現在の全体判定にしない。
 use super::*;
 use crate::record::RecordKind;
 use std::{
@@ -162,7 +162,12 @@ struct Computed {
     snapshot: EvaluationSnapshot,
     nodes: BTreeMap<Key, Node>,
     conflicts: BTreeMap<Key, (Key, u64)>,
+    blobs: BTreeMap<Key, BlobFact>,
+    known: BTreeMap<Key, (Key, u64)>,
     storage_fault: bool,
+    blob_dir: OwnedFd,
+    directory_stamp: String,
+    files: BTreeMap<Key, Option<String>>,
     budget: Budget,
 }
 impl RecordStore {
@@ -172,10 +177,18 @@ impl RecordStore {
         Ok(self.compute_evaluation(limits)?.snapshot)
     }
     fn compute_evaluation(&self, limits: EvaluationLimits) -> Result<Computed> {
-        let budget = Budget {
-            start: Instant::now(),
-            limits,
-        };
+        let mut computed = self.load_evaluation(limits, Instant::now())?;
+        computed.snapshot.records = evaluate_graph(
+            &computed.nodes,
+            &computed.blobs,
+            &computed.known,
+            &computed.budget,
+        )?;
+        computed.validate_evidence(&self.dir)?;
+        Ok(computed)
+    }
+    fn load_evaluation(&self, limits: EvaluationLimits, start: Instant) -> Result<Computed> {
+        let budget = Budget { start, limits };
         budget.check()?;
         let mut nodes = BTreeMap::new();
         let mut byte_budget = limits.record_bytes;
@@ -249,6 +262,8 @@ impl RecordStore {
             .filter_map(|n| n.payload.map(|(id, _)| id))
             .collect();
         let dir = blobs::blob_directory(&self.dir, "blobs")?;
+        let directory_stamp = fingerprint(&std::fs::metadata(anchored(&dir, "."))?);
+        let mut files = BTreeMap::new();
         let mut remaining = limits.blob_bytes;
         for key in requested {
             budget.check()?;
@@ -284,14 +299,23 @@ impl RecordStore {
                     remaining = remaining
                         .checked_sub(n as u64)
                         .ok_or(StorageError::BudgetExceeded)?;
-                    match blobs::verify_file(&dir, blob_id(key), Some(n as u64), n as u64) {
-                        Ok(_) => BlobFact::Verified(n as u64),
-                        Err(StorageError::Corrupt) => BlobFact::Unavailable,
-                        Err(StorageError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
-                            BlobFact::Unavailable
-                        }
-                        Err(e) => return Err(e),
+                    let before = blob_stamp(&dir, key)?;
+                    let fact =
+                        match blobs::verify_file(&dir, blob_id(key), Some(n as u64), n as u64) {
+                            Ok(_) => BlobFact::Verified(n as u64),
+                            Err(StorageError::Corrupt) => BlobFact::Unavailable,
+                            Err(StorageError::Io(e))
+                                if e.kind() == std::io::ErrorKind::NotFound =>
+                            {
+                                BlobFact::Unavailable
+                            }
+                            Err(e) => return Err(e),
+                        };
+                    if blob_stamp(&dir, key)? != before {
+                        return Err(StorageError::Corrupt);
                     }
+                    files.insert(key, before);
+                    fact
                 }
                 _ => return Err(StorageError::Corrupt),
             };
@@ -311,7 +335,7 @@ impl RecordStore {
             }
         }
         let storage_fault = blobs.values().any(|b| matches!(b, BlobFact::Unavailable));
-        let records = evaluate_graph(&nodes, &blobs, &known, &budget)?;
+        let records = Vec::new();
         budget.check()?;
         Ok(Computed {
             snapshot: EvaluationSnapshot {
@@ -321,7 +345,12 @@ impl RecordStore {
             },
             nodes,
             conflicts,
+            blobs,
+            known,
             storage_fault,
+            blob_dir: dir,
+            directory_stamp,
+            files,
             budget,
         })
     }
@@ -357,12 +386,11 @@ fn same_scope(child: &Node, parent: &Node) -> bool {
         && parent.record.knowledge() == child.record.knowledge()
         && parent.genesis == child.genesis
 }
-fn evaluate_graph(
-    nodes: &BTreeMap<Key, Node>,
-    blobs: &BTreeMap<Key, BlobFact>,
-    known: &BTreeMap<Key, (Key, u64)>,
-    budget: &Budget,
-) -> Result<Vec<Assessment>> {
+struct GraphPlan {
+    order: Vec<Key>,
+    remaining: BTreeMap<Key, usize>,
+}
+fn evaluation_order(nodes: &BTreeMap<Key, Node>, budget: &Budget) -> Result<GraphPlan> {
     let mut remaining = BTreeMap::new();
     let mut reverse: BTreeMap<Key, Vec<Key>> = BTreeMap::new();
     let mut ready = VecDeque::new();
@@ -380,13 +408,10 @@ fn evaluate_graph(
             ready.push_back(*key);
         }
     }
-    let mut results: BTreeMap<Key, Assessment> = BTreeMap::new();
+    let mut order = Vec::new();
     while let Some(key) = ready.pop_front() {
         budget.check()?;
-        let node = &nodes[&key];
-        let mut result = assess(node, nodes, blobs, known, &results);
-        result.record_id = record_id(key);
-        results.insert(key, result);
+        order.push(key);
         if let Some(children) = reverse.get(&key) {
             for child in children {
                 let count = remaining.get_mut(child).ok_or(StorageError::Corrupt)?;
@@ -397,29 +422,63 @@ fn evaluate_graph(
             }
         }
     }
-    // 未処理は循環またはその必要子孫。深い履歴もスタック再帰を使わない。
-    // 実際のcontent-addressed循環構築は困難だが、依存エンジンの防御として検査する。
-    for (key, node) in nodes {
+    order.extend(remaining.iter().filter(|(_, n)| **n > 0).map(|(id, _)| *id));
+    Ok(GraphPlan { order, remaining })
+}
+fn planned_assessment(
+    key: Key,
+    plan: &GraphPlan,
+    computed: &Computed,
+    results: &BTreeMap<Key, Assessment>,
+) -> Assessment {
+    planned_result(
+        key,
+        plan,
+        &computed.nodes,
+        &computed.blobs,
+        &computed.known,
+        results,
+    )
+}
+fn planned_result(
+    key: Key,
+    plan: &GraphPlan,
+    nodes: &BTreeMap<Key, Node>,
+    blobs: &BTreeMap<Key, BlobFact>,
+    known: &BTreeMap<Key, (Key, u64)>,
+    results: &BTreeMap<Key, Assessment>,
+) -> Assessment {
+    let node = &nodes[&key];
+    let mut result = assess(node, nodes, blobs, known, results);
+    if plan.remaining[&key] > 0 && base_result(node, nodes).is_none() {
+        result.validation = Validation::Invalid;
+        result.reason = Some(Reason::InvalidParent);
+        result.related = node
+            .parents
+            .iter()
+            .find(|p| plan.remaining.get(*p).is_some_and(|n| *n > 0))
+            .copied()
+            .map(record_id);
+    }
+    result.record_id = record_id(key);
+    result
+}
+fn evaluate_graph(
+    nodes: &BTreeMap<Key, Node>,
+    blobs: &BTreeMap<Key, BlobFact>,
+    known: &BTreeMap<Key, (Key, u64)>,
+    budget: &Budget,
+) -> Result<Vec<Assessment>> {
+    let plan = evaluation_order(nodes, budget)?;
+    let mut results = BTreeMap::new();
+    for key in &plan.order {
         budget.check()?;
-        if results.contains_key(key) {
-            continue;
-        }
-        let mut result = assess(node, nodes, blobs, known, &results);
-        if base_result(node, nodes).is_none() {
-            result.validation = Validation::Invalid;
-            result.reason = Some(Reason::InvalidParent);
-            result.related = node
-                .parents
-                .iter()
-                .find(|p| remaining.get(*p).is_some_and(|n| *n > 0))
-                .copied()
-                .map(record_id);
-        }
-        result.record_id = record_id(*key);
+        let result = planned_result(*key, &plan, nodes, blobs, known, &results);
         results.insert(*key, result);
     }
     Ok(results.into_values().collect())
 }
+
 fn assess(
     node: &Node,
     nodes: &BTreeMap<Key, Node>,
@@ -581,105 +640,7 @@ impl RecordWriter {
         self.reserved += reserve;
         let result: Result<()> = (|| {
             let tx = self.store.conn.transaction()?;
-            let old_rows = {
-                let mut statement = tx.prepare("SELECT record_id,validation,payload,reason,related,payload_reason FROM evaluations ORDER BY record_id")?;
-                let mut old = BTreeMap::new();
-                let mut rows = statement.query([])?;
-                while let Some(row) = rows.next()? {
-                    computed.budget.check()?;
-                    if old.len() as u64 >= limits.records {
-                        return Err(StorageError::BudgetExceeded);
-                    }
-                    let id: Vec<u8> = row.get(0)?;
-                    let validation: String = row.get(1)?;
-                    let payload: Option<String> = row.get(2)?;
-                    let reason: Option<String> = row.get(3)?;
-                    let related: Option<Vec<u8>> = row.get(4)?;
-                    let payload_reason: Option<String> = row.get(5)?;
-                    old.insert(
-                        id,
-                        format!(
-                            "{}:{}:{}:{:?}:{}",
-                            validation,
-                            payload.as_deref().unwrap_or("none"),
-                            reason.as_deref().unwrap_or("none"),
-                            related,
-                            payload_reason.as_deref().unwrap_or("none")
-                        ),
-                    );
-                }
-                old
-            };
-            tx.execute("DELETE FROM evaluations", [])?;
-            tx.execute("DELETE FROM parent_edges", [])?;
-            for (key, node) in &computed.nodes {
-                computed.budget.check()?;
-                for parent in &node.parents {
-                    tx.execute(
-                        "INSERT INTO parent_edges(child,parent) VALUES(?1,?2)",
-                        params![key, parent],
-                    )?;
-                }
-            }
-            for row in &computed.snapshot.records {
-                computed.budget.check()?;
-                let new_state = format!(
-                    "{}:{}:{}:{:?}:{}",
-                    row.validation.text(),
-                    row.payload_status
-                        .map(PayloadStatus::text)
-                        .unwrap_or("none"),
-                    row.reason.map(Reason::code).unwrap_or("none"),
-                    row.related.map(|id| id.bytes.to_vec()),
-                    row.payload_reason
-                        .map(PayloadReason::code)
-                        .unwrap_or("none")
-                );
-                let old_state = old_rows
-                    .get(row.record_id.bytes.as_slice())
-                    .map(String::as_str)
-                    .unwrap_or("unevaluated");
-                if old_state != new_state {
-                    advance(&tx)?;
-                    audit(
-                        &tx,
-                        Some(&row.record_id.bytes),
-                        old_state,
-                        &new_state,
-                        "record_dependency_evaluation",
-                    )?;
-                }
-                tx.execute(
-                    "INSERT INTO evaluations VALUES(?1,?2,?3,?4,?5,?6)",
-                    params![
-                        &row.record_id.bytes,
-                        row.validation.text(),
-                        row.payload_status.map(PayloadStatus::text),
-                        row.reason.map(Reason::code),
-                        row.related.map(|id| id.bytes),
-                        row.payload_reason.map(PayloadReason::code)
-                    ],
-                )?;
-            }
-            advance(&tx)?;
-            for (key, (blob, n)) in &computed.conflicts {
-                computed.budget.check()?;
-                tx.execute("INSERT INTO known_invalid(record_id,reason,blob_id,actual_length,rules,generation,at) SELECT ?1,'declared_length_mismatch',?2,?3,'lngnb-validation-1',generation,strftime('%Y-%m-%dT%H:%M:%fZ','now') FROM storage_state WHERE singleton=1 ON CONFLICT(record_id) DO NOTHING",params![key,blob,i64::try_from(*n).map_err(|_| StorageError::Corrupt)?])?;
-            }
-            tx.execute("UPDATE evaluation_state SET dirty=0,generation=(SELECT generation FROM storage_state WHERE singleton=1) WHERE singleton=1",[])?;
-            audit(
-                &tx,
-                None,
-                "evaluation_pending",
-                "evaluated_local_only",
-                "revalidate_dependencies_and_payloads",
-            )?;
-            computed.budget.check()?;
-            computed.snapshot.generation = tx.query_row(
-                "SELECT generation FROM storage_state WHERE singleton=1",
-                [],
-                |r| r.get(0),
-            )?;
+            publish(&tx, &mut computed, limits)?;
             #[cfg(test)]
             if self.evaluation_pause {
                 use std::io::Write;
@@ -688,6 +649,7 @@ impl RecordWriter {
                 let mut line = String::new();
                 std::io::stdin().read_line(&mut line)?;
             }
+            computed.validate_evidence(&self.store.dir)?;
             tx.commit()?;
             Ok(())
         })();
@@ -701,3 +663,133 @@ impl RecordWriter {
 #[cfg(test)]
 #[path = "evaluation_tests.rs"]
 mod tests;
+
+fn publish(tx: &Transaction<'_>, computed: &mut Computed, limits: EvaluationLimits) -> Result<()> {
+    let old_rows = {
+        let mut statement = tx.prepare("SELECT record_id,validation,payload,reason,related,payload_reason FROM evaluations ORDER BY record_id")?;
+        let mut old = BTreeMap::new();
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            computed.budget.check()?;
+            if old.len() as u64 >= limits.records {
+                return Err(StorageError::BudgetExceeded);
+            }
+            let id: Vec<u8> = row.get(0)?;
+            let validation: String = row.get(1)?;
+            let payload: Option<String> = row.get(2)?;
+            let reason: Option<String> = row.get(3)?;
+            let related: Option<Vec<u8>> = row.get(4)?;
+            let payload_reason: Option<String> = row.get(5)?;
+            old.insert(
+                id,
+                format!(
+                    "{}:{}:{}:{:?}:{}",
+                    validation,
+                    payload.as_deref().unwrap_or("none"),
+                    reason.as_deref().unwrap_or("none"),
+                    related,
+                    payload_reason.as_deref().unwrap_or("none")
+                ),
+            );
+        }
+        old
+    };
+    tx.execute("DELETE FROM evaluations", [])?;
+    tx.execute("DELETE FROM parent_edges", [])?;
+    for (key, node) in &computed.nodes {
+        computed.budget.check()?;
+        for parent in &node.parents {
+            tx.execute(
+                "INSERT INTO parent_edges(child,parent) VALUES(?1,?2)",
+                params![key, parent],
+            )?;
+        }
+    }
+    for row in &computed.snapshot.records {
+        computed.budget.check()?;
+        let new_state = format!(
+            "{}:{}:{}:{:?}:{}",
+            row.validation.text(),
+            row.payload_status
+                .map(PayloadStatus::text)
+                .unwrap_or("none"),
+            row.reason.map(Reason::code).unwrap_or("none"),
+            row.related.map(|id| id.bytes.to_vec()),
+            row.payload_reason
+                .map(PayloadReason::code)
+                .unwrap_or("none")
+        );
+        let old_state = old_rows
+            .get(row.record_id.bytes.as_slice())
+            .map(String::as_str)
+            .unwrap_or("unevaluated");
+        if old_state != new_state {
+            advance(tx)?;
+            audit(
+                tx,
+                Some(&row.record_id.bytes),
+                old_state,
+                &new_state,
+                "record_dependency_evaluation",
+            )?;
+        }
+        tx.execute(
+            "INSERT INTO evaluations VALUES(?1,?2,?3,?4,?5,?6)",
+            params![
+                &row.record_id.bytes,
+                row.validation.text(),
+                row.payload_status.map(PayloadStatus::text),
+                row.reason.map(Reason::code),
+                row.related.map(|id| id.bytes),
+                row.payload_reason.map(PayloadReason::code)
+            ],
+        )?;
+    }
+    advance(tx)?;
+    for (key, (blob, n)) in &computed.conflicts {
+        computed.budget.check()?;
+        tx.execute("INSERT INTO known_invalid(record_id,reason,blob_id,actual_length,rules,generation,at) SELECT ?1,'declared_length_mismatch',?2,?3,'lngnb-validation-1',generation,strftime('%Y-%m-%dT%H:%M:%fZ','now') FROM storage_state WHERE singleton=1 ON CONFLICT(record_id) DO NOTHING",params![key,blob,i64::try_from(*n).map_err(|_| StorageError::Corrupt)?])?;
+    }
+    tx.execute("UPDATE evaluation_state SET dirty=0,generation=(SELECT generation FROM storage_state WHERE singleton=1) WHERE singleton=1",[])?;
+    audit(
+        tx,
+        None,
+        "evaluation_pending",
+        "evaluated_local_only",
+        "revalidate_dependencies_and_payloads",
+    )?;
+    computed.budget.check()?;
+    computed.snapshot.generation = tx.query_row(
+        "SELECT generation FROM storage_state WHERE singleton=1",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(())
+}
+
+#[path = "evaluation_queue.rs"]
+mod queue;
+pub use queue::{EvaluationJob, EvaluationProgress, EvaluationStepBudget};
+
+fn blob_stamp(dir: &OwnedFd, key: Key) -> Result<Option<String>> {
+    match blobs::checked_file(dir, &blobs::hex(&key)) {
+        Ok(file) => Ok(Some(fingerprint(&file.metadata()?))),
+        Err(StorageError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+impl Computed {
+    fn validate_evidence(&self, root: &OwnedFd) -> Result<()> {
+        let current = blobs::blob_directory(root, "blobs")?;
+        if fingerprint(&std::fs::metadata(anchored(&current, "."))?) != self.directory_stamp {
+            return Err(StorageError::Corrupt);
+        }
+        for (key, stamp) in &self.files {
+            self.budget.check()?;
+            if blob_stamp(&self.blob_dir, *key)? != *stamp {
+                return Err(StorageError::Corrupt);
+            }
+        }
+        self.budget.check()
+    }
+}
