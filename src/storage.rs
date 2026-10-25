@@ -16,7 +16,7 @@ use std::{
 };
 
 pub const IMPLEMENTATION: &str = "lngnb-rust-sqlite-1";
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 const DB: &str = "database.sqlite";
 const SCHEMA: &str = "
 CREATE TABLE storage_state (
@@ -32,6 +32,21 @@ CREATE TABLE records (
 ) STRICT;
 CREATE TRIGGER records_no_update BEFORE UPDATE ON records BEGIN SELECT RAISE(ABORT,'immutable_record'); END;
 CREATE TRIGGER records_no_delete BEFORE DELETE ON records BEGIN SELECT RAISE(ABORT,'immutable_record'); END;
+CREATE TABLE record_inspection (
+ singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+ source_epoch INTEGER NOT NULL CHECK(source_epoch>=0),
+ phase TEXT NOT NULL CHECK(phase IN ('idle','records','blobs','complete')),
+ cursor BLOB CHECK(cursor IS NULL OR length(cursor)=32),
+ checked_records INTEGER NOT NULL CHECK(checked_records>=0),
+ checked_bytes INTEGER NOT NULL CHECK(checked_bytes>=0),
+ checkpoint_generation INTEGER
+) STRICT;
+INSERT INTO record_inspection VALUES(1,0,'idle',NULL,0,0,NULL);
+CREATE TRIGGER record_invalidates_inspection AFTER INSERT ON records BEGIN
+ UPDATE record_inspection SET source_epoch=source_epoch+1,
+ phase=CASE WHEN phase IN ('records','blobs') THEN 'records' ELSE 'idle' END,
+ cursor=NULL,checked_records=0,checked_bytes=0,checkpoint_generation=NULL;
+END;
 CREATE TABLE blobs (
  id BLOB PRIMARY KEY NOT NULL CHECK(length(id)=32),
  byte_length INTEGER NOT NULL CHECK(byte_length>=0)
@@ -97,6 +112,7 @@ pub enum StorageError {
     RandomUnavailable,
     BlobHashMismatch,
     InvalidBlobId,
+    InspectionPending,
 }
 impl std::fmt::Display for StorageError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -113,6 +129,7 @@ impl std::fmt::Display for StorageError {
             Self::RandomUnavailable => "random_unavailable",
             Self::BlobHashMismatch => "transfer_hash_mismatch",
             Self::InvalidBlobId => "invalid_blob_id",
+            Self::InspectionPending => "startup_inspection_pending",
         })
     }
 }
@@ -191,6 +208,7 @@ impl Limits {
 pub enum StartupState {
     Clean,
     NeedsReview,
+    InspectionPending,
 }
 #[derive(Debug, Clone, Copy)]
 pub struct Capacity {
@@ -320,6 +338,8 @@ fn check_format(conn: &Connection) -> Result<()> {
         "blob_retained_local_only",
         "evaluated_local_only",
         "blob_failure_observed",
+        "record_inspection_pending",
+        "record_inspection_complete",
     ]
     .contains(&audit_state.as_str())
     {
@@ -401,6 +421,7 @@ pub struct RecordStore {
     dir: OwnedFd,
     limits: Limits,
     blob_recovery: BlobRecovery,
+    records_checked: bool,
 }
 impl RecordStore {
     /// 新しい最終ディレクトリだけを作る。既存/未完了領域を上書きしない。
@@ -455,10 +476,21 @@ impl RecordStore {
             dir,
             limits,
             blob_recovery: BlobRecovery::default(),
+            records_checked: true,
         })
     }
     /// 欠損DB・未知保存版を作成/移行しない。稼働中印は読取りで解除しない。
     pub fn open(path: &Path, limits: Limits) -> Result<Self> {
+        let mut store = Self::open_locked(path, limits)?;
+        store.check_records()?;
+        store.records_checked = true;
+        store.blob_recovery = store.scan_blobs()?;
+        if store.blob_recovery.needs_review() && state(&store.conn)? == StartupState::Clean {
+            transition(&mut store.conn, "running", "blob_recovery_required")?;
+        }
+        Ok(store)
+    }
+    fn open_locked(path: &Path, limits: Limits) -> Result<Self> {
         let limits = limits.check()?;
         let dir = directory(path)?;
         check_area(&dir)?;
@@ -467,22 +499,18 @@ impl RecordStore {
         // 未対応版のDBを設定変更する前にread-onlyで照合する。
         let probe = connection(&dir, true)?;
         check_format(&probe)?;
+        inspection::checkpoint(&probe)?;
         drop(probe);
         let conn = connection(&dir, false)?;
         configure(&conn)?;
-        let mut store = Self {
+        Ok(Self {
             conn,
             _lock: lock,
             dir,
             limits,
             blob_recovery: BlobRecovery::default(),
-        };
-        store.check_records()?;
-        store.blob_recovery = store.scan_blobs()?;
-        if store.blob_recovery.needs_review() && state(&store.conn)? == StartupState::Clean {
-            transition(&mut store.conn, "running", "blob_recovery_required")?;
-        }
-        Ok(store)
+            records_checked: false,
+        })
     }
     fn check_records(&self) -> Result<()> {
         let mut statement = self
@@ -519,10 +547,13 @@ impl RecordStore {
         Ok(())
     }
     pub fn startup_state(&self) -> Result<StartupState> {
-        if self.blob_recovery.needs_review() {
+        if self.blob_recovery.needs_review() || state(&self.conn)? == StartupState::NeedsReview {
             return Ok(StartupState::NeedsReview);
         }
-        state(&self.conn)
+        if !self.records_checked || inspection::checkpoint(&self.conn)?.pending() {
+            return Ok(StartupState::InspectionPending);
+        }
+        Ok(StartupState::Clean)
     }
     pub fn generation(&self) -> Result<i64> {
         Ok(self.conn.query_row(
@@ -581,8 +612,10 @@ impl RecordStore {
         })
     }
     pub fn begin(mut self) -> Result<RecordWriter> {
-        if self.startup_state()? != StartupState::Clean {
-            return Err(StorageError::NeedsReview);
+        match self.startup_state()? {
+            StartupState::Clean => (),
+            StartupState::NeedsReview => return Err(StorageError::NeedsReview),
+            StartupState::InspectionPending => return Err(StorageError::InspectionPending),
         }
         transition(&mut self.conn, "running", "begin_record_session")?;
         Ok(RecordWriter {
@@ -723,3 +756,7 @@ pub use evaluation::{
     Assessment, EvaluationLimits, EvaluationSnapshot, PayloadReason, PayloadStatus, Reason,
     Validation,
 };
+
+#[path = "record_inspection.rs"]
+mod inspection;
+pub use inspection::{InspectionBudget, InspectionProgress, RecordInspection};
