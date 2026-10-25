@@ -1,0 +1,13 @@
+/target/
+# 実行時データはリポジトリ外を推奨。既定候補も追跡しない。
+/lngnb-data/
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+*.key
+*.pem
+*.keyfile
+.env
+.env.*
+*.log

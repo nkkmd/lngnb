@@ -1,0 +1,15 @@
+[package]
+name = "lngnb"
+version = "0.1.0-dev"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "軽量な分散図書館・知識基盤（開発初期段階）"
+repository = "https://github.com/nkkmd/lngnb"
+publish = false
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"

@@ -6,9 +6,31 @@ lngnbは、資料を保存し、見つけ、読み、引用し、改訂履歴を
 
 ## 現在の状態
 
-仕様設計書 v1.0.0 を基準に、Rustによる初期実装を始める段階です。実行可能なソフトウェアはまだありません。ビルド・導入手順は、実装と検証に合わせて追加します。
+Rustの最小CLIとCIを用意した開発初期段階です。現在実行できるのはヘルプ・版表示・設定候補の表示だけです。資料の作成・公開、リレー起動などは未実装で、G1〜G5の製品試験も未実行です。
 
-**仕様書の v1.0.0 は文書の版であり、ソフトウェア v1.0.0 のリリースや検証完了を意味しません。** 現在は仕様設計書と実装計画を公開する開発初期段階です。実行可能なソフトウェアの提供は今後予定しています。
+**仕様書・実装計画書の v1.0.0 は文書の版です。** ソフトウェアの開発版は `0.1.0-dev` で、初期版完成やリリースを意味しません。
+
+## 開発用のビルドと確認
+
+現在のビルド確認対象はLinux x86_64（Ubuntu 24.04）です。RustupとCリンカー（Ubuntuでは`build-essential`）を用意し、取得したリポジトリ内で実行します。Rust 1.85.0・edition 2024を採用し、ツールチェーンと構成を固定しています。現在は外部クレート依存がなく、ツールチェーン導入後のビルド・試験にネット接続は不要です。
+
+```sh
+git clone https://github.com/nkkmd/lngnb.git
+cd lngnb
+rustup toolchain install 1.85.0 --profile minimal --component rustfmt --component clippy
+cargo fmt --all -- --check
+cargo clippy --locked --offline --all-targets -- -D warnings
+cargo test --locked --offline --all-targets
+cargo build --locked --offline --release
+./target/release/lngnb --help
+./target/release/lngnb --version
+./target/release/lngnb config show
+./target/release/lngnb config show --data-dir /path/to/data
+```
+
+`config show`は未保存・未適用の設定候補を表示します。既定のデータ領域候補はカレントディレクトリの`./lngnb-data`で、指定したパスの読込み・作成、設定保存、ネットワーク接続は行いません。既存リレーの状態確認や初期化コマンドではありません。未対応操作・不正引数は終了コード2、出力失敗は1となり、成功とは表示しません。
+
+実行時データや秘密情報はリポジトリ外で管理してください。正式な保存保証・性能評価の対象条件は仕様書に従い、ビルド成功と区別します。WSL2等の対応は未判定です。
 
 ## 初期版で目指すこと
 
