@@ -1,5 +1,5 @@
-//! 工程④の最初の単位: 不変Recordのローカル保存と書込みセッション。
-//! Blob、親依存評価、pin、配信許可、復旧確認の代替にはならない。
+//! 工程④: 不変Record/Blobのローカル保存と書込みセッション。
+//! 親依存評価、pin、配信許可、管理者の復旧確認の代替にはならない。
 use crate::{
     cbor::MAX_RECORD,
     id::{Id, Kind},
@@ -16,7 +16,7 @@ use std::{
 };
 
 pub const IMPLEMENTATION: &str = "lngnb-rust-sqlite-1";
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 const DB: &str = "database.sqlite";
 const SCHEMA: &str = "
 CREATE TABLE storage_state (
@@ -32,6 +32,12 @@ CREATE TABLE records (
 ) STRICT;
 CREATE TRIGGER records_no_update BEFORE UPDATE ON records BEGIN SELECT RAISE(ABORT,'immutable_record'); END;
 CREATE TRIGGER records_no_delete BEFORE DELETE ON records BEGIN SELECT RAISE(ABORT,'immutable_record'); END;
+CREATE TABLE blobs (
+ id BLOB PRIMARY KEY NOT NULL CHECK(length(id)=32),
+ byte_length INTEGER NOT NULL CHECK(byte_length>=0)
+) STRICT;
+CREATE TRIGGER blobs_no_update BEFORE UPDATE ON blobs BEGIN SELECT RAISE(ABORT,'immutable_blob'); END;
+CREATE TRIGGER blobs_no_delete BEFORE DELETE ON blobs BEGIN SELECT RAISE(ABORT,'immutable_blob'); END;
 CREATE TABLE history (
  generation INTEGER PRIMARY KEY CHECK(generation>=0),
  namespace BLOB NOT NULL CHECK(length(namespace)=32),
@@ -54,6 +60,8 @@ pub enum StorageError {
     Capacity,
     UnresolvedFailure,
     RandomUnavailable,
+    BlobHashMismatch,
+    InvalidBlobId,
 }
 impl std::fmt::Display for StorageError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -68,6 +76,8 @@ impl std::fmt::Display for StorageError {
             Self::Capacity => "storage_pressure",
             Self::UnresolvedFailure => "unresolved_storage_failure",
             Self::RandomUnavailable => "random_unavailable",
+            Self::BlobHashMismatch => "transfer_hash_mismatch",
+            Self::InvalidBlobId => "invalid_blob_id",
         })
     }
 }
@@ -101,6 +111,10 @@ pub type Result<T> = std::result::Result<T, StorageError>;
 pub struct Limits {
     pub scan_records: u64,
     pub scan_bytes: u64,
+    pub scan_blob_files: u64,
+    pub scan_blob_bytes: u64,
+    pub max_blob_bytes: u64,
+    pub session_blobs: u64,
     pub session_records: u64,
     pub session_bytes: u64,
     pub reserve_min_bytes: u64,
@@ -111,6 +125,10 @@ impl Default for Limits {
         Self {
             scan_records: 10_000,
             scan_bytes: 64 * 1024 * 1024,
+            scan_blob_files: 10_000,
+            scan_blob_bytes: 64 * 1024 * 1024,
+            max_blob_bytes: 16 * 1024 * 1024,
+            session_blobs: 10_000,
             session_records: 10_000,
             session_bytes: 64 * 1024 * 1024,
             reserve_min_bytes: 64 * 1024 * 1024,
@@ -122,6 +140,9 @@ impl Limits {
     fn check(self) -> Result<Self> {
         if self.scan_records == 0
             || self.scan_bytes == 0
+            || self.scan_blob_files == 0
+            || self.scan_blob_bytes == 0
+            || self.session_blobs == 0
             || self.session_records == 0
             || self.session_bytes == 0
             || self.reserve_percent > 100
@@ -189,14 +210,22 @@ fn check_files(fd: &OwnedFd) -> Result<()> {
     }
     Ok(())
 }
-fn lock(fd: &OwnedFd, create: bool) -> Result<OwnedFd> {
+// closeだけでは、同じopen-file-descriptionを一時継承した子プロセスが
+// execするまでflockが残る。所有Storeの接続終了後に明示解除してからfdを閉じる。
+struct DataLock(OwnedFd);
+impl Drop for DataLock {
+    fn drop(&mut self) {
+        let _ = fs::flock(&self.0, FlockOperation::Unlock);
+    }
+}
+fn lock(fd: &OwnedFd, create: bool) -> Result<DataLock> {
     let mut flags = OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOFOLLOW;
     if create {
         flags |= OFlags::CREATE | OFlags::EXCL;
     }
     let lock = fs::openat(fd, "lock", flags, Mode::RUSR | Mode::WUSR)?;
     match fs::flock(&lock, FlockOperation::NonBlockingLockExclusive) {
-        Ok(()) => Ok(lock),
+        Ok(()) => Ok(DataLock(lock)),
         Err(rustix::io::Errno::WOULDBLOCK) => Err(StorageError::Busy),
         Err(e) => Err(e.into()),
     }
@@ -251,11 +280,12 @@ fn check_format(conn: &Connection) -> Result<()> {
         [generation],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
-    let expected_state = if audit_state == "stored_local_only" {
-        "running"
-    } else {
-        audit_state.as_str()
-    };
+    let expected_state =
+        if ["stored_local_only", "blob_retained_local_only"].contains(&audit_state.as_str()) {
+            "running"
+        } else {
+            audit_state.as_str()
+        };
     if audit_namespace != namespace || expected_state != state || rules != "lngnb-validation-1" {
         return Err(StorageError::Corrupt);
     }
@@ -326,9 +356,10 @@ fn transition(conn: &mut Connection, new: &str, reason: &str) -> Result<()> {
 pub struct RecordStore {
     // Rustのfield drop順で、接続を閉じてからlockとdirectoryを解放する。
     conn: Connection,
-    _lock: OwnedFd,
+    _lock: DataLock,
     dir: OwnedFd,
     limits: Limits,
+    blob_recovery: BlobRecovery,
 }
 impl RecordStore {
     /// 新しい最終ディレクトリだけを作る。既存/未完了領域を上書きしない。
@@ -351,7 +382,7 @@ impl RecordStore {
         )?;
         check_area(&dir)?;
         let lock = lock(&dir, true)?;
-        fs::fsync(&lock)?;
+        fs::fsync(&lock.0)?;
         let db = fs::openat(
             &dir,
             DB,
@@ -361,6 +392,7 @@ impl RecordStore {
         fs::fsync(&db)?;
         fs::fsync(&dir)?;
         drop(db);
+        blobs::initialize_directories(&dir)?;
         let mut conn = connection(&dir, false)?;
         configure(&conn)?;
         let tx = conn.transaction()?;
@@ -381,6 +413,7 @@ impl RecordStore {
             _lock: lock,
             dir,
             limits,
+            blob_recovery: BlobRecovery::default(),
         })
     }
     /// 欠損DB・未知保存版を作成/移行しない。稼働中印は読取りで解除しない。
@@ -396,13 +429,18 @@ impl RecordStore {
         drop(probe);
         let conn = connection(&dir, false)?;
         configure(&conn)?;
-        let store = Self {
+        let mut store = Self {
             conn,
             _lock: lock,
             dir,
             limits,
+            blob_recovery: BlobRecovery::default(),
         };
         store.check_records()?;
+        store.blob_recovery = store.scan_blobs()?;
+        if store.blob_recovery.needs_review() && state(&store.conn)? == StartupState::Clean {
+            transition(&mut store.conn, "running", "blob_recovery_required")?;
+        }
         Ok(store)
     }
     fn check_records(&self) -> Result<()> {
@@ -440,6 +478,9 @@ impl RecordStore {
         Ok(())
     }
     pub fn startup_state(&self) -> Result<StartupState> {
+        if self.blob_recovery.needs_review() {
+            return Ok(StartupState::NeedsReview);
+        }
         state(&self.conn)
     }
     pub fn generation(&self) -> Result<i64> {
@@ -509,6 +550,9 @@ impl RecordStore {
             records: 0,
             bytes: 0,
             reserved: 0,
+            blobs: 0,
+            #[cfg(test)]
+            blob_fault: None,
         })
     }
 }
@@ -520,6 +564,9 @@ pub struct RecordWriter {
     records: u64,
     bytes: u64,
     reserved: u64,
+    blobs: u64,
+    #[cfg(test)]
+    blob_fault: Option<blobs::BlobFault>,
 }
 impl RecordWriter {
     pub fn record(&mut self, id: Id) -> Result<Option<LocalRecord>> {
@@ -620,3 +667,7 @@ impl RecordWriter {
 #[cfg(test)]
 #[path = "storage_tests.rs"]
 mod tests;
+
+#[path = "blob_store.rs"]
+mod blobs;
+pub use blobs::{BlobRecovery, BlobStored};

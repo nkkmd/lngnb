@@ -71,7 +71,29 @@ pub fn record_id(bytes: &[u8]) -> Id {
     hash(Kind::Record, b"lngnb:record:library-core-1\0", bytes)
 }
 pub fn blob_id(bytes: &[u8]) -> Id {
-    hash(Kind::Blob, b"lngnb:blob:1\0", bytes)
+    let mut hash = BlobHasher::default();
+    hash.update(bytes);
+    hash.finish()
+}
+/// A3のBlob domainを一箇所で保持し、全本文をRAMへ載せずに計算する。
+pub struct BlobHasher(Sha256);
+impl Default for BlobHasher {
+    fn default() -> Self {
+        let mut h = Sha256::new();
+        h.update(b"lngnb:blob:1\0");
+        Self(h)
+    }
+}
+impl BlobHasher {
+    pub fn update(&mut self, bytes: &[u8]) {
+        self.0.update(bytes);
+    }
+    pub fn finish(self) -> Id {
+        Id {
+            kind: Kind::Blob,
+            bytes: self.0.finalize().into(),
+        }
+    }
 }
 pub fn key_id(bytes: &[u8; 32]) -> Id {
     hash(Kind::Key, b"lngnb:key:ed25519:1\0", bytes)

@@ -8,20 +8,20 @@ use std::{
     process::{Command, Stdio},
 };
 
-struct Temp {
-    root: PathBuf,
+pub(super) struct Temp {
+    pub(super) root: PathBuf,
 }
 impl Temp {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let id = crate::id::Id::random_knowledge().unwrap();
         let root = std::env::temp_dir().join(format!("lngnb-store-test-{id}"));
         stdfs::DirBuilder::new().mode(0o700).create(&root).unwrap();
         Self { root }
     }
-    fn data(&self) -> PathBuf {
+    pub(super) fn data(&self) -> PathBuf {
         self.root.join("data")
     }
-    fn store(&self) -> RecordStore {
+    pub(super) fn store(&self) -> RecordStore {
         RecordStore::initialize(&self.data(), Limits::default()).unwrap()
     }
 }
@@ -30,7 +30,7 @@ impl Drop for Temp {
         let _ = stdfs::remove_dir_all(&self.root);
     }
 }
-fn fixture_data() -> serde_json::Value {
+pub(super) fn fixture_data() -> serde_json::Value {
     let spec = include_str!("../docs/specification-v1.0.0.md");
     let part = spec
         .split("## 付録A13 Record・IDの固定計算例")
@@ -44,13 +44,13 @@ fn fixture_data() -> serde_json::Value {
         .unwrap();
     serde_json::from_str(part).unwrap()
 }
-fn unhex(hex: &str) -> Vec<u8> {
+pub(super) fn unhex(hex: &str) -> Vec<u8> {
     (0..hex.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
         .collect()
 }
-fn fixture() -> LocalRecord {
+pub(super) fn fixture() -> LocalRecord {
     let f = fixture_data();
     LocalRecord::check(
         &unhex(f["genesis"]["envelope_cbor_hex"].as_str().unwrap()),
@@ -172,7 +172,8 @@ fn missing_database_and_unknown_versions_are_not_initialized_or_modified() {
     ));
     assert_eq!(stdfs::read(t.data().join(DB)).unwrap(), unknown);
     let c = raw_conn(&t.data());
-    c.pragma_update(None, "user_version", 1).unwrap();
+    c.pragma_update(None, "user_version", SCHEMA_VERSION)
+        .unwrap();
     c.execute(
         "UPDATE storage_state SET implementation='other-implementation'",
         [],
@@ -549,4 +550,16 @@ fn corruption_discovered_during_session_prevents_clean_stop() {
             Err(StorageError::UnresolvedFailure)
         ));
     }
+}
+
+#[test]
+fn dropping_store_releases_flock_even_if_an_unused_descriptor_was_inherited() {
+    let t = Temp::new();
+    let store = t.store();
+    let inherited = store._lock.0.try_clone().unwrap();
+    drop(store);
+    let reopened = RecordStore::open(&t.data(), Limits::default()).unwrap();
+    assert_eq!(reopened.startup_state().unwrap(), StartupState::Clean);
+    drop(reopened);
+    drop(inherited);
 }
