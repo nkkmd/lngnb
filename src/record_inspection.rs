@@ -407,3 +407,14 @@ pub(super) fn validate_aux(store: &RecordStore) -> Result<()> {
     blob_checks::restore(store, cp.epoch, (cp.blob_files, cp.blob_bytes))?;
     Ok(())
 }
+pub(super) fn validate_for_resume(store: &RecordStore) -> Result<()> {
+    let cp = checkpoint(&store.conn)?;
+    if !store.records_checked || cp.pending() {
+        return Err(StorageError::InspectionPending);
+    }
+    validate_aux(store)?;
+    if cp.phase == "complete" {
+        blob_checks::validate_complete(store, cp.epoch, (cp.blob_files, cp.blob_bytes))?;
+    }
+    Ok(())
+}

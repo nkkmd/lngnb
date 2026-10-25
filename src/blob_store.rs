@@ -142,6 +142,9 @@ pub(super) fn entries(dir: &OwnedFd, remaining: &mut u64) -> Result<Vec<String>>
     Ok(names)
 }
 impl RecordStore {
+    pub(super) fn recovery_files(&self) -> Result<Vec<(String, String)>> {
+        recovery_files(&self.dir, self.limits.scan_blob_files)
+    }
     pub fn blob_recovery(&self) -> &BlobRecovery {
         &self.blob_recovery
     }
@@ -467,3 +470,21 @@ impl RecordWriter {
 #[cfg(test)]
 #[path = "blob_store_tests.rs"]
 mod tests;
+
+// 全保持実体とstagingの変更検出。hashとは別に確定直前まで同じ一覧を要求する。
+pub(super) fn recovery_files(root: &OwnedFd, max_files: u64) -> Result<Vec<(String, String)>> {
+    let mut out = Vec::new();
+    let mut remaining = max_files;
+    for area in ["blobs", "staging"] {
+        let dir = blob_directory(root, area)?;
+        out.push((
+            area.into(),
+            fingerprint(&std::fs::metadata(anchored(&dir, "."))?),
+        ));
+        for name in entries(&dir, &mut remaining)? {
+            let file = checked_file(&dir, &name)?;
+            out.push((format!("{area}/{name}"), fingerprint(&file.metadata()?)));
+        }
+    }
+    Ok(out)
+}

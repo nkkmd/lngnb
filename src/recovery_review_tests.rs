@@ -11,15 +11,15 @@ use std::{
     process::{Command, Stdio},
 };
 
-fn open(t: &Temp) -> RecordStore {
+pub(super) fn open(t: &Temp) -> RecordStore {
     RecordStore::open(&t.data(), Limits::default()).unwrap()
 }
-fn path(t: &Temp) -> std::path::PathBuf {
+pub(super) fn path(t: &Temp) -> std::path::PathBuf {
     t.data()
         .join("blobs")
         .join(blobs::hex(&id::blob_id(&bytes()).bytes))
 }
-fn populated(t: &Temp) -> LocalRecord {
+pub(super) fn populated(t: &Temp) -> LocalRecord {
     let bad = rev(&[], 15, "bad");
     let child = rev(&[bad.id()], 14, "child");
     let mut w = t.store().begin().unwrap();
@@ -33,7 +33,7 @@ fn populated(t: &Temp) -> LocalRecord {
     drop(w);
     bad
 }
-fn review(s: RecordStore) -> Result<EvidenceRecoveryReview> {
+pub(super) fn review(s: RecordStore) -> Result<EvidenceRecoveryReview> {
     let g = s.generation()?;
     s.confirm_evidence_recovery(
         g,

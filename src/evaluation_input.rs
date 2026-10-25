@@ -354,6 +354,21 @@ pub(super) fn ready(
             .collect(),
     )))
 }
+// 明示再開では、保存要約を現在の一次Recordから得た入力と照合する。
+pub(super) fn validate_for_resume(store: &RecordStore, c: &Computed) -> Result<()> {
+    if let Some((_, nodes)) = ready(store, &c.budget)? {
+        if nodes.len() != c.nodes.len() {
+            return Err(StorageError::Corrupt);
+        }
+        for (id, node) in nodes {
+            c.budget.check()?;
+            if c.nodes.get(&id).map(encode).transpose()? != Some(encode(&node)?) {
+                return Err(StorageError::Corrupt);
+            }
+        }
+    }
+    Ok(())
+}
 impl EvaluationJob {
     /// 局所検査したRecordだけを依存情報へ変換して保存する。収集途中はstepへ進めない。
     pub fn prepare(

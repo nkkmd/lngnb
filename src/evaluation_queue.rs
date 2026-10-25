@@ -51,6 +51,20 @@ struct Saved {
     results: BTreeMap<Key, Assessment>,
     label: String,
 }
+pub(super) fn validate_for_resume(store: &RecordStore, c: &Computed) -> Result<()> {
+    if let Some(saved) = load(store, &c.budget)? {
+        if saved.input != input_digest(c) || saved.results.len() != c.nodes.len() {
+            return Err(StorageError::EvaluationInputPending);
+        }
+        for row in &c.snapshot.records {
+            c.budget.check()?;
+            if saved.results.get(&row.record_id.bytes) != Some(row) {
+                return Err(StorageError::Corrupt);
+            }
+        }
+    }
+    Ok(())
+}
 fn optional<T: Copy>(v: &Value, choices: &[(&str, T)]) -> Result<Option<T>> {
     match v {
         Value::Null => Ok(None),
