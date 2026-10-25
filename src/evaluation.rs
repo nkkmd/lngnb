@@ -636,7 +636,7 @@ impl RecordWriter {
 
 #[cfg(test)]
 #[path = "evaluation_tests.rs"]
-mod tests;
+pub(super) mod tests;
 
 fn publish(tx: &Transaction<'_>, computed: &mut Computed, limits: EvaluationLimits) -> Result<()> {
     let old_rows = {
@@ -772,3 +772,22 @@ pub use blob_preparation::{EvaluationBlobBudget, EvaluationBlobProgress};
 #[path = "recovery_review.rs"]
 mod recovery_review;
 pub use recovery_review::EvidenceRecoveryReview;
+
+impl RecordStore {
+    pub(super) fn startup_evaluation(self, began_clean: bool) -> Result<EvaluationJob> {
+        let mut job = self.evaluation_job()?;
+        job.started_clean = began_clean;
+        Ok(job)
+    }
+}
+impl EvaluationJob {
+    pub(super) fn startup_writer(self) -> Result<RecordWriter> {
+        if self.writer.failed {
+            return Err(StorageError::UnresolvedFailure);
+        }
+        Ok(self.writer)
+    }
+    pub(super) fn startup_store(&self) -> &RecordStore {
+        &self.writer.store
+    }
+}

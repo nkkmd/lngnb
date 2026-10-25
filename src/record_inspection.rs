@@ -378,7 +378,20 @@ impl RecordInspection {
     }
     /// 実装済みのRecord/Blob起動検査が終了したStoreだけを返す。
     /// 元からの異常終了/根拠欠損の手動待ちを解除する復旧操作ではない。
-    pub fn into_store(mut self) -> Result<RecordStore> {
+    pub fn into_store(self) -> Result<RecordStore> {
+        self.complete_store(true)
+    }
+    pub(super) fn began_clean(&self) -> bool {
+        self.started_clean
+    }
+    pub(super) fn recovery_needs_review(&self) -> bool {
+        self.store.blob_recovery.needs_review()
+    }
+    // 統合起動では親評価へ渡す間もrunningを維持する。
+    pub(super) fn into_running_store(self) -> Result<RecordStore> {
+        self.complete_store(false)
+    }
+    fn complete_store(mut self, restore_clean: bool) -> Result<RecordStore> {
         if self.failed {
             return Err(StorageError::UnresolvedFailure);
         }
@@ -387,7 +400,7 @@ impl RecordInspection {
         }
         let cp = checkpoint(&self.store.conn)?;
         blob_checks::validate_complete(&self.store, cp.epoch, (cp.blob_files, cp.blob_bytes))?;
-        if self.started_clean && !self.store.blob_recovery.needs_review() {
+        if restore_clean && self.started_clean && !self.store.blob_recovery.needs_review() {
             transition(&mut self.store.conn, "clean", "finish_record_inspection")?;
         }
         self.store.records_checked = true;

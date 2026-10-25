@@ -858,3 +858,7 @@ pub use evaluation::{
 #[path = "record_inspection.rs"]
 mod inspection;
 pub use inspection::{InspectionBudget, InspectionProgress, RecordInspection};
+
+#[path = "local_startup.rs"]
+mod startup;
+pub use startup::{LocalStartup, LocalStartupBudget, LocalStartupProgress};
