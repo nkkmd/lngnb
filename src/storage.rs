@@ -1,5 +1,5 @@
 //! 工程④: 不変Record/Blobのローカル保存と書込みセッション。
-//! 親依存評価、pin、配信許可、管理者の復旧確認の代替にはならない。
+//! 親依存評価は管理用内部機能。pin、配信許可、管理者の復旧確認の代替にはならない。
 use crate::{
     cbor::MAX_RECORD,
     id::{Id, Kind},
@@ -16,7 +16,7 @@ use std::{
 };
 
 pub const IMPLEMENTATION: &str = "lngnb-rust-sqlite-1";
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 const DB: &str = "database.sqlite";
 const SCHEMA: &str = "
 CREATE TABLE storage_state (
@@ -38,6 +38,41 @@ CREATE TABLE blobs (
 ) STRICT;
 CREATE TRIGGER blobs_no_update BEFORE UPDATE ON blobs BEGIN SELECT RAISE(ABORT,'immutable_blob'); END;
 CREATE TRIGGER blobs_no_delete BEFORE DELETE ON blobs BEGIN SELECT RAISE(ABORT,'immutable_blob'); END;
+CREATE TABLE blob_failures (
+ id BLOB PRIMARY KEY NOT NULL CHECK(length(id)=32),
+ reason TEXT NOT NULL CHECK(reason IN ('transfer_hash_mismatch','transfer_failed')),
+ generation INTEGER NOT NULL, at TEXT NOT NULL
+) STRICT;
+CREATE TABLE evaluation_state (
+ singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+ dirty INTEGER NOT NULL CHECK(dirty IN (0,1)),
+ generation INTEGER
+) STRICT;
+INSERT INTO evaluation_state VALUES(1,1,NULL);
+CREATE TRIGGER record_invalidates_evaluation AFTER INSERT ON records BEGIN UPDATE evaluation_state SET dirty=1; END;
+CREATE TRIGGER blob_invalidates_evaluation AFTER INSERT ON blobs BEGIN UPDATE evaluation_state SET dirty=1; END;
+CREATE TRIGGER failed_blob_invalidates_evaluation AFTER INSERT ON blob_failures BEGIN UPDATE evaluation_state SET dirty=1; END;
+CREATE TRIGGER changed_blob_failure_invalidates_evaluation AFTER UPDATE ON blob_failures BEGIN UPDATE evaluation_state SET dirty=1; END;
+CREATE TABLE parent_edges (
+ child BLOB NOT NULL REFERENCES records(id), parent BLOB NOT NULL CHECK(length(parent)=32),
+ PRIMARY KEY(child,parent)
+) STRICT;
+CREATE INDEX parent_reverse ON parent_edges(parent,child);
+CREATE TABLE evaluations (
+ record_id BLOB PRIMARY KEY NOT NULL REFERENCES records(id),
+ validation TEXT NOT NULL CHECK(validation IN ('valid','pending','invalid')),
+ payload TEXT CHECK(payload IN ('verified','missing','unavailable')),
+ reason TEXT, related BLOB CHECK(related IS NULL OR length(related)=32), payload_reason TEXT
+) STRICT;
+CREATE TABLE known_invalid (
+ record_id BLOB PRIMARY KEY NOT NULL REFERENCES records(id),
+ reason TEXT NOT NULL CHECK(reason='declared_length_mismatch'),
+ blob_id BLOB NOT NULL REFERENCES blobs(id), actual_length INTEGER NOT NULL CHECK(actual_length>=0),
+ rules TEXT NOT NULL CHECK(rules='lngnb-validation-1'),
+ generation INTEGER NOT NULL, at TEXT NOT NULL
+) STRICT;
+CREATE TRIGGER evidence_no_update BEFORE UPDATE ON known_invalid BEGIN SELECT RAISE(ABORT,'immutable_evidence'); END;
+CREATE TRIGGER evidence_no_delete BEFORE DELETE ON known_invalid BEGIN SELECT RAISE(ABORT,'immutable_evidence'); END;
 CREATE TABLE history (
  generation INTEGER PRIMARY KEY CHECK(generation>=0),
  namespace BLOB NOT NULL CHECK(length(namespace)=32),
@@ -280,12 +315,18 @@ fn check_format(conn: &Connection) -> Result<()> {
         [generation],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
-    let expected_state =
-        if ["stored_local_only", "blob_retained_local_only"].contains(&audit_state.as_str()) {
-            "running"
-        } else {
-            audit_state.as_str()
-        };
+    let expected_state = if [
+        "stored_local_only",
+        "blob_retained_local_only",
+        "evaluated_local_only",
+        "blob_failure_observed",
+    ]
+    .contains(&audit_state.as_str())
+    {
+        "running"
+    } else {
+        audit_state.as_str()
+    };
     if audit_namespace != namespace || expected_state != state || rules != "lngnb-validation-1" {
         return Err(StorageError::Corrupt);
     }
@@ -553,6 +594,8 @@ impl RecordStore {
             blobs: 0,
             #[cfg(test)]
             blob_fault: None,
+            #[cfg(test)]
+            evaluation_pause: false,
         })
     }
 }
@@ -567,6 +610,8 @@ pub struct RecordWriter {
     blobs: u64,
     #[cfg(test)]
     blob_fault: Option<blobs::BlobFault>,
+    #[cfg(test)]
+    evaluation_pause: bool,
 }
 impl RecordWriter {
     pub fn record(&mut self, id: Id) -> Result<Option<LocalRecord>> {
@@ -671,3 +716,10 @@ mod tests;
 #[path = "blob_store.rs"]
 mod blobs;
 pub use blobs::{BlobRecovery, BlobStored};
+
+#[path = "evaluation.rs"]
+mod evaluation;
+pub use evaluation::{
+    Assessment, EvaluationLimits, EvaluationSnapshot, PayloadReason, PayloadStatus, Reason,
+    Validation,
+};

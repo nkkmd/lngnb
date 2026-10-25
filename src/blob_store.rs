@@ -38,7 +38,7 @@ pub(super) fn initialize_directories(root: &OwnedFd) -> Result<()> {
     fs::fsync(root)?;
     Ok(())
 }
-fn blob_directory(root: &OwnedFd, name: &str) -> Result<OwnedFd> {
+pub(super) fn blob_directory(root: &OwnedFd, name: &str) -> Result<OwnedFd> {
     let fd = fs::openat(
         root,
         name,
@@ -90,7 +90,12 @@ fn checked_file(dir: &OwnedFd, name: &str) -> Result<File> {
     }
     Ok(file)
 }
-fn verify_file(dir: &OwnedFd, id: Id, length: Option<u64>, budget: u64) -> Result<(File, u64)> {
+pub(super) fn verify_file(
+    dir: &OwnedFd,
+    id: Id,
+    length: Option<u64>,
+    budget: u64,
+) -> Result<(File, u64)> {
     let mut file = checked_file(dir, &hex(&id.bytes))?;
     let expected_len = file.metadata()?.len();
     if expected_len > budget {
@@ -270,6 +275,19 @@ impl RecordWriter {
         self.blobs += 1;
         let mut clean_abort = false;
         let result = self.put_blob_inner(id, input, max, &mut clean_abort);
+        // 壊れた転送は宣言矛盾の証明ではない。失敗観測だけを別に記録する。
+        let failure = match &result {
+            Err(StorageError::BlobHashMismatch) => Some("transfer_hash_mismatch"),
+            Err(StorageError::Io(_)) => Some("transfer_failed"),
+            _ => None,
+        };
+        if let Some(reason) = failure {
+            if let Err(e) = self.observe_blob_failure(id, reason) {
+                self.reserved -= reserve;
+                self.failed = true;
+                return Err(e);
+            }
+        }
         self.reserved -= reserve;
         match &result {
             Ok(_) => (),
