@@ -453,3 +453,71 @@ fn multi_buffer_streaming_and_session_count_limit() {
     let s = RecordStore::open(&t.data(), Limits::default()).unwrap();
     assert_eq!(read_blob(&s, id), bytes);
 }
+
+#[test]
+fn aborted_transfers_consume_bytes_and_attempts_even_after_cleanup() {
+    struct MustNotRead;
+    impl Read for MustNotRead {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            panic!("exhausted budget must reject before receiving");
+        }
+    }
+    for over_limit in [false, true] {
+        for count_limited in [false, true] {
+            let t = Temp::new();
+            let limits = Limits {
+                max_blob_bytes: 3,
+                session_bytes: if count_limited { 100 } else { 6 },
+                session_blobs: if count_limited { 1 } else { 100 },
+                ..Limits::default()
+            };
+            let mut w = RecordStore::initialize(&t.data(), limits)
+                .unwrap()
+                .begin()
+                .unwrap();
+            let result = if over_limit {
+                w.put_blob(id::blob_id(b"abcd"), Cursor::new(b"abcd"))
+            } else {
+                w.put_blob(id::blob_id(b"abc"), Cursor::new(b"bad"))
+            };
+            assert!(matches!(
+                result,
+                Err(StorageError::BudgetExceeded | StorageError::BlobHashMismatch)
+            ));
+            assert_eq!(w.blobs, 1);
+            assert_eq!(w.bytes, if over_limit { 4 } else { 3 });
+            assert_eq!(w.reserved, 0);
+            assert!(matches!(
+                w.put_blob(id::blob_id(b"abc"), MustNotRead),
+                Err(StorageError::BudgetExceeded)
+            ));
+            assert_eq!(w.blobs, 1);
+            assert!(w.store.blob_recovery().incomplete_staging.is_empty());
+            w.finish().unwrap();
+            assert!(
+                !RecordStore::open(&t.data(), Limits::default())
+                    .unwrap()
+                    .blob_recovery()
+                    .needs_review()
+            );
+        }
+    }
+    // 上限超過検出の1byteもジョブ予算内に確保できなければ、最初から受信しない。
+    let t = Temp::new();
+    let limits = Limits {
+        max_blob_bytes: 3,
+        session_bytes: 3,
+        ..Limits::default()
+    };
+    let mut w = RecordStore::initialize(&t.data(), limits)
+        .unwrap()
+        .begin()
+        .unwrap();
+    assert!(matches!(
+        w.put_blob(id::blob_id(b"abc"), MustNotRead),
+        Err(StorageError::BudgetExceeded)
+    ));
+    assert_eq!(w.bytes, 0);
+    assert_eq!(w.blobs, 0);
+    w.finish().unwrap();
+}

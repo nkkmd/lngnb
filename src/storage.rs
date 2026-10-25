@@ -210,14 +210,22 @@ fn check_files(fd: &OwnedFd) -> Result<()> {
     }
     Ok(())
 }
-fn lock(fd: &OwnedFd, create: bool) -> Result<OwnedFd> {
+// closeだけでは、同じopen-file-descriptionを一時継承した子プロセスが
+// execするまでflockが残る。所有Storeの接続終了後に明示解除してからfdを閉じる。
+struct DataLock(OwnedFd);
+impl Drop for DataLock {
+    fn drop(&mut self) {
+        let _ = fs::flock(&self.0, FlockOperation::Unlock);
+    }
+}
+fn lock(fd: &OwnedFd, create: bool) -> Result<DataLock> {
     let mut flags = OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOFOLLOW;
     if create {
         flags |= OFlags::CREATE | OFlags::EXCL;
     }
     let lock = fs::openat(fd, "lock", flags, Mode::RUSR | Mode::WUSR)?;
     match fs::flock(&lock, FlockOperation::NonBlockingLockExclusive) {
-        Ok(()) => Ok(lock),
+        Ok(()) => Ok(DataLock(lock)),
         Err(rustix::io::Errno::WOULDBLOCK) => Err(StorageError::Busy),
         Err(e) => Err(e.into()),
     }
@@ -348,7 +356,7 @@ fn transition(conn: &mut Connection, new: &str, reason: &str) -> Result<()> {
 pub struct RecordStore {
     // Rustのfield drop順で、接続を閉じてからlockとdirectoryを解放する。
     conn: Connection,
-    _lock: OwnedFd,
+    _lock: DataLock,
     dir: OwnedFd,
     limits: Limits,
     blob_recovery: BlobRecovery,
@@ -374,7 +382,7 @@ impl RecordStore {
         )?;
         check_area(&dir)?;
         let lock = lock(&dir, true)?;
-        fs::fsync(&lock)?;
+        fs::fsync(&lock.0)?;
         let db = fs::openat(
             &dir,
             DB,

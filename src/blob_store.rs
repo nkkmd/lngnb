@@ -240,7 +240,8 @@ impl RecordWriter {
         result
     }
     /// inputの全体転送を検査し、明示的に保持する。宣言長の採否や公開状態は扱わない。
-    /// 一Blob上限全量のジョブ/容量予算を開始前に予約し、予算不足ならreaderを読まない。
+    /// 転送は一Blob上限＋超過検出1byte、容量は上限全量を開始前に予約する。
+    /// 中止した受信bytes/試行件数も消費し、予算不足ならreaderを読まない。
     pub fn put_blob(&mut self, id: Id, input: impl Read) -> Result<BlobStored> {
         if self.failed {
             return Err(StorageError::UnresolvedFailure);
@@ -249,8 +250,9 @@ impl RecordWriter {
             return Err(StorageError::InvalidBlobId);
         }
         let max = self.store.limits.max_blob_bytes;
+        let transfer_reserve = max.checked_add(1).ok_or(StorageError::BudgetExceeded)?;
         if self.blobs >= self.store.limits.session_blobs
-            || max > self.store.limits.session_bytes.saturating_sub(self.bytes)
+            || transfer_reserve > self.store.limits.session_bytes.saturating_sub(self.bytes)
         {
             return Err(StorageError::BudgetExceeded);
         }
@@ -265,14 +267,12 @@ impl RecordWriter {
             return Err(StorageError::Capacity);
         }
         self.reserved += reserve;
+        self.blobs += 1;
         let mut clean_abort = false;
         let result = self.put_blob_inner(id, input, max, &mut clean_abort);
         self.reserved -= reserve;
         match &result {
-            Ok(blob) => {
-                self.blobs += 1;
-                self.bytes += blob.byte_length;
-            }
+            Ok(_) => (),
             Err(_) if clean_abort => (),
             Err(_) => self.failed = true,
         }
@@ -316,6 +316,11 @@ impl RecordWriter {
             if n == 0 {
                 break;
             }
+            // 書込み/ハッシュ/上限判定より先に、受信済み量を計上する。
+            self.bytes = self
+                .bytes
+                .checked_add(n as u64)
+                .ok_or(StorageError::BudgetExceeded)?;
             if n as u64 > max - length {
                 drop(file);
                 remove_staging(&staging, &name)?;

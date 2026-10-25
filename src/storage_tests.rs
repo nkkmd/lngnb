@@ -551,3 +551,15 @@ fn corruption_discovered_during_session_prevents_clean_stop() {
         ));
     }
 }
+
+#[test]
+fn dropping_store_releases_flock_even_if_an_unused_descriptor_was_inherited() {
+    let t = Temp::new();
+    let store = t.store();
+    let inherited = store._lock.0.try_clone().unwrap();
+    drop(store);
+    let reopened = RecordStore::open(&t.data(), Limits::default()).unwrap();
+    assert_eq!(reopened.startup_state().unwrap(), StartupState::Clean);
+    drop(reopened);
+    drop(inherited);
+}
