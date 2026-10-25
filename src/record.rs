@@ -398,4 +398,32 @@ impl LocalRecord {
     pub fn kind(&self) -> RecordKind {
         self.kind
     }
+    pub(crate) fn knowledge(&self) -> [u8; 32] {
+        self.knowledge
+    }
+    pub(crate) fn genesis(&self) -> Result<[u8; 32]> {
+        match self.kind {
+            RecordKind::Genesis => Ok(self.id.bytes),
+            RecordKind::Revision => bytes(get(&self.body, "genesis_record_id")?),
+        }
+    }
+    pub(crate) fn parents(&self) -> Result<Vec<[u8; 32]>> {
+        if self.kind == RecordKind::Genesis {
+            return Ok(Vec::new());
+        }
+        array(get(&self.body, "parents")?)?
+            .iter()
+            .map(bytes)
+            .collect()
+    }
+    pub(crate) fn payload(&self) -> Result<Option<([u8; 32], u64)>> {
+        if self.kind == RecordKind::Genesis {
+            return Ok(None);
+        }
+        let payload = get(&self.body, "payload")?;
+        Ok(Some((
+            bytes(get(payload, "blob_id")?)?,
+            u63(get(payload, "byte_length")?)?,
+        )))
+    }
 }
