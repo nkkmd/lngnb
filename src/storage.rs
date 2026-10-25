@@ -16,7 +16,7 @@ use std::{
 };
 
 pub const IMPLEMENTATION: &str = "lngnb-rust-sqlite-1";
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 const DB: &str = "database.sqlite";
 const SCHEMA: &str = "
 CREATE TABLE storage_state (
@@ -85,9 +85,25 @@ CREATE TABLE evaluation_state (
  generation INTEGER,
  job_started INTEGER NOT NULL CHECK(job_started IN (0,1)),
  input_started INTEGER NOT NULL CHECK(input_started IN (0,1)),
- record_epoch INTEGER NOT NULL CHECK(record_epoch>=0)
+ record_epoch INTEGER NOT NULL CHECK(record_epoch>=0),
+ payload_epoch INTEGER NOT NULL CHECK(payload_epoch>=0),
+ blob_input_started INTEGER NOT NULL CHECK(blob_input_started IN (0,1))
 ) STRICT;
-INSERT INTO evaluation_state VALUES(1,1,NULL,0,0,0);
+INSERT INTO evaluation_state VALUES(1,1,NULL,0,0,0,0,0);
+CREATE TABLE evaluation_blob_input (
+ singleton INTEGER PRIMARY KEY CHECK(singleton=1), record_epoch INTEGER NOT NULL CHECK(record_epoch>=0),
+ payload_epoch INTEGER NOT NULL CHECK(payload_epoch>=0), directory TEXT NOT NULL CHECK(length(directory) BETWEEN 1 AND 512),
+ digest BLOB NOT NULL CHECK(length(digest)=32), total INTEGER NOT NULL CHECK(total>=0),
+ complete INTEGER NOT NULL CHECK(complete IN (0,1)), checkpoint_generation INTEGER NOT NULL CHECK(checkpoint_generation>=0)
+) STRICT;
+CREATE TABLE evaluation_blob_facts (
+ blob_id BLOB PRIMARY KEY NOT NULL CHECK(length(blob_id)=32),
+ byte_length INTEGER CHECK(byte_length IS NULL OR byte_length>=0),
+ size INTEGER CHECK(size IS NULL OR size>=0), fingerprint TEXT CHECK(fingerprint IS NULL OR length(fingerprint) BETWEEN 1 AND 512),
+ transfer TEXT CHECK(transfer IN ('transfer_hash_mismatch','transfer_failed')),
+ state TEXT NOT NULL CHECK(state IN ('pending','verified','missing','failed','unavailable')),
+ examined_bytes INTEGER NOT NULL CHECK(examined_bytes>=0)
+) STRICT;
 CREATE TABLE evaluation_input (
  singleton INTEGER PRIMARY KEY CHECK(singleton=1), epoch INTEGER NOT NULL CHECK(epoch>=0),
  cursor BLOB CHECK(cursor IS NULL OR length(cursor)=32),
@@ -113,9 +129,9 @@ CREATE TABLE evaluation_work (
  result BLOB NOT NULL CHECK(length(result) BETWEEN 1 AND 1024)
 ) STRICT;
 CREATE TRIGGER record_invalidates_evaluation AFTER INSERT ON records BEGIN UPDATE evaluation_state SET dirty=1,record_epoch=record_epoch+1; END;
-CREATE TRIGGER blob_invalidates_evaluation AFTER INSERT ON blobs BEGIN UPDATE evaluation_state SET dirty=1; END;
-CREATE TRIGGER failed_blob_invalidates_evaluation AFTER INSERT ON blob_failures BEGIN UPDATE evaluation_state SET dirty=1; END;
-CREATE TRIGGER changed_blob_failure_invalidates_evaluation AFTER UPDATE ON blob_failures BEGIN UPDATE evaluation_state SET dirty=1; END;
+CREATE TRIGGER blob_invalidates_evaluation AFTER INSERT ON blobs BEGIN UPDATE evaluation_state SET dirty=1,payload_epoch=payload_epoch+1; END;
+CREATE TRIGGER failed_blob_invalidates_evaluation AFTER INSERT ON blob_failures BEGIN UPDATE evaluation_state SET dirty=1,payload_epoch=payload_epoch+1; END;
+CREATE TRIGGER changed_blob_failure_invalidates_evaluation AFTER UPDATE ON blob_failures BEGIN UPDATE evaluation_state SET dirty=1,payload_epoch=payload_epoch+1; END;
 CREATE TABLE parent_edges (
  child BLOB NOT NULL REFERENCES records(id), parent BLOB NOT NULL CHECK(length(parent)=32),
  PRIMARY KEY(child,parent)
@@ -410,6 +426,8 @@ fn check_format(conn: &Connection) -> Result<()> {
         "evaluation_job_complete",
         "evaluation_input_pending",
         "evaluation_input_complete",
+        "evaluation_blob_pending",
+        "evaluation_blob_complete",
     ]
     .contains(&audit_state.as_str())
     {
@@ -827,9 +845,9 @@ pub use blobs::{BlobRecovery, BlobStored};
 #[path = "evaluation.rs"]
 mod evaluation;
 pub use evaluation::{
-    Assessment, EvaluationInputBudget, EvaluationInputProgress, EvaluationJob, EvaluationLimits,
-    EvaluationProgress, EvaluationSnapshot, EvaluationStepBudget, PayloadReason, PayloadStatus,
-    Reason, Validation,
+    Assessment, EvaluationBlobBudget, EvaluationBlobProgress, EvaluationInputBudget,
+    EvaluationInputProgress, EvaluationJob, EvaluationLimits, EvaluationProgress,
+    EvaluationSnapshot, EvaluationStepBudget, PayloadReason, PayloadStatus, Reason, Validation,
 };
 
 #[path = "record_inspection.rs"]
