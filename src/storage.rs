@@ -180,6 +180,7 @@ pub enum StorageError {
     EvaluationInputPending,
     StaleRecoveryReview,
     InvalidRecoveryReview,
+    ProtectionChanged,
 }
 impl std::fmt::Display for StorageError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -200,6 +201,7 @@ impl std::fmt::Display for StorageError {
             Self::EvaluationInputPending => "evaluation_input_pending",
             Self::StaleRecoveryReview => "stale_recovery_review",
             Self::InvalidRecoveryReview => "invalid_recovery_review",
+            Self::ProtectionChanged => "protection_snapshot_changed",
         })
     }
 }
@@ -862,3 +864,7 @@ pub use inspection::{InspectionBudget, InspectionProgress, RecordInspection};
 #[path = "local_startup.rs"]
 mod startup;
 pub use startup::{LocalStartup, LocalStartupBudget, LocalStartupProgress};
+
+#[path = "blob_protection.rs"]
+mod protection;
+pub use protection::{BlobProtection, BlobProtectionSnapshot, ProtectionBudget, ProtectionVersion};
