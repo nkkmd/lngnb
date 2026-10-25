@@ -84,6 +84,298 @@ fn blob_path(t: &Temp) -> std::path::PathBuf {
     t.data().join("blobs").join(hex)
 }
 
+fn oracle_case(records: &[LocalRecord], retained: bool) -> serde_json::Value {
+    serde_json::json!({
+        "records": records.iter().map(|r| data_encoding::HEXLOWER.encode(r.bytes())).collect::<Vec<_>>(),
+        "retained": if retained { vec![data_encoding::HEXLOWER.encode(&bytes())] } else { vec![] },
+    })
+}
+
+fn assert_oracle(cases: &[(serde_json::Value, EvaluationSnapshot)]) {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let input: Vec<_> = cases.iter().map(|(case, _)| case).collect();
+    let mut child = Command::new(
+        std::env::var_os("LNGNB_REFERENCE_PYTHON").unwrap_or_else(|| "python3".into()),
+    )
+    .arg(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/dependency_reference.py"
+    ))
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .expect("独立した依存評価用Python環境が必要");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&serde_json::to_vec(&input).unwrap())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "独立依存評価失敗: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let expected: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(expected.len(), cases.len());
+    for (index, ((_, snapshot), expected)) in cases.iter().zip(expected).enumerate() {
+        let actual: Vec<_> = snapshot
+            .records
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": data_encoding::HEXLOWER.encode(&r.record_id.bytes),
+                    "validation": r.validation.text(),
+                    "payload": r.payload_status.map(PayloadStatus::text),
+                    "payload_reason": r.payload_reason.map(PayloadReason::code),
+                    "reason": r.reason.map(Reason::code),
+                    "related": r.related.map(|id| data_encoding::HEXLOWER.encode(&id.bytes)),
+                })
+            })
+            .collect();
+        assert_eq!(serde_json::json!(actual), expected, "独立照合case {index}");
+    }
+}
+
+#[test]
+fn signed_deep_history_and_arrival_orders_match_independent_dfs() {
+    // 実際の署名・IDを持つ65段。内部Nodeだけを置換する既存の1000段試験とは別。
+    let mut records = vec![fixture()];
+    let mut parent = None;
+    for depth in 0..65 {
+        let record = rev(
+            &parent.into_iter().collect::<Vec<_>>(),
+            14,
+            &format!("depth {depth}"),
+        );
+        parent = Some(record.id());
+        records.push(record);
+    }
+    let bad = rev(&[parent.unwrap()], 15, "genuine length mismatch");
+    let good = rev(&[parent.unwrap()], 14, "unaffected branch");
+    let join = rev(&[bad.id(), good.id()], 14, "join");
+    let missing = record_id([0x91; 32]);
+    let incomplete = rev(&[missing], 14, "absent parent");
+    let pending_child = rev(&[incomplete.id()], 14, "pending descendant");
+    let invalid_and_missing = rev(&[missing, bad.id()], 14, "invalid precedes missing");
+    records.extend([
+        bad.clone(),
+        good.clone(),
+        join.clone(),
+        incomplete.clone(),
+        pending_child.clone(),
+        invalid_and_missing.clone(),
+    ]);
+    let t = Temp::new();
+    let mut w = t.store().begin().unwrap();
+    for record in records.iter().skip(1).rev() {
+        w.insert(record).unwrap();
+    }
+    let mut cases = vec![(oracle_case(&records[1..], false), snapshot(&mut w))];
+    assert_state(
+        &cases[0].1,
+        &good,
+        Validation::Pending,
+        Some(Reason::MissingGenesis),
+    );
+    w.insert(&records[0]).unwrap();
+    cases.push((oracle_case(&records, false), snapshot(&mut w)));
+    assert_state(&cases[1].1, &bad, Validation::Valid, None);
+    assert_state(
+        &cases[1].1,
+        &pending_child,
+        Validation::Pending,
+        Some(Reason::RevalidationInProgress),
+    );
+    w.put_blob(id::blob_id(&bytes()), Cursor::new(bytes()))
+        .unwrap();
+    cases.push((oracle_case(&records, true), snapshot(&mut w)));
+    assert_state(
+        &cases[2].1,
+        &bad,
+        Validation::Invalid,
+        Some(Reason::DeclaredLengthMismatch),
+    );
+    for record in [&join, &invalid_and_missing] {
+        assert_state(
+            &cases[2].1,
+            record,
+            Validation::Invalid,
+            Some(Reason::InvalidParent),
+        );
+    }
+    assert_state(&cases[2].1, &good, Validation::Valid, None);
+    assert_eq!(
+        result(&cases[2].1, join.id()).payload_status,
+        Some(PayloadStatus::Verified)
+    );
+    w.finish().unwrap();
+    let second = Temp::new();
+    let mut w = second.store().begin().unwrap();
+    w.put_blob(id::blob_id(&bytes()), Cursor::new(bytes()))
+        .unwrap();
+    for record in &records {
+        w.insert(record).unwrap();
+    }
+    let forward = snapshot(&mut w);
+    assert_eq!(forward.records, cases[2].1.records);
+    cases.push((oracle_case(&records, true), forward));
+    w.finish().unwrap();
+    assert_oracle(&cases);
+}
+
+#[test]
+fn independent_dfs_distinguishes_transfer_failure_and_lost_invalid_evidence() {
+    let t = Temp::new();
+    let mut w = t.store().begin().unwrap();
+    let bad = rev(&[], 15, "bad");
+    let child = rev(&[bad.id()], 14, "child");
+    let good = rev(&[], 14, "good");
+    let records = [fixture(), bad.clone(), child.clone(), good.clone()];
+    for record in &records {
+        w.insert(record).unwrap();
+    }
+    let bid = id::blob_id(&bytes());
+    let hex = data_encoding::HEXLOWER.encode(&bid.bytes);
+    let mut cases = vec![(oracle_case(&records, false), snapshot(&mut w))];
+    for reason in ["transfer_hash_mismatch", "transfer_failed"] {
+        w.observe_blob_failure(bid, reason).unwrap();
+        let mut case = oracle_case(&records, false);
+        case["failures"] = serde_json::json!({hex.clone(): reason});
+        let s = snapshot(&mut w);
+        assert_state(&s, &bad, Validation::Valid, None);
+        assert_eq!(
+            result(&s, bad.id()).payload_status,
+            Some(PayloadStatus::Unavailable)
+        );
+        cases.push((case, s));
+    }
+    w.put_blob(bid, Cursor::new(bytes())).unwrap();
+    let mut case = oracle_case(&records, true);
+    case["failures"] = serde_json::json!({hex.clone(): "transfer_failed"});
+    cases.push((case, snapshot(&mut w)));
+    w.finish().unwrap();
+    // 真正本文を失った既知不正はvalidへ戻らず、無関係な版をpendingにしない。
+    let path = blob_path(&t);
+    std::fs::remove_file(&path).unwrap();
+    let store = RecordStore::open(&t.data(), Limits::default()).unwrap();
+    assert_eq!(store.startup_state().unwrap(), StartupState::NeedsReview);
+    let mut case = oracle_case(&records, false);
+    case["unavailable"] = serde_json::json!([hex.clone()]);
+    case["known"] = serde_json::json!([data_encoding::HEXLOWER.encode(&bad.id().bytes)]);
+    let s = store.evaluate(EvaluationLimits::default()).unwrap();
+    for record in [&bad, &child] {
+        assert_state(
+            &s,
+            record,
+            Validation::Pending,
+            Some(Reason::EvidenceUnavailable),
+        );
+    }
+    assert_state(&s, &good, Validation::Valid, None);
+    assert!(!s.committed);
+    cases.push((case, s));
+    drop(store);
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut restored = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .unwrap();
+    restored.write_all(&bytes()).unwrap();
+    restored.sync_all().unwrap();
+    drop(restored);
+    let store = RecordStore::open(&t.data(), Limits::default()).unwrap();
+    assert_eq!(store.startup_state().unwrap(), StartupState::NeedsReview);
+    let mut case = oracle_case(&records, true);
+    case["known"] = serde_json::json!([data_encoding::HEXLOWER.encode(&bad.id().bytes)]);
+    let s = store.evaluate(EvaluationLimits::default()).unwrap();
+    assert_state(
+        &s,
+        &bad,
+        Validation::Invalid,
+        Some(Reason::DeclaredLengthMismatch),
+    );
+    assert_state(&s, &child, Validation::Invalid, Some(Reason::InvalidParent));
+    cases.push((case, s));
+    assert_oracle(&cases);
+}
+
+#[test]
+fn independent_dfs_checks_genesis_publisher_and_parent_scope_before_payload() {
+    let genesis = fixture();
+    let sample = rev(&[], 14, "sample");
+    // A15 S04の公開試験seed。実運用への流用禁止。
+    let wrong_publisher = LocalRecord::sign(
+        sample.body().clone(),
+        &ed25519_dalek::SigningKey::from_bytes(&[1; 32]),
+    )
+    .unwrap();
+    let mut body = sample.body().clone();
+    set(
+        &mut body,
+        "genesis_record_id",
+        Value::Bytes(sample.id().bytes.to_vec()),
+    );
+    let wrong_genesis_kind = LocalRecord::sign(body, &key()).unwrap();
+    let mut body = sample.body().clone();
+    set(&mut body, "knowledge_id", Value::Bytes(vec![0x72; 32]));
+    let wrong_knowledge = LocalRecord::sign(body, &key()).unwrap();
+    let wrong_parent_kind = rev(&[genesis.id()], 15, "genesis is not a Revision parent");
+    let wrong_parent_scope = rev(&[wrong_knowledge.id()], 15, "foreign Knowledge parent");
+    let wrong_parent_genesis = rev(&[wrong_genesis_kind.id()], 15, "different Genesis parent");
+    let records = [
+        genesis,
+        sample,
+        wrong_publisher.clone(),
+        wrong_genesis_kind.clone(),
+        wrong_knowledge.clone(),
+        wrong_parent_kind.clone(),
+        wrong_parent_scope.clone(),
+        wrong_parent_genesis.clone(),
+    ];
+    let t = Temp::new();
+    let mut w = t.store().begin().unwrap();
+    for record in records.iter().rev() {
+        w.insert(record).unwrap();
+    }
+    w.put_blob(id::blob_id(&bytes()), Cursor::new(bytes()))
+        .unwrap();
+    let s = snapshot(&mut w);
+    assert_state(
+        &s,
+        &wrong_publisher,
+        Validation::Invalid,
+        Some(Reason::WrongPublisher),
+    );
+    for record in [&wrong_genesis_kind, &wrong_knowledge] {
+        assert_state(
+            &s,
+            record,
+            Validation::Invalid,
+            Some(Reason::GenesisMismatch),
+        );
+    }
+    for record in [
+        &wrong_parent_kind,
+        &wrong_parent_scope,
+        &wrong_parent_genesis,
+    ] {
+        assert_state(&s, record, Validation::Invalid, Some(Reason::InvalidParent));
+        assert_eq!(
+            result(&s, record.id()).payload_reason,
+            Some(PayloadReason::DeclaredLengthMismatch)
+        );
+    }
+    w.finish().unwrap();
+    assert_oracle(&[(oracle_case(&records, true), s)]);
+}
+
 #[test]
 fn missing_genesis_then_parent_arrival_and_metadata_only_history() {
     let t = Temp::new();
