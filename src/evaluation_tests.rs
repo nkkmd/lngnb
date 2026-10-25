@@ -31,7 +31,7 @@ fn set(body: &mut Value, name: &str, value: Value) {
     };
     fields.iter_mut().find(|(k, _)| k == name).unwrap().1 = value;
 }
-fn rev(parents: &[Id], length: u64, tag: &str) -> LocalRecord {
+pub(super) fn rev(parents: &[Id], length: u64, tag: &str) -> LocalRecord {
     let mut b = revision().body().clone();
     let mut parents: Vec<_> = parents.iter().map(|id| id.bytes).collect();
     parents.sort();
@@ -53,13 +53,13 @@ fn rev(parents: &[Id], length: u64, tag: &str) -> LocalRecord {
     );
     LocalRecord::sign(b, &key()).unwrap()
 }
-fn bytes() -> Vec<u8> {
+pub(super) fn bytes() -> Vec<u8> {
     unhex(fixture_data()["blob_hex"].as_str().unwrap())
 }
-fn result(s: &EvaluationSnapshot, id: Id) -> &Assessment {
+pub(super) fn result(s: &EvaluationSnapshot, id: Id) -> &Assessment {
     s.records.iter().find(|r| r.record_id == id).unwrap()
 }
-fn assert_state(
+pub(super) fn assert_state(
     s: &EvaluationSnapshot,
     r: &LocalRecord,
     state: Validation,
@@ -84,14 +84,14 @@ fn blob_path(t: &Temp) -> std::path::PathBuf {
     t.data().join("blobs").join(hex)
 }
 
-fn oracle_case(records: &[LocalRecord], retained: bool) -> serde_json::Value {
+pub(super) fn oracle_case(records: &[LocalRecord], retained: bool) -> serde_json::Value {
     serde_json::json!({
         "records": records.iter().map(|r| data_encoding::HEXLOWER.encode(r.bytes())).collect::<Vec<_>>(),
         "retained": if retained { vec![data_encoding::HEXLOWER.encode(&bytes())] } else { vec![] },
     })
 }
 
-fn assert_oracle(cases: &[(serde_json::Value, EvaluationSnapshot)]) {
+pub(super) fn assert_oracle(cases: &[(serde_json::Value, EvaluationSnapshot)]) {
     use std::io::Write;
     use std::process::{Command, Stdio};
     let input: Vec<_> = cases.iter().map(|(case, _)| case).collect();

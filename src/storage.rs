@@ -16,7 +16,7 @@ use std::{
 };
 
 pub const IMPLEMENTATION: &str = "lngnb-rust-sqlite-1";
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 const DB: &str = "database.sqlite";
 const SCHEMA: &str = "
 CREATE TABLE storage_state (
@@ -82,9 +82,22 @@ CREATE TABLE blob_failures (
 CREATE TABLE evaluation_state (
  singleton INTEGER PRIMARY KEY CHECK(singleton=1),
  dirty INTEGER NOT NULL CHECK(dirty IN (0,1)),
- generation INTEGER
+ generation INTEGER,
+ job_started INTEGER NOT NULL CHECK(job_started IN (0,1))
 ) STRICT;
-INSERT INTO evaluation_state VALUES(1,1,NULL);
+INSERT INTO evaluation_state VALUES(1,1,NULL,0);
+CREATE TABLE evaluation_job (
+ singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+ input BLOB NOT NULL CHECK(length(input)=32),
+ digest BLOB NOT NULL CHECK(length(digest)=32),
+ total INTEGER NOT NULL CHECK(total>=0),
+ complete INTEGER NOT NULL CHECK(complete IN (0,1)),
+ checkpoint_generation INTEGER NOT NULL CHECK(checkpoint_generation>=0)
+) STRICT;
+CREATE TABLE evaluation_work (
+ record_id BLOB PRIMARY KEY NOT NULL REFERENCES records(id),
+ result BLOB NOT NULL CHECK(length(result) BETWEEN 1 AND 1024)
+) STRICT;
 CREATE TRIGGER record_invalidates_evaluation AFTER INSERT ON records BEGIN UPDATE evaluation_state SET dirty=1; END;
 CREATE TRIGGER blob_invalidates_evaluation AFTER INSERT ON blobs BEGIN UPDATE evaluation_state SET dirty=1; END;
 CREATE TRIGGER failed_blob_invalidates_evaluation AFTER INSERT ON blob_failures BEGIN UPDATE evaluation_state SET dirty=1; END;
@@ -179,6 +192,22 @@ impl From<rusqlite::Error> for StorageError {
     }
 }
 pub type Result<T> = std::result::Result<T, StorageError>;
+
+// 起動検査と評価で同じ変更検出条件を使う。hashの代替にはしない。
+fn fingerprint(m: &std::fs::Metadata) -> String {
+    format!(
+        "{}:{}:{}:{}:{}:{}:{}:{}:{}",
+        m.dev(),
+        m.ino(),
+        m.len(),
+        m.mtime(),
+        m.mtime_nsec(),
+        m.ctime(),
+        m.ctime_nsec(),
+        m.mode(),
+        m.nlink()
+    )
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
@@ -361,6 +390,8 @@ fn check_format(conn: &Connection) -> Result<()> {
         "blob_failure_observed",
         "record_inspection_pending",
         "record_inspection_complete",
+        "evaluation_job_pending",
+        "evaluation_job_complete",
     ]
     .contains(&audit_state.as_str())
     {
@@ -640,18 +671,7 @@ impl RecordStore {
             StartupState::InspectionPending => return Err(StorageError::InspectionPending),
         }
         transition(&mut self.conn, "running", "begin_record_session")?;
-        Ok(RecordWriter {
-            store: self,
-            failed: false,
-            records: 0,
-            bytes: 0,
-            reserved: 0,
-            blobs: 0,
-            #[cfg(test)]
-            blob_fault: None,
-            #[cfg(test)]
-            evaluation_pause: false,
-        })
+        Ok(RecordWriter::new(self))
     }
 }
 
@@ -669,6 +689,20 @@ pub struct RecordWriter {
     evaluation_pause: bool,
 }
 impl RecordWriter {
+    fn new(store: RecordStore) -> Self {
+        Self {
+            store,
+            failed: false,
+            records: 0,
+            bytes: 0,
+            reserved: 0,
+            blobs: 0,
+            #[cfg(test)]
+            blob_fault: None,
+            #[cfg(test)]
+            evaluation_pause: false,
+        }
+    }
     pub fn record(&mut self, id: Id) -> Result<Option<LocalRecord>> {
         let result = self.store.record(id);
         if result.is_err() {
@@ -775,8 +809,8 @@ pub use blobs::{BlobRecovery, BlobStored};
 #[path = "evaluation.rs"]
 mod evaluation;
 pub use evaluation::{
-    Assessment, EvaluationLimits, EvaluationSnapshot, PayloadReason, PayloadStatus, Reason,
-    Validation,
+    Assessment, EvaluationJob, EvaluationLimits, EvaluationProgress, EvaluationSnapshot,
+    EvaluationStepBudget, PayloadReason, PayloadStatus, Reason, Validation,
 };
 
 #[path = "record_inspection.rs"]
