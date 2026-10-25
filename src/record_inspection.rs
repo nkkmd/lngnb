@@ -1,5 +1,5 @@
 //! R20/R24/R27/R28/R30: 起動時のRecord局所検査を永続cursorから再開する。
-//! 親依存評価キュー・Blobの分割検査・管理者の明示復旧ではない。
+//! 親依存評価キュー・管理者の明示復旧ではない。
 use super::*;
 use std::time::{Duration, Instant};
 
@@ -8,6 +8,8 @@ pub struct InspectionBudget {
     pub records: u64,
     pub bytes: u64,
     pub elapsed: Duration,
+    pub blob_files: u64,
+    pub blob_bytes: u64,
 }
 impl Default for InspectionBudget {
     fn default() -> Self {
@@ -15,6 +17,8 @@ impl Default for InspectionBudget {
             records: 10_000,
             bytes: 64 * 1024 * 1024,
             elapsed: Duration::from_secs(60),
+            blob_files: 10_000,
+            blob_bytes: 64 * 1024 * 1024,
         }
     }
 }
@@ -24,6 +28,8 @@ pub struct InspectionProgress {
     pub checked_records: u64,
     pub checked_bytes: u64,
     pub records_complete: bool,
+    pub checked_blob_files: u64,
+    pub checked_blob_bytes: u64,
     pub checks_complete: bool,
 }
 #[derive(Debug)]
@@ -33,6 +39,8 @@ pub(super) struct Checkpoint {
     cursor: Option<[u8; 32]>,
     count: i64,
     bytes: i64,
+    blob_files: i64,
+    blob_bytes: i64,
 }
 impl Checkpoint {
     pub(super) fn pending(&self) -> bool {
@@ -42,6 +50,8 @@ impl Checkpoint {
         InspectionProgress {
             checked_records: self.count as u64,
             checked_bytes: self.bytes as u64,
+            checked_blob_files: self.blob_files as u64,
+            checked_blob_bytes: self.blob_bytes as u64,
             records_complete: matches!(self.phase.as_str(), "blobs" | "complete"),
             checks_complete: self.phase == "complete",
         }
@@ -49,16 +59,29 @@ impl Checkpoint {
 }
 /// 再開台帳の型・対象epoch・累計・cursor・完了端点・履歴を整合確認する。
 /// SQLの索引走査/SQLite整合検査は署名検査の件数・byte予算とは別である。
+type StoredCheckpoint = (
+    i64,
+    String,
+    Option<Vec<u8>>,
+    i64,
+    i64,
+    Option<i64>,
+    i64,
+    i64,
+);
 pub(super) fn checkpoint(conn: &Connection) -> Result<Checkpoint> {
-    let (epoch,phase,raw,count,bytes,generation):(i64,String,Option<Vec<u8>>,i64,i64,Option<i64>)=conn.query_row(
-        "SELECT source_epoch,phase,cursor,checked_records,checked_bytes,checkpoint_generation FROM record_inspection WHERE singleton=1",[],
-        |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)))?;
+    let (epoch,phase,raw,count,bytes,generation,blob_files,blob_bytes):StoredCheckpoint=conn.query_row(
+        "SELECT source_epoch,phase,cursor,checked_records,checked_bytes,checkpoint_generation,checked_blob_files,checked_blob_bytes FROM record_inspection WHERE singleton=1",[],
+        |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?)))?;
     let cursor: Option<[u8; 32]> = raw
         .map(|b| b.try_into().map_err(|_| StorageError::Corrupt))
         .transpose()?;
     if epoch < 0
         || count < 0
         || bytes < 0
+        || blob_files < 0
+        || blob_bytes < 0
+        || (matches!(phase.as_str(), "idle" | "records") && (blob_files != 0 || blob_bytes != 0))
         || !["idle", "records", "blobs", "complete"].contains(&phase.as_str())
         || (cursor.is_none() && (count != 0 || bytes != 0))
         || (cursor.is_some() && (count == 0 || bytes == 0))
@@ -125,13 +148,29 @@ pub(super) fn checkpoint(conn: &Connection) -> Result<Checkpoint> {
         cursor,
         count,
         bytes,
+        blob_files,
+        blob_bytes,
     })
 }
 fn save(conn: &mut Connection, old: &Checkpoint, new: &Checkpoint) -> Result<()> {
+    save_blob(conn, old, new, None)
+}
+fn save_blob(
+    conn: &mut Connection,
+    old: &Checkpoint,
+    new: &Checkpoint,
+    plan: Option<&blob_checks::BlobPlan>,
+) -> Result<()> {
     let tx = conn.transaction()?;
     advance(&tx)?;
-    let changed=tx.execute("UPDATE record_inspection SET phase=?1,cursor=?2,checked_records=?3,checked_bytes=?4,checkpoint_generation=(SELECT generation FROM storage_state WHERE singleton=1) WHERE singleton=1 AND source_epoch=?5",
-        params![&new.phase,new.cursor,new.count,new.bytes,new.epoch])?;
+    if new.phase == "records" && new.cursor.is_none() {
+        blob_checks::reset(&tx)?;
+    }
+    if let Some(plan) = plan {
+        plan.apply(&tx)?;
+    }
+    let changed=tx.execute("UPDATE record_inspection SET phase=?1,cursor=?2,checked_records=?3,checked_bytes=?4,checkpoint_generation=(SELECT generation FROM storage_state WHERE singleton=1),checked_blob_files=?6,checked_blob_bytes=?7 WHERE singleton=1 AND source_epoch=?5",
+        params![&new.phase,new.cursor,new.count,new.bytes,new.epoch,new.blob_files,new.blob_bytes])?;
     if changed != 1 {
         return Err(StorageError::Corrupt);
     }
@@ -169,6 +208,8 @@ impl RecordInspection {
         let mut store = RecordStore::open_locked(path, limits)?;
         let started_clean = state(&store.conn)? == StartupState::Clean;
         let old = checkpoint(&store.conn)?;
+        let previous_report =
+            blob_checks::restore(&store, old.epoch, (old.blob_files, old.blob_bytes))?;
         // 一般配信/管理変更を許可する前の印。検査cursorを書くだけでも先に確定する。
         transition(&mut store.conn, "running", "begin_record_inspection")?;
         if !old.pending() {
@@ -178,9 +219,16 @@ impl RecordInspection {
                 cursor: None,
                 count: 0,
                 bytes: 0,
+                blob_files: 0,
+                blob_bytes: 0,
             };
             save(&mut store.conn, &old, &new)?;
         }
+        store.blob_recovery = if old.pending() {
+            previous_report
+        } else {
+            BlobRecovery::default()
+        };
         Ok(Self {
             store,
             epoch: old.epoch,
@@ -227,7 +275,10 @@ impl RecordInspection {
             cursor: old.cursor,
             count: old.count,
             bytes: old.bytes,
+            blob_files: old.blob_files,
+            blob_bytes: old.blob_bytes,
         };
+        let mut blob_plan = None;
         if old.phase == "records" {
             let mut n = 0u64;
             let mut total = 0u64;
@@ -282,19 +333,19 @@ impl RecordInspection {
                 new.bytes = new.bytes.checked_add(length).ok_or(StorageError::Corrupt)?;
             }
         } else {
-            // Blobの分割検査は次の単位。ここは従来のファイル件数/実長予算を守る。
-            let check: String = self
-                .store
-                .conn
-                .query_row("PRAGMA quick_check", [], |r| r.get(0))?;
-            if check != "ok" {
-                return Err(StorageError::Corrupt);
+            let plan = blob_checks::prepare(
+                &self.store,
+                old.epoch,
+                (old.blob_files, old.blob_bytes),
+                budget,
+                start,
+            )?;
+            new.blob_files = plan.files;
+            new.blob_bytes = plan.bytes;
+            if plan.done {
+                new.phase = "complete".into();
             }
-            self.store.blob_recovery = self.store.scan_blobs()?;
-            if start.elapsed() >= budget.elapsed {
-                return Err(StorageError::BudgetExceeded);
-            }
-            new.phase = "complete".into();
+            blob_plan = Some(plan);
         }
         #[cfg(test)]
         if self.pause_before_checkpoint {
@@ -304,7 +355,10 @@ impl RecordInspection {
             let mut line = String::new();
             std::io::stdin().read_line(&mut line)?;
         }
-        save(&mut self.store.conn, &old, &new)?;
+        save_blob(&mut self.store.conn, &old, &new, blob_plan.as_ref())?;
+        if let Some(plan) = blob_plan {
+            self.store.blob_recovery = plan.report()?;
+        }
         Ok(new.progress())
     }
     /// ジョブ間の正常停止。開始時からの手動待ちを、検査やpauseの成功で解除しない。
@@ -331,6 +385,8 @@ impl RecordInspection {
         if !checkpoint(&self.store.conn)?.progress().checks_complete {
             return Err(StorageError::InspectionPending);
         }
+        let cp = checkpoint(&self.store.conn)?;
+        blob_checks::validate_complete(&self.store, cp.epoch, (cp.blob_files, cp.blob_bytes))?;
         if self.started_clean && !self.store.blob_recovery.needs_review() {
             transition(&mut self.store.conn, "clean", "finish_record_inspection")?;
         }
@@ -342,3 +398,12 @@ impl RecordInspection {
 #[cfg(test)]
 #[path = "record_inspection_tests.rs"]
 mod tests;
+
+#[path = "blob_inspection.rs"]
+mod blob_checks;
+
+pub(super) fn validate_aux(store: &RecordStore) -> Result<()> {
+    let cp = checkpoint(&store.conn)?;
+    blob_checks::restore(store, cp.epoch, (cp.blob_files, cp.blob_bytes))?;
+    Ok(())
+}
