@@ -7,7 +7,7 @@ use crate::{
 };
 use std::io::Cursor;
 
-fn key() -> ed25519_dalek::SigningKey {
+pub(super) fn key() -> ed25519_dalek::SigningKey {
     ed25519_dalek::SigningKey::from_bytes(
         &unhex(fixture_data()["seed_hex"].as_str().unwrap())
             .try_into()
@@ -25,7 +25,7 @@ fn revision() -> LocalRecord {
     )
     .unwrap()
 }
-fn set(body: &mut Value, name: &str, value: Value) {
+pub(super) fn set(body: &mut Value, name: &str, value: Value) {
     let Value::Map(fields) = body else {
         panic!("map");
     };
@@ -906,7 +906,7 @@ fn iterative_engine_checks_cycles_and_deep_history_without_protocol_fixtures() {
         let record = sample.clone();
         Node {
             genesis,
-            record,
+            identity: record.identity(),
             parents,
             payload: None,
         }
@@ -917,7 +917,7 @@ fn iterative_engine_checks_cycles_and_deep_history_without_protocol_fixtures() {
         g.id().bytes,
         Node {
             genesis: g.id().bytes,
-            record: g,
+            identity: g.identity(),
             parents: vec![],
             payload: None,
         },
@@ -945,7 +945,7 @@ fn iterative_engine_checks_cycles_and_deep_history_without_protocol_fixtures() {
             Validation::Invalid
         );
     }
-    nodes.retain(|_, n| n.record.kind() == RecordKind::Genesis);
+    nodes.retain(|_, n| n.identity.kind == RecordKind::Genesis);
     let mut parent = None;
     for i in 0u32..1000 {
         let mut id = [0u8; 32];

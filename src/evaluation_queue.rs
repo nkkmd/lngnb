@@ -25,10 +25,10 @@ pub struct EvaluationProgress {
     pub snapshot: Option<EvaluationSnapshot>,
 }
 pub struct EvaluationJob {
-    writer: RecordWriter,
+    pub(super) writer: RecordWriter,
     started_clean: bool,
     #[cfg(test)]
-    pause_at: Option<&'static str>,
+    pub(super) pause_at: Option<&'static str>,
 }
 impl RecordStore {
     /// 起動局所検査済みStoreから評価だけを再開する。通常writerや手動解除を公開しない。
@@ -360,10 +360,14 @@ impl EvaluationJob {
             return Err(StorageError::UnresolvedFailure);
         }
         let result = self.step_inner(limits, work);
-        if result
-            .as_ref()
-            .is_err_and(|e| !matches!(e, StorageError::BudgetExceeded | StorageError::Capacity))
-        {
+        if result.as_ref().is_err_and(|e| {
+            !matches!(
+                e,
+                StorageError::BudgetExceeded
+                    | StorageError::Capacity
+                    | StorageError::EvaluationInputPending
+            )
+        }) {
             self.writer.failed = true;
         }
         result
@@ -379,7 +383,14 @@ impl EvaluationJob {
         let start = Instant::now();
         // 旧台帳の不整合を入力変更によるリセットで隠さない。
         let saved = load(&self.writer.store, &Budget { start, limits })?;
-        let mut c = self.writer.store.load_evaluation(limits, start)?;
+        let mut c = match preparation::ready(&self.writer.store, &Budget { start, limits })? {
+            Some((record_epoch, nodes)) => self.writer.store.evaluation_from_nodes(
+                nodes,
+                Budget { start, limits },
+                record_epoch,
+            )?,
+            None => self.writer.store.load_evaluation(limits, start)?,
+        };
         if c.storage_fault {
             return Err(StorageError::Corrupt);
         }
@@ -435,6 +446,10 @@ impl EvaluationJob {
         if complete {
             c.snapshot.records = results.values().cloned().collect();
         }
+        #[cfg(test)]
+        if self.pause_at == Some("eval_input_ready") {
+            test_pause("eval_input_ready");
+        }
         let tx = self.writer.store.conn.transaction()?;
         tx.execute(
             "UPDATE evaluation_state SET dirty=1,job_started=1 WHERE singleton=1",
@@ -488,7 +503,7 @@ impl EvaluationJob {
         if self.pause_at == Some("before") {
             test_pause("before");
         }
-        c.validate_evidence(&self.writer.store.dir)?;
+        c.validate_evidence(&self.writer.store.dir, &tx)?;
         tx.commit()?;
         #[cfg(test)]
         if self.pause_at == Some("after") {
@@ -525,7 +540,7 @@ impl EvaluationJob {
     }
 }
 #[cfg(test)]
-fn test_pause(phase: &str) {
+pub(super) fn test_pause(phase: &str) {
     use std::io::Write;
     println!("LNGNB_EVALUATION_CHECKPOINT_{phase}");
     std::io::stdout().flush().unwrap();

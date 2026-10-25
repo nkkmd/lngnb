@@ -301,6 +301,29 @@ pub struct LocalRecord {
     public: [u8; 32],
     knowledge: [u8; 32],
 }
+/// 局所検査済みRecordから抽出する依存照合用の識別情報。単独で署名証明にしない。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RecordIdentity {
+    pub(crate) id: Id,
+    pub(crate) kind: RecordKind,
+    pub(crate) public: [u8; 32],
+    pub(crate) knowledge: [u8; 32],
+}
+impl RecordIdentity {
+    pub(crate) fn check_genesis(&self, expected: [u8; 32], genesis: &Self) -> Result<()> {
+        if self.kind != RecordKind::Revision
+            || genesis.kind != RecordKind::Genesis
+            || self.knowledge != genesis.knowledge
+            || expected != genesis.id.bytes
+        {
+            return Err(Error::GenesisMismatch);
+        }
+        if self.public != genesis.public {
+            return Err(Error::WrongPublisher);
+        }
+        Ok(())
+    }
+}
 impl LocalRecord {
     /// 形式→対応版/種別→スキーマ→期待ID→署名→Genesis自己鍵の順に検査。
     /// RevisionのGenesis/親が未照合でも返る。validと解釈しないこと。
@@ -374,17 +397,8 @@ impl LocalRecord {
         Self::check(&cbor::encode(&envelope)?, None)
     }
     pub fn check_genesis(&self, genesis: &Self) -> Result<()> {
-        if self.kind != RecordKind::Revision
-            || genesis.kind != RecordKind::Genesis
-            || self.knowledge != genesis.knowledge
-            || bytes::<32>(get(&self.body, "genesis_record_id")?)? != genesis.id.bytes
-        {
-            return Err(Error::GenesisMismatch);
-        }
-        if self.public != genesis.public {
-            return Err(Error::WrongPublisher);
-        }
-        Ok(())
+        self.identity()
+            .check_genesis(self.genesis()?, &genesis.identity())
     }
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
@@ -398,8 +412,13 @@ impl LocalRecord {
     pub fn kind(&self) -> RecordKind {
         self.kind
     }
-    pub(crate) fn knowledge(&self) -> [u8; 32] {
-        self.knowledge
+    pub(crate) fn identity(&self) -> RecordIdentity {
+        RecordIdentity {
+            id: self.id,
+            kind: self.kind,
+            public: self.public,
+            knowledge: self.knowledge,
+        }
     }
     pub(crate) fn genesis(&self) -> Result<[u8; 32]> {
         match self.kind {

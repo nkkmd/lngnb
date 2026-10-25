@@ -1,7 +1,7 @@
 //! R07/R08/R10/R26/R27: 保存集合の管理用評価。pin・公開・候補選択は扱わない。
 //! 集合評価と、入力照合後の親評価cursor再開。部分結果を現在の全体判定にしない。
 use super::*;
-use crate::record::RecordKind;
+use crate::record::{RecordIdentity, RecordKind};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     time::{Duration, Instant},
@@ -145,11 +145,22 @@ pub struct EvaluationSnapshot {
     pub committed: bool,
     pub records: Vec<Assessment>,
 }
+#[derive(Clone)]
 struct Node {
-    record: LocalRecord,
+    identity: RecordIdentity,
     genesis: Key,
     parents: Vec<Key>,
     payload: Option<(Key, u64)>,
+}
+impl Node {
+    fn from_record(record: &LocalRecord) -> Result<Self> {
+        Ok(Self {
+            identity: record.identity(),
+            genesis: record.genesis().map_err(|_| StorageError::Corrupt)?,
+            parents: record.parents().map_err(|_| StorageError::Corrupt)?,
+            payload: record.payload().map_err(|_| StorageError::Corrupt)?,
+        })
+    }
 }
 #[derive(Clone, Copy)]
 enum BlobFact {
@@ -165,6 +176,7 @@ struct Computed {
     blobs: BTreeMap<Key, BlobFact>,
     known: BTreeMap<Key, (Key, u64)>,
     storage_fault: bool,
+    record_epoch: i64,
     blob_dir: OwnedFd,
     directory_stamp: String,
     files: BTreeMap<Key, Option<String>>,
@@ -184,12 +196,13 @@ impl RecordStore {
             &computed.known,
             &computed.budget,
         )?;
-        computed.validate_evidence(&self.dir)?;
+        computed.validate_evidence(&self.dir, &self.conn)?;
         Ok(computed)
     }
     fn load_evaluation(&self, limits: EvaluationLimits, start: Instant) -> Result<Computed> {
         let budget = Budget { start, limits };
         budget.check()?;
+        let record_epoch = preparation::epoch(&self.conn)?;
         let mut nodes = BTreeMap::new();
         let mut byte_budget = limits.record_bytes;
         let mut edge_budget = limits.edges;
@@ -212,22 +225,21 @@ impl RecordStore {
                 .checked_sub(n as u64)
                 .ok_or(StorageError::BudgetExceeded)?;
             let record = self.record(record_id(key))?.ok_or(StorageError::Corrupt)?;
-            let parents = record.parents().map_err(|_| StorageError::Corrupt)?;
+            let node = Node::from_record(&record)?;
             edge_budget = edge_budget
-                .checked_sub(parents.len() as u64)
+                .checked_sub(node.parents.len() as u64)
                 .ok_or(StorageError::BudgetExceeded)?;
-            let genesis = record.genesis().map_err(|_| StorageError::Corrupt)?;
-            let payload = record.payload().map_err(|_| StorageError::Corrupt)?;
-            nodes.insert(
-                key,
-                Node {
-                    record,
-                    genesis,
-                    parents,
-                    payload,
-                },
-            );
+            nodes.insert(key, node);
         }
+        self.evaluation_from_nodes(nodes, budget, record_epoch)
+    }
+    fn evaluation_from_nodes(
+        &self,
+        nodes: BTreeMap<Key, Node>,
+        budget: Budget,
+        record_epoch: i64,
+    ) -> Result<Computed> {
+        let limits = budget.limits;
         // 既知不正の根拠を入力集合とは別に保持する。再投稿・再索引で消さない。
         let mut known = BTreeMap::new();
         let mut stmt = self.conn.prepare(
@@ -348,6 +360,7 @@ impl RecordStore {
             blobs,
             known,
             storage_fault,
+            record_epoch,
             blob_dir: dir,
             directory_stamp,
             files,
@@ -357,7 +370,7 @@ impl RecordStore {
 }
 
 fn base_result(node: &Node, nodes: &BTreeMap<Key, Node>) -> Option<(Validation, Reason, Id)> {
-    if node.record.kind() == RecordKind::Genesis {
+    if node.identity.kind == RecordKind::Genesis {
         return None;
     }
     let Some(genesis) = nodes.get(&node.genesis) else {
@@ -367,7 +380,7 @@ fn base_result(node: &Node, nodes: &BTreeMap<Key, Node>) -> Option<(Validation, 
             record_id(node.genesis),
         ));
     };
-    match node.record.check_genesis(&genesis.record) {
+    match node.identity.check_genesis(node.genesis, &genesis.identity) {
         Ok(()) => None,
         Err(crate::Error::WrongPublisher) => Some((
             Validation::Invalid,
@@ -382,8 +395,8 @@ fn base_result(node: &Node, nodes: &BTreeMap<Key, Node>) -> Option<(Validation, 
     }
 }
 fn same_scope(child: &Node, parent: &Node) -> bool {
-    parent.record.kind() == RecordKind::Revision
-        && parent.record.knowledge() == child.record.knowledge()
+    parent.identity.kind == RecordKind::Revision
+        && parent.identity.knowledge == child.identity.knowledge
         && parent.genesis == child.genesis
 }
 struct GraphPlan {
@@ -487,7 +500,7 @@ fn assess(
     results: &BTreeMap<Key, Assessment>,
 ) -> Assessment {
     let mut out = Assessment {
-        record_id: node.record.id(),
+        record_id: node.identity.id,
         validation: Validation::Valid,
         payload_status: None,
         payload_reason: None,
@@ -498,7 +511,7 @@ fn assess(
         out.payload_reason = match blobs[&id] {
             BlobFact::Verified(n) if n != declared => Some(PayloadReason::DeclaredLengthMismatch),
             BlobFact::Missing | BlobFact::Unavailable | BlobFact::TransferFailed(_)
-                if known.contains_key(&node.record.id().bytes) =>
+                if known.contains_key(&node.identity.id.bytes) =>
             {
                 Some(PayloadReason::EvidenceUnavailable)
             }
@@ -508,7 +521,7 @@ fn assess(
         };
         out.payload_status = Some(match blobs[&id] {
             BlobFact::Verified(n) if n == declared => PayloadStatus::Verified,
-            BlobFact::Missing if !known.contains_key(&node.record.id().bytes) => {
+            BlobFact::Missing if !known.contains_key(&node.identity.id.bytes) => {
                 PayloadStatus::Missing
             }
             _ => PayloadStatus::Unavailable,
@@ -570,7 +583,7 @@ fn assess(
                 blob_id(id),
             ),
             BlobFact::Missing | BlobFact::Unavailable | BlobFact::TransferFailed(_)
-                if known.contains_key(&node.record.id().bytes) =>
+                if known.contains_key(&node.identity.id.bytes) =>
             {
                 set(
                     &mut out,
@@ -649,7 +662,7 @@ impl RecordWriter {
                 let mut line = String::new();
                 std::io::stdin().read_line(&mut line)?;
             }
-            computed.validate_evidence(&self.store.dir)?;
+            computed.validate_evidence(&self.store.dir, &tx)?;
             tx.commit()?;
             Ok(())
         })();
@@ -779,7 +792,10 @@ fn blob_stamp(dir: &OwnedFd, key: Key) -> Result<Option<String>> {
     }
 }
 impl Computed {
-    fn validate_evidence(&self, root: &OwnedFd) -> Result<()> {
+    fn validate_evidence(&self, root: &OwnedFd, conn: &Connection) -> Result<()> {
+        if preparation::epoch(conn)? != self.record_epoch {
+            return Err(StorageError::Corrupt);
+        }
         let current = blobs::blob_directory(root, "blobs")?;
         if fingerprint(&std::fs::metadata(anchored(&current, "."))?) != self.directory_stamp {
             return Err(StorageError::Corrupt);
@@ -793,3 +809,7 @@ impl Computed {
         self.budget.check()
     }
 }
+
+#[path = "evaluation_input.rs"]
+mod preparation;
+pub use preparation::{EvaluationInputBudget, EvaluationInputProgress};
