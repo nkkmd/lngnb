@@ -1,0 +1,325 @@
+//! A11/R34: Linuxの所有者専用ディレクトリ内での鍵ファイル操作。
+//! ファイルは暗号化bytesだけ。DB・HTTP・IPC・端末操作には接続しない。
+use super::{KeyError, MAX_KEYFILE_BYTES, UnlockedKey, generate, unlock};
+use rustix::fs::{self, AtFlags, CWD, FlockOperation, Mode, OFlags, RenameFlags};
+use std::{
+    fs::File,
+    io::{Read, Write},
+    os::{fd::AsRawFd, unix::fs::MetadataExt},
+    path::{Component, Path},
+};
+
+type Result<T> = std::result::Result<T, KeyFileError>;
+const PREFIX: &str = ".lngnb-key-";
+const SCAN_LIMIT: usize = 10_000;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyFileError {
+    UnsafePath,
+    Busy,
+    Exists,
+    Missing,
+    Io,
+    PendingRecovery,
+    ScanLimit,
+    /// 交換/配置済みだがdirectory fsync成功を確認できない。成功/rollbackを断定しない。
+    CommitUncertain,
+    /// 新鍵の永続化確認済み。旧暗号文の整理だけが未完了/不確実。
+    CleanupUncertain,
+    Key(KeyError),
+}
+impl From<KeyError> for KeyFileError {
+    fn from(e: KeyError) -> Self {
+        Self::Key(e)
+    }
+}
+impl std::fmt::Display for KeyFileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::UnsafePath => "unsafe_key_path",
+            Self::Busy => "key_directory_busy",
+            Self::Exists => "key_file_exists",
+            Self::Missing => "key_file_missing",
+            Self::Io => "key_file_io_failed",
+            Self::PendingRecovery => "key_recovery_required",
+            Self::ScanLimit => "key_directory_scan_limit",
+            Self::CommitUncertain => "key_commit_uncertain",
+            Self::CleanupUncertain => "key_committed_cleanup_uncertain",
+            Self::Key(e) => return e.fmt(f),
+        })
+    }
+}
+impl std::error::Error for KeyFileError {}
+fn io<T>(r: std::io::Result<T>) -> Result<T> {
+    r.map_err(|_| KeyFileError::Io)
+}
+fn os<T>(r: rustix::io::Result<T>) -> Result<T> {
+    r.map_err(|_| KeyFileError::Io)
+}
+fn name(s: &str) -> Result<()> {
+    if s.is_empty()
+        || s.len() > 128
+        || s == "."
+        || s == ".."
+        || s.starts_with(PREFIX)
+        || !s
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+    {
+        return Err(KeyFileError::UnsafePath);
+    }
+    Ok(())
+}
+fn directory(path: &Path) -> Result<File> {
+    if path.as_os_str().is_empty() {
+        return Err(KeyFileError::UnsafePath);
+    }
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let mut fd = os(fs::openat(CWD, ".", flags, Mode::empty()))?;
+    for c in path.components() {
+        fd = match c {
+            Component::RootDir => os(fs::openat(CWD, "/", flags, Mode::empty()))?,
+            Component::CurDir => continue,
+            Component::Normal(n) => {
+                fs::openat(&fd, n, flags, Mode::empty()).map_err(|_| KeyFileError::UnsafePath)?
+            }
+            _ => return Err(KeyFileError::UnsafePath),
+        };
+    }
+    let f = File::from(fd);
+    let m = io(f.metadata())?;
+    if m.uid() != rustix::process::geteuid().as_raw() || m.mode() & 0o7777 != 0o700 {
+        return Err(KeyFileError::UnsafePath);
+    }
+    Ok(f)
+}
+/// 専用0700ディレクトリを開く。作成・権限修正・他者所有/root特例は行わない。
+/// directory inodeを寿命中flockし、&mut selfで同じハンドルの操作も直列化する。
+/// 所有者/rootが悪意を持ってファイルを差し替える攻撃への保証は追加しない。
+pub struct KeyDirectory {
+    dir: File,
+}
+impl Drop for KeyDirectory {
+    fn drop(&mut self) {
+        let _ = fs::flock(&self.dir, FlockOperation::Unlock);
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stage {
+    TempCreated,
+    Written,
+    FileSynced,
+    Validated,
+    BeforeInstall,
+    Installed,
+    DirectorySynced,
+    BeforeCleanup,
+    Removed,
+}
+impl KeyDirectory {
+    pub fn open(path: &Path) -> Result<Self> {
+        let dir = directory(path)?;
+        match fs::flock(&dir, FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => Ok(Self { dir }),
+            Err(rustix::io::Errno::WOULDBLOCK) => Err(KeyFileError::Busy),
+            Err(_) => Err(KeyFileError::Io),
+        }
+    }
+    fn secure(&self) -> Result<()> {
+        let m = io(self.dir.metadata())?;
+        if m.uid() != rustix::process::geteuid().as_raw() || m.mode() & 0o7777 != 0o700 {
+            return Err(KeyFileError::UnsafePath);
+        }
+        Ok(())
+    }
+    fn read(&self, n: &str) -> Result<Vec<u8>> {
+        self.secure()?;
+        let fd = fs::openat(
+            &self.dir,
+            n,
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|e| {
+            if e == rustix::io::Errno::NOENT {
+                KeyFileError::Missing
+            } else {
+                KeyFileError::UnsafePath
+            }
+        })?;
+        let mut f = File::from(fd);
+        let before = io(f.metadata())?;
+        private_file(&before, rustix::process::geteuid().as_raw())?;
+        if before.len() > MAX_KEYFILE_BYTES as u64 {
+            return Err(KeyError::InvalidFormat.into());
+        }
+        let mut b = Vec::new();
+        io((&mut f)
+            .take(MAX_KEYFILE_BYTES as u64 + 1)
+            .read_to_end(&mut b))?;
+        let after = io(f.metadata())?;
+        if b.len() > MAX_KEYFILE_BYTES {
+            return Err(KeyError::InvalidFormat.into());
+        }
+        if before.len() != b.len() as u64 || fingerprint(&before) != fingerprint(&after) {
+            return Err(KeyFileError::UnsafePath);
+        }
+        Ok(b)
+    }
+    pub fn load(&mut self, n: &str, passphrase: &str) -> Result<UnlockedKey> {
+        name(n)?;
+        Ok(unlock(&self.read(n)?, passphrase)?)
+    }
+    fn pending(&self) -> Result<()> {
+        self.secure()?;
+        // /proc経路はNOFOLLOWで開いたdirectory fdへ固定し、利用者パスを再解決しない。
+        let entries = io(std::fs::read_dir(format!(
+            "/proc/self/fd/{}",
+            self.dir.as_raw_fd()
+        )))?;
+        for (i, entry) in entries.enumerate() {
+            if i >= SCAN_LIMIT {
+                return Err(KeyFileError::ScanLimit);
+            }
+            if io(entry)?
+                .file_name()
+                .as_encoded_bytes()
+                .starts_with(PREFIX.as_bytes())
+            {
+                return Err(KeyFileError::PendingRecovery);
+            }
+        }
+        Ok(())
+    }
+    pub fn create(&mut self, n: &str, passphrase: &str) -> Result<[u8; 32]> {
+        self.create_with(n, passphrase, &mut |_| Ok(()))
+    }
+    fn create_with(
+        &mut self,
+        n: &str,
+        p: &str,
+        hook: &mut impl FnMut(Stage) -> Result<()>,
+    ) -> Result<[u8; 32]> {
+        name(n)?;
+        self.pending()?;
+        match fs::statat(&self.dir, n, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(_) => return Err(KeyFileError::Exists),
+            Err(rustix::io::Errno::NOENT) => (),
+            Err(_) => return Err(KeyFileError::Io),
+        }
+        let encrypted = generate(p)?;
+        self.install(n, &encrypted, p, None, hook)
+    }
+    pub fn change_passphrase(&mut self, n: &str, old: &str, new: &str) -> Result<[u8; 32]> {
+        self.change_with(n, old, new, &mut |_| Ok(()))
+    }
+    fn change_with(
+        &mut self,
+        n: &str,
+        old: &str,
+        new: &str,
+        hook: &mut impl FnMut(Stage) -> Result<()>,
+    ) -> Result<[u8; 32]> {
+        name(n)?;
+        self.pending()?;
+        let original = self.read(n)?;
+        let key = unlock(&original, old)?;
+        let encrypted = key.encrypt(new)?;
+        self.install(n, &encrypted, new, Some(&original), hook)
+    }
+    fn install(
+        &mut self,
+        n: &str,
+        encrypted: &[u8],
+        p: &str,
+        original: Option<&[u8]>,
+        hook: &mut impl FnMut(Stage) -> Result<()>,
+    ) -> Result<[u8; 32]> {
+        let mut random = [0; 32];
+        super::random(&mut random)?;
+        let temp = format!("{PREFIX}{}", data_encoding::HEXLOWER.encode(&random));
+        let fd = os(fs::openat(
+            &self.dir,
+            &temp,
+            OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        ))?;
+        let mut f = File::from(fd);
+        // 呼出し元のumaskが0600を狭めても、作成したinodeだけを0600へ確定する。
+        os(fs::fchmod(&f, Mode::RUSR | Mode::WUSR))?;
+        hook(Stage::TempCreated)?;
+        io(f.write_all(encrypted))?;
+        hook(Stage::Written)?;
+        io(f.sync_all())?;
+        hook(Stage::FileSynced)?;
+        let readback = self.read(&temp)?;
+        if readback != encrypted {
+            return Err(KeyFileError::Io);
+        }
+        let public = unlock(&readback, p)?.public_key();
+        hook(Stage::Validated)?;
+        hook(Stage::BeforeInstall)?;
+        self.secure()?;
+        if let Some(old) = original {
+            if self.read(n)? != old {
+                return Err(KeyFileError::UnsafePath);
+            }
+        }
+        let flag = if original.is_some() {
+            RenameFlags::EXCHANGE
+        } else {
+            RenameFlags::NOREPLACE
+        };
+        fs::renameat_with(&self.dir, &temp, &self.dir, n, flag).map_err(|e| {
+            if e == rustix::io::Errno::EXIST {
+                KeyFileError::Exists
+            } else {
+                KeyFileError::Io
+            }
+        })?;
+        // ここから元へ戻ったと推測しない。EXCHANGEなら旧暗号文はtempへ残っている。
+        hook(Stage::Installed).map_err(|_| KeyFileError::CommitUncertain)?;
+        if self.read(n).map_err(|_| KeyFileError::CommitUncertain)? != encrypted {
+            return Err(KeyFileError::CommitUncertain);
+        }
+        io(self.dir.sync_all()).map_err(|_| KeyFileError::CommitUncertain)?;
+        hook(Stage::DirectorySynced).map_err(|_| KeyFileError::CleanupUncertain)?;
+        if let Some(old) = original {
+            hook(Stage::BeforeCleanup).map_err(|_| KeyFileError::CleanupUncertain)?;
+            if self
+                .read(&temp)
+                .map_err(|_| KeyFileError::CleanupUncertain)?
+                != old
+            {
+                return Err(KeyFileError::CleanupUncertain);
+            }
+            os(fs::unlinkat(&self.dir, &temp, AtFlags::empty()))
+                .map_err(|_| KeyFileError::CleanupUncertain)?;
+            hook(Stage::Removed).map_err(|_| KeyFileError::CleanupUncertain)?;
+            io(self.dir.sync_all()).map_err(|_| KeyFileError::CleanupUncertain)?;
+        }
+        Ok(public)
+    }
+}
+fn private_file(m: &std::fs::Metadata, uid: u32) -> Result<()> {
+    if !m.is_file() || m.nlink() != 1 || m.uid() != uid || m.mode() & 0o7777 != 0o600 {
+        return Err(KeyFileError::UnsafePath);
+    }
+    Ok(())
+}
+fn fingerprint(m: &std::fs::Metadata) -> (u64, u64, u64, u32, u32, u64, i64, i64, i64, i64) {
+    (
+        m.dev(),
+        m.ino(),
+        m.len(),
+        m.mode(),
+        m.uid(),
+        m.nlink(),
+        m.mtime(),
+        m.mtime_nsec(),
+        m.ctime(),
+        m.ctime_nsec(),
+    )
+}
+#[cfg(test)]
+#[path = "keyfile_storage_tests.rs"]
+mod tests;

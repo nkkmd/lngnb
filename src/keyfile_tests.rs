@@ -4,7 +4,7 @@ use std::{
     io::Write,
     process::{Command, Stdio},
 };
-fn unhex(s: &str) -> Vec<u8> {
+pub(super) fn unhex(s: &str) -> Vec<u8> {
     (0..s.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
@@ -31,7 +31,7 @@ fn fixture(section: &str) -> serde_json::Value {
         .unwrap();
     serde_json::from_str(json).unwrap()
 }
-fn a14() -> serde_json::Value {
+pub(super) fn a14() -> serde_json::Value {
     fixture("## 付録A14 暗号化鍵ファイルの固定計算例")
 }
 fn a13() -> serde_json::Value {
@@ -40,7 +40,7 @@ fn a13() -> serde_json::Value {
 fn original() -> Vec<u8> {
     unhex(a14()["keyfile_cbor_hex"].as_str().unwrap())
 }
-fn passphrase() -> String {
+pub(super) fn passphrase() -> String {
     String::from_utf8(unhex(a14()["passphrase_utf8_hex"].as_str().unwrap())).unwrap()
 }
 fn test_key() -> UnlockedKey {
