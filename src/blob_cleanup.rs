@@ -27,6 +27,7 @@ pub struct BlobCleanupPlan {
     pub planned_generation: i64,
     pub cancelled_generation: Option<i64>,
     pub cancellation: Option<String>,
+    pub completed_generation: Option<i64>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CleanupDecision {
@@ -47,7 +48,7 @@ pub(super) fn validate(conn: &Connection) -> Result<()> {
     let bad:bool=conn.query_row(
         "SELECT EXISTS(
             SELECT 1 FROM blob_cleanup_plans p
-            LEFT JOIN blobs b ON b.id=p.blob_id
+            LEFT JOIN blob_objects b ON b.id=p.blob_id
             LEFT JOIN history h ON h.generation=p.planned_generation
             LEFT JOIN history c ON c.generation=p.cancelled_generation
             WHERE b.id IS NULL OR b.byte_length!=p.byte_length OR p.byte_length<0
@@ -55,6 +56,9 @@ pub(super) fn validate(conn: &Connection) -> Result<()> {
                OR length(p.fingerprint) NOT BETWEEN 1 AND 512
                OR p.planned_generation<0 OR p.planned_generation>(SELECT generation FROM storage_state WHERE singleton=1)
                OR (p.cancelled_generation IS NULL)!=(p.cancellation IS NULL)
+               OR (p.cancelled_generation IS NOT NULL AND p.completed_generation IS NOT NULL)
+               OR (p.completed_generation IS NOT NULL AND (p.completed_generation<=p.planned_generation
+                   OR NOT EXISTS(SELECT 1 FROM blob_cleanup_runs r WHERE r.plan_id=p.plan_id AND r.finished_generation=p.completed_generation)))
                OR h.generation IS NULL OR h.target IS NOT p.blob_id
                OR h.old_state!='temporary_blob_expired' OR h.new_state!='blob_cleanup_planned_local_only'
                OR h.namespace IS NOT (SELECT namespace FROM storage_state WHERE singleton=1)
@@ -79,10 +83,11 @@ pub(super) fn validate(conn: &Connection) -> Result<()> {
     if bad {
         return Err(StorageError::Corrupt);
     }
+    execution::validate_runs(conn)?;
     Ok(())
 }
 fn plans(conn: &Connection, limit: u64) -> Result<Vec<BlobCleanupPlan>> {
-    let mut stmt=conn.prepare("SELECT plan_id,blob_id,byte_length,planned_at,planned_generation,cancelled_generation,cancellation FROM blob_cleanup_plans ORDER BY planned_generation")?;
+    let mut stmt=conn.prepare("SELECT plan_id,blob_id,byte_length,planned_at,planned_generation,cancelled_generation,cancellation,completed_generation FROM blob_cleanup_plans ORDER BY planned_generation")?;
     let mut query = stmt.query([])?;
     let mut out = Vec::new();
     while let Some(row) = query.next()? {
@@ -104,13 +109,14 @@ fn plans(conn: &Connection, limit: u64) -> Result<Vec<BlobCleanupPlan>> {
             planned_generation: row.get(4)?,
             cancelled_generation: row.get(5)?,
             cancellation: row.get(6)?,
+            completed_generation: row.get(7)?,
         });
     }
     Ok(out)
 }
 /// 呼出し側の変更transactionでだけ取り消す。新しい保持根拠と取消履歴を分離しない。
 pub(super) fn cancel(tx: &Transaction<'_>, blob: &[u8; 32], cause: &str) -> Result<()> {
-    let pending:Option<Vec<u8>>=tx.query_row("SELECT plan_id FROM blob_cleanup_plans WHERE blob_id=?1 AND cancelled_generation IS NULL",[blob],|r|r.get(0)).optional()?;
+    let pending:Option<Vec<u8>>=tx.query_row("SELECT plan_id FROM blob_cleanup_plans WHERE blob_id=?1 AND cancelled_generation IS NULL AND completed_generation IS NULL",[blob],|r|r.get(0)).optional()?;
     if let Some(raw) = pending {
         validate(tx)?;
         let id = key(raw)?;
@@ -243,9 +249,9 @@ impl RecordWriter {
         if verified != original {
             return Err(StorageError::Corrupt);
         }
-        let pending = prior
-            .into_iter()
-            .find(|p| p.blob_id == id && p.cancelled_generation.is_none());
+        let pending = prior.into_iter().find(|p| {
+            p.blob_id == id && p.cancelled_generation.is_none() && p.completed_generation.is_none()
+        });
         let plan = if let Some(plan) = pending {
             let saved: String = tx.query_row(
                 "SELECT fingerprint FROM blob_cleanup_plans WHERE plan_id=?1",
@@ -287,6 +293,7 @@ impl RecordWriter {
                 planned_generation: generation,
                 cancelled_generation: None,
                 cancellation: None,
+                completed_generation: None,
             }
         };
         let expected_generation: i64 = tx.query_row(
@@ -342,4 +349,15 @@ pub(super) fn cancel_point(pause: Option<bool>, before: bool) -> Result<()> {
         std::io::stdin().read_line(&mut line)?;
     }
     Ok(())
+}
+
+#[path = "blob_cleanup_execution.rs"]
+mod execution;
+pub use execution::{CleanupExecution, CleanupOutcome};
+pub(super) fn pending(conn: &Connection) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM blob_cleanup_runs WHERE finished_generation IS NULL)",
+        [],
+        |r| r.get(0),
+    )?)
 }

@@ -148,6 +148,9 @@ impl RecordStore {
         {
             return Err(StorageError::InvalidRecoveryReview);
         }
+        if super::super::cleanup::pending(&self.conn)? {
+            return Err(StorageError::CleanupPending);
+        }
         self.validate_recovery_review(review)?;
         inspection::validate_for_resume(&self)?;
         if state(&self.conn)? != StartupState::NeedsReview {

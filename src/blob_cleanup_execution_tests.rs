@@ -1,0 +1,761 @@
+//! R23/R24/R26/R27/R30: 内部物理整理・明示復旧。公開試験鍵のみ、実運用への流用禁止。
+use super::*;
+use crate::{
+    id,
+    storage::{
+        evaluation::tests::{assert_oracle, bytes, oracle_case, rev},
+        tests::{Temp, fixture},
+    },
+};
+use std::{
+    io::{BufRead, Cursor, Write},
+    process::{Command, Stdio},
+};
+fn setup(t: &Temp) -> (RecordWriter, BlobCleanupPlan) {
+    let mut w = t.store().begin().unwrap();
+    let a = w
+        .stage_blob(
+            id::blob_id(&bytes()),
+            Cursor::new(bytes()),
+            1,
+            TemporaryLimits::default(),
+        )
+        .unwrap();
+    let CleanupDecision::Planned(p) = w
+        .plan_at(a.id, CleanupBudget::default(), a.expires_at, |_, _| Ok(()))
+        .unwrap()
+    else {
+        panic!()
+    };
+    (w, p)
+}
+fn execute(w: &mut RecordWriter, p: &BlobCleanupPlan) -> CleanupExecution {
+    w.execute_at(p.plan_id, CleanupBudget::default(), p.planned_at, |_, _| {
+        Ok(())
+    })
+    .unwrap()
+}
+fn path(t: &Temp) -> std::path::PathBuf {
+    t.data()
+        .join("blobs")
+        .join(blobs::hex(&id::blob_id(&bytes()).bytes))
+}
+fn count(s: &RecordStore, table: &str) -> i64 {
+    s.conn
+        .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+        .unwrap()
+}
+fn reopen(t: &Temp) -> RecordStore {
+    RecordStore::open(&t.data(), Limits::default()).unwrap()
+}
+fn recover(s: &mut RecordStore, r: &CleanupExecution, p: &BlobCleanupPlan) -> CleanupExecution {
+    s.recover_at(
+        r.run_id,
+        CleanupBudget::default(),
+        "保存済み削除意思と現在の根拠を確認し、この整理だけを完了",
+        p.planned_at,
+        |_, _| Ok(()),
+    )
+    .unwrap()
+}
+#[test]
+fn expired_unreferenced_blob_is_removed_but_objects_promises_and_history_remain() {
+    let t = Temp::new();
+    let (mut w, p) = setup(&t);
+    let result = execute(&mut w, &p);
+    assert_eq!(result.outcome, Some(CleanupOutcome::Removed));
+    assert!(result.finished_generation.is_some());
+    assert!(!path(&t).exists());
+    assert_eq!(count(&w.store, "blobs"), 0);
+    assert_eq!(count(&w.store, "blob_objects"), 1);
+    assert_eq!(count(&w.store, "temporary_blob_holds"), 1);
+    assert!(w.blob(p.blob_id).unwrap().is_none());
+    let ps = w.store.blob_cleanup_plans(1).unwrap();
+    assert_eq!(ps[0].completed_generation, result.finished_generation);
+    assert!(ps[0].cancelled_generation.is_none());
+    let b = w.blob_protection(ProtectionBudget::default()).unwrap();
+    assert_eq!(b.blobs[0].recorded_length, None);
+    assert_eq!(b.blobs[0].temporary_holds.len(), 1);
+    w.finish().unwrap();
+    let s = reopen(&t);
+    assert_eq!(s.startup_state().unwrap(), StartupState::Clean);
+    assert!(!s.blob_recovery().needs_review());
+    assert_eq!(s.blob_cleanup_executions(1).unwrap(), vec![result]);
+    drop(s);
+    let mut startup = LocalStartup::open(&t.data(), Limits::default()).unwrap();
+    loop {
+        if startup
+            .step(EvaluationLimits::default(), LocalStartupBudget::default())
+            .unwrap()
+            .checks_complete()
+        {
+            break;
+        }
+    }
+    let mut w = startup.into_writer().unwrap();
+    assert!(w.blob(p.blob_id).unwrap().is_none());
+    w.finish().unwrap();
+}
+#[test]
+fn later_record_sees_missing_body_and_reupload_restores_the_same_id() {
+    let t = Temp::new();
+    let (mut w, p) = setup(&t);
+    execute(&mut w, &p);
+    let r = rev(&[], 14, "after cleanup");
+    w.insert(&fixture()).unwrap();
+    w.insert(&r).unwrap();
+    let s = w.revalidate(EvaluationLimits::default()).unwrap();
+    let a = s.records.iter().find(|x| x.record_id == r.id()).unwrap();
+    assert_eq!(a.payload_status, Some(PayloadStatus::Missing));
+    assert_eq!(a.validation, Validation::Valid);
+    let records = [fixture(), r.clone()];
+    let mut cases = vec![(oracle_case(&records, false), s)];
+    w.put_blob(p.blob_id, Cursor::new(bytes())).unwrap();
+    let s = w.revalidate(EvaluationLimits::default()).unwrap();
+    let a = s.records.iter().find(|x| x.record_id == r.id()).unwrap();
+    assert_eq!(a.payload_status, Some(PayloadStatus::Verified));
+    cases.push((oracle_case(&records, true), s));
+    assert_oracle(&cases);
+    assert_eq!(count(&w.store, "blob_objects"), 1);
+    assert_eq!(count(&w.store, "blobs"), 1);
+    assert_eq!(
+        w.store.blob_cleanup_executions(1).unwrap()[0].outcome,
+        Some(CleanupOutcome::Removed)
+    );
+    w.finish().unwrap();
+}
+#[test]
+fn cancelled_plan_and_new_references_or_promises_are_never_executed() {
+    for op in 0..3 {
+        let t = Temp::new();
+        let (mut w, p) = setup(&t);
+        match op {
+            0 => {
+                w.insert(&rev(&[], 14, "protected")).unwrap();
+            }
+            1 => {
+                w.put_blob(p.blob_id, Cursor::new(bytes())).unwrap();
+            }
+            _ => {
+                w.stage_blob(
+                    p.blob_id,
+                    Cursor::new(bytes()),
+                    1,
+                    TemporaryLimits::default(),
+                )
+                .unwrap();
+            }
+        }
+        assert!(
+            w.execute_at(
+                p.plan_id,
+                CleanupBudget::default(),
+                p.planned_at,
+                |_, _| Ok(())
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(path(&t)).unwrap(), bytes());
+        assert_eq!(count(&w.store, "blob_cleanup_runs"), 0);
+    }
+}
+#[test]
+fn fresh_checks_detect_missing_corruption_and_file_change_before_intent() {
+    for damage in 0..3 {
+        let t = Temp::new();
+        let (mut w, p) = setup(&t);
+        if damage == 0 {
+            std::fs::remove_file(path(&t)).unwrap();
+        } else if damage == 1 {
+            std::fs::write(path(&t), b"bad").unwrap();
+        }
+        let e = w.execute_at(
+            p.plan_id,
+            CleanupBudget::default(),
+            p.planned_at,
+            |point, _| {
+                if point == Point::BeforeIntentCommit && damage == 2 {
+                    std::fs::write(path(&t), b"changed").unwrap();
+                }
+                Ok(())
+            },
+        );
+        assert!(e.is_err());
+        assert_eq!(count(&w.store, "blob_cleanup_runs"), 0);
+        assert!(matches!(w.finish(), Err(StorageError::UnresolvedFailure)));
+    }
+}
+#[test]
+fn budget_clock_and_capacity_before_intent_leave_no_partial_execution() {
+    let t = Temp::new();
+    let (mut w, p) = setup(&t);
+    let generation = w.store.generation().unwrap();
+    for b in [
+        CleanupBudget {
+            hash_bytes: 27,
+            ..CleanupBudget::default()
+        },
+        CleanupBudget {
+            hash_bytes: 14,
+            ..CleanupBudget::default()
+        },
+        CleanupBudget {
+            hash_bytes: 13,
+            ..CleanupBudget::default()
+        },
+        CleanupBudget {
+            plans: 0,
+            ..CleanupBudget::default()
+        },
+        CleanupBudget {
+            protection: ProtectionBudget {
+                elapsed: std::time::Duration::ZERO,
+                ..ProtectionBudget::default()
+            },
+            ..CleanupBudget::default()
+        },
+    ] {
+        assert!(matches!(
+            w.execute_at(p.plan_id, b, p.planned_at, |_, _| Ok(())),
+            Err(StorageError::BudgetExceeded)
+        ));
+        assert_eq!(w.store.generation().unwrap(), generation);
+    }
+    assert!(matches!(
+        w.execute_at(
+            p.plan_id,
+            CleanupBudget::default(),
+            p.planned_at - 1,
+            |_, _| Ok(())
+        ),
+        Err(StorageError::BudgetExceeded)
+    ));
+    w.store.limits.reserve_min_bytes = u64::MAX;
+    assert!(matches!(
+        w.execute_at(
+            p.plan_id,
+            CleanupBudget::default(),
+            p.planned_at,
+            |_, _| Ok(())
+        ),
+        Err(StorageError::Capacity)
+    ));
+    w.store.limits.reserve_min_bytes = 64 * 1024 * 1024;
+    execute(&mut w, &p);
+    w.finish().unwrap();
+}
+#[test]
+fn intent_sql_failure_rolls_back_before_any_unlink() {
+    for table in ["blob_cleanup_runs", "history"] {
+        let t = Temp::new();
+        let (mut w, p) = setup(&t);
+        let generation = w.store.generation().unwrap();
+        w.store.conn.execute_batch(&format!("CREATE TRIGGER refuse_start BEFORE INSERT ON {table} BEGIN SELECT RAISE(ABORT,'test'); END;")).unwrap();
+        assert!(
+            w.execute_at(
+                p.plan_id,
+                CleanupBudget::default(),
+                p.planned_at,
+                |_, _| Ok(())
+            )
+            .is_err()
+        );
+        assert_eq!(count(&w.store, "blob_cleanup_runs"), 0);
+        assert_eq!(w.store.generation().unwrap(), generation);
+        assert_eq!(std::fs::read(path(&t)).unwrap(), bytes());
+        assert!(matches!(w.finish(), Err(StorageError::UnresolvedFailure)));
+    }
+}
+#[test]
+fn completion_sql_failure_keeps_intent_and_requires_explicit_recovery() {
+    for sql in [
+        "CREATE TRIGGER refuse_finish BEFORE DELETE ON blobs BEGIN SELECT RAISE(ABORT,'test'); END;",
+        "CREATE TRIGGER refuse_finish BEFORE UPDATE ON blob_cleanup_plans BEGIN SELECT RAISE(ABORT,'test'); END;",
+        "CREATE TRIGGER refuse_finish BEFORE UPDATE ON blob_cleanup_runs BEGIN SELECT RAISE(ABORT,'test'); END;",
+        "CREATE TRIGGER refuse_finish BEFORE INSERT ON history WHEN NEW.new_state='blob_cleanup_completed_local_only' BEGIN SELECT RAISE(ABORT,'test'); END;",
+    ] {
+        let t = Temp::new();
+        let (mut w, p) = setup(&t);
+        w.store.conn.execute_batch(sql).unwrap();
+        assert!(
+            w.execute_at(
+                p.plan_id,
+                CleanupBudget::default(),
+                p.planned_at,
+                |_, _| Ok(())
+            )
+            .is_err()
+        );
+        assert!(!path(&t).exists());
+        assert_eq!(count(&w.store, "blobs"), 1);
+        let r = w.store.blob_cleanup_executions(1).unwrap().remove(0);
+        assert!(r.finished_generation.is_none());
+        assert!(matches!(w.finish(), Err(StorageError::UnresolvedFailure)));
+        let c = Connection::open(t.data().join(DB)).unwrap();
+        c.execute_batch("DROP TRIGGER refuse_finish;").unwrap();
+        drop(c);
+        let mut s = reopen(&t);
+        assert_eq!(s.startup_state().unwrap(), StartupState::NeedsReview);
+        let done = recover(&mut s, &r, &p);
+        assert_eq!(done.outcome, Some(CleanupOutcome::RecoveryAbsent));
+        assert_eq!(s.startup_state().unwrap(), StartupState::NeedsReview);
+        assert!(!s.blob_recovery().needs_review());
+    }
+}
+#[test]
+fn each_io_failure_point_preserves_a_recoverable_intent_or_completed_result() {
+    for point in [
+        Point::AfterIntentCommit,
+        Point::BeforeUnlink,
+        Point::AfterUnlink,
+        Point::AfterDirectorySync,
+        Point::BeforeFinishCommit,
+        Point::AfterFinishCommit,
+    ] {
+        let t = Temp::new();
+        let (mut w, p) = setup(&t);
+        if point == Point::AfterUnlink {
+            w.finish().unwrap();
+            let mut startup = LocalStartup::open(&t.data(), Limits::default()).unwrap();
+            loop {
+                if startup
+                    .step(EvaluationLimits::default(), LocalStartupBudget::default())
+                    .unwrap()
+                    .checks_complete()
+                {
+                    break;
+                }
+            }
+            w = startup.into_writer().unwrap();
+        }
+
+        assert!(
+            w.execute_at(
+                p.plan_id,
+                CleanupBudget::default(),
+                p.planned_at,
+                |at, _| {
+                    if at == point {
+                        Err(StorageError::Io(std::io::Error::from_raw_os_error(5)))
+                    } else {
+                        Ok(())
+                    }
+                }
+            )
+            .is_err()
+        );
+        assert!(matches!(w.finish(), Err(StorageError::UnresolvedFailure)));
+        let mut s = reopen(&t);
+        assert_eq!(s.startup_state().unwrap(), StartupState::NeedsReview);
+        let r = s.blob_cleanup_executions(1).unwrap().remove(0);
+        if point == Point::AfterFinishCommit {
+            assert_eq!(r.outcome, Some(CleanupOutcome::Removed));
+            assert_eq!(count(&s, "blobs"), 0);
+        } else {
+            assert!(r.finished_generation.is_none());
+            let before = path(&t).exists();
+            let done = recover(&mut s, &r, &p);
+            assert_eq!(
+                done.outcome,
+                Some(if before {
+                    CleanupOutcome::RecoveryRemoved
+                } else {
+                    CleanupOutcome::RecoveryAbsent
+                })
+            );
+        }
+        assert!(!path(&t).exists());
+        assert_eq!(count(&s, "temporary_blob_holds"), 1);
+    }
+}
+#[test]
+fn protection_added_after_intent_prevents_unlink_and_completion() {
+    let t = Temp::new();
+    let (mut w, p) = setup(&t);
+    let r = rev(&[], 14, "racing reference");
+    assert!(
+        w.execute_at(
+            p.plan_id,
+            CleanupBudget::default(),
+            p.planned_at,
+            |at, c| {
+                if at == Point::AfterIntentCommit {
+                    c.execute(
+                        "INSERT INTO records(id,bytes) VALUES(?1,?2)",
+                        params![&r.id().bytes, r.bytes()],
+                    )?;
+                }
+                Ok(())
+            }
+        )
+        .is_err()
+    );
+    assert_eq!(std::fs::read(path(&t)).unwrap(), bytes());
+    let run = w.store.blob_cleanup_executions(1).unwrap().remove(0);
+    assert!(run.finished_generation.is_none());
+    assert!(matches!(w.finish(), Err(StorageError::UnresolvedFailure)));
+    let mut s = reopen(&t);
+    assert!(matches!(
+        s.recover_at(
+            run.run_id,
+            CleanupBudget::default(),
+            "新たな根拠も再検査",
+            p.planned_at,
+            |_, _| Ok(())
+        ),
+        Err(StorageError::ProtectionChanged)
+    ));
+    assert!(path(&t).exists());
+}
+#[test]
+fn normal_writer_resume_is_blocked_while_cleanup_is_pending() {
+    let t = Temp::new();
+    let (mut w, p) = setup(&t);
+    assert!(
+        w.execute_at(
+            p.plan_id,
+            CleanupBudget::default(),
+            p.planned_at,
+            |at, _| {
+                if at == Point::AfterIntentCommit {
+                    Err(StorageError::Io(std::io::Error::from_raw_os_error(5)))
+                } else {
+                    Ok(())
+                }
+            }
+        )
+        .is_err()
+    );
+    drop(w);
+    let s = reopen(&t);
+    assert!(matches!(s.begin(), Err(StorageError::NeedsReview)));
+    let s = reopen(&t);
+    let generation = s.generation().unwrap();
+    let review = s
+        .confirm_evidence_recovery(
+            generation,
+            "根拠確認",
+            "未完了の整理あり",
+            EvaluationLimits::default(),
+        )
+        .unwrap();
+    let s = reopen(&t);
+    assert!(matches!(
+        s.resume_local_writes(review, "整理を飛ばさない", EvaluationLimits::default()),
+        Err(StorageError::CleanupPending)
+    ));
+}
+#[test]
+fn corrupted_or_lost_execution_proof_is_rejected_instead_of_authorizing_absence() {
+    for sql in [
+        "UPDATE history SET reason='lost' WHERE new_state='blob_cleanup_started_local_only'",
+        "DROP TRIGGER cleanup_run_no_delete; DELETE FROM blob_cleanup_runs;",
+    ] {
+        let t = Temp::new();
+        let (mut w, p) = setup(&t);
+        assert!(
+            w.execute_at(
+                p.plan_id,
+                CleanupBudget::default(),
+                p.planned_at,
+                |at, _| {
+                    if at == Point::AfterUnlink {
+                        Err(StorageError::Io(std::io::Error::from_raw_os_error(5)))
+                    } else {
+                        Ok(())
+                    }
+                }
+            )
+            .is_err()
+        );
+        drop(w);
+        let c = Connection::open(t.data().join(DB)).unwrap();
+        c.execute_batch(sql).unwrap();
+        drop(c);
+        assert!(matches!(
+            RecordStore::open(&t.data(), Limits::default()),
+            Err(StorageError::Corrupt)
+        ));
+    }
+}
+#[test]
+fn schema_ten_is_preserved_without_automatic_migration() {
+    let t = Temp::new();
+    drop(t.store());
+    let c = Connection::open(t.data().join(DB)).unwrap();
+    c.pragma_update(None, "user_version", 10).unwrap();
+    drop(c);
+    let before = std::fs::read(t.data().join(DB)).unwrap();
+    assert!(matches!(
+        RecordStore::open(&t.data(), Limits::default()),
+        Err(StorageError::UnsupportedFormat)
+    ));
+    assert_eq!(std::fs::read(t.data().join(DB)).unwrap(), before);
+}
+#[test]
+fn process_kill_at_each_execution_boundary_requires_manual_recovery() {
+    if let Some(dir) = std::env::var_os("LNGNB_EXECUTION_KILL") {
+        let mut w = RecordStore::open(Path::new(&dir), Limits::default())
+            .unwrap()
+            .begin()
+            .unwrap();
+        let a = w
+            .stage_blob(
+                id::blob_id(&bytes()),
+                Cursor::new(bytes()),
+                1,
+                TemporaryLimits::default(),
+            )
+            .unwrap();
+        let CleanupDecision::Planned(p) = w
+            .plan_at(a.id, CleanupBudget::default(), a.expires_at, |_, _| Ok(()))
+            .unwrap()
+        else {
+            panic!()
+        };
+        let point: usize = std::env::var("LNGNB_EXECUTION_POINT")
+            .unwrap()
+            .parse()
+            .unwrap();
+        w.execute_at(
+            p.plan_id,
+            CleanupBudget::default(),
+            p.planned_at,
+            |at, _| {
+                if at as usize == point {
+                    println!("LNGNB_EXECUTION_READY");
+                    std::io::stdout().flush()?;
+                    let mut line = String::new();
+                    std::io::stdin().read_line(&mut line)?;
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        panic!("must be killed");
+    }
+    for point in 0..7 {
+        let t = Temp::new();
+        drop(t.store());
+        let mut child=Command::new(std::env::current_exe().unwrap()).args(["--exact","storage::cleanup::execution::tests::process_kill_at_each_execution_boundary_requires_manual_recovery","--nocapture"]).env("LNGNB_EXECUTION_KILL",t.data()).env("LNGNB_EXECUTION_POINT",point.to_string()).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+        let mut reader = std::io::BufReader::new(child.stdout.take().unwrap());
+        loop {
+            let mut line = String::new();
+            assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+            if line.contains("LNGNB_EXECUTION_READY") {
+                break;
+            }
+        }
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let mut s = reopen(&t);
+        assert_eq!(s.startup_state().unwrap(), StartupState::NeedsReview);
+        let runs = s.blob_cleanup_executions(1).unwrap();
+        if point == 0 {
+            assert!(runs.is_empty());
+            assert!(path(&t).exists());
+        } else if point == 6 {
+            assert!(runs[0].finished_generation.is_some());
+            assert!(!path(&t).exists());
+        } else {
+            let p = s.blob_cleanup_plans(1).unwrap().remove(0);
+            recover(&mut s, &runs[0], &p);
+            assert!(!path(&t).exists());
+            assert_eq!(s.startup_state().unwrap(), StartupState::NeedsReview);
+        }
+    }
+}
+
+#[test]
+fn a_reference_added_at_the_last_preunlink_boundary_preserves_the_file() {
+    let t = Temp::new();
+    let (mut w, p) = setup(&t);
+    let r = rev(&[], 14, "last moment reference");
+    assert!(
+        w.execute_at(
+            p.plan_id,
+            CleanupBudget::default(),
+            p.planned_at,
+            |at, c| {
+                if at == Point::BeforeUnlink {
+                    c.execute(
+                        "INSERT INTO records(id,bytes) VALUES(?1,?2)",
+                        params![&r.id().bytes, r.bytes()],
+                    )?;
+                }
+                Ok(())
+            }
+        )
+        .is_err()
+    );
+    assert_eq!(std::fs::read(path(&t)).unwrap(), bytes());
+    assert_eq!(count(&w.store, "records"), 0);
+    assert!(
+        w.store.blob_cleanup_executions(1).unwrap()[0]
+            .finished_generation
+            .is_none()
+    );
+}
+#[test]
+fn reappearance_before_completion_cannot_be_reported_as_finished_removal() {
+    use std::os::unix::fs::PermissionsExt;
+    for point in [Point::AfterUnlink, Point::BeforeFinishCommit] {
+        let t = Temp::new();
+        let (mut w, p) = setup(&t);
+        assert!(
+            w.execute_at(
+                p.plan_id,
+                CleanupBudget::default(),
+                p.planned_at,
+                |at, _| {
+                    if at == point {
+                        std::fs::write(path(&t), bytes())?;
+                        std::fs::set_permissions(path(&t), std::fs::Permissions::from_mode(0o600))?;
+                    }
+                    Ok(())
+                }
+            )
+            .is_err()
+        );
+        assert!(path(&t).exists());
+        let r = w.store.blob_cleanup_executions(1).unwrap().remove(0);
+        assert!(r.finished_generation.is_none());
+        drop(w);
+        let mut s = reopen(&t);
+        let done = recover(&mut s, &r, &p);
+        assert_eq!(done.outcome, Some(CleanupOutcome::RecoveryRemoved));
+    }
+}
+#[test]
+fn recovery_confirmation_clock_and_budget_do_not_release_pending_state() {
+    let t = Temp::new();
+    let (mut w, p) = setup(&t);
+    assert!(
+        w.execute_at(
+            p.plan_id,
+            CleanupBudget::default(),
+            p.planned_at,
+            |at, _| if at == Point::AfterIntentCommit {
+                Err(StorageError::Io(std::io::Error::from_raw_os_error(5)))
+            } else {
+                Ok(())
+            }
+        )
+        .is_err()
+    );
+    drop(w);
+    let mut s = reopen(&t);
+    let r = s.blob_cleanup_executions(1).unwrap().remove(0);
+    let g = s.generation().unwrap();
+    assert!(matches!(
+        s.recover_at(
+            r.run_id,
+            CleanupBudget::default(),
+            "",
+            p.planned_at,
+            |_, _| Ok(())
+        ),
+        Err(StorageError::InvalidRecoveryReview)
+    ));
+    assert_eq!(s.generation().unwrap(), g);
+    assert!(matches!(
+        s.recover_at(
+            r.run_id,
+            CleanupBudget::default(),
+            "確認",
+            p.planned_at - 1,
+            |_, _| Ok(())
+        ),
+        Err(StorageError::BudgetExceeded)
+    ));
+    assert!(matches!(
+        s.recover_at(
+            r.run_id,
+            CleanupBudget {
+                hash_bytes: 13,
+                ..CleanupBudget::default()
+            },
+            "確認",
+            p.planned_at,
+            |_, _| Ok(())
+        ),
+        Err(StorageError::BudgetExceeded)
+    ));
+    assert!(path(&t).exists());
+    assert!(
+        s.blob_cleanup_executions(1).unwrap()[0]
+            .finished_generation
+            .is_none()
+    );
+    assert_eq!(s.startup_state().unwrap(), StartupState::NeedsReview);
+    recover(&mut s, &r, &p);
+    assert_eq!(s.startup_state().unwrap(), StartupState::NeedsReview);
+}
+#[test]
+fn empty_body_uses_zero_hash_bytes_without_dropping_its_promise() {
+    let t = Temp::new();
+    let mut w = t.store().begin().unwrap();
+    let id = id::blob_id(b"");
+    let a = w
+        .stage_blob(id, Cursor::new(b""), 1, TemporaryLimits::default())
+        .unwrap();
+    let CleanupDecision::Planned(p) = w
+        .plan_at(
+            id,
+            CleanupBudget {
+                hash_bytes: 0,
+                ..CleanupBudget::default()
+            },
+            a.expires_at,
+            |_, _| Ok(()),
+        )
+        .unwrap()
+    else {
+        panic!()
+    };
+    w.execute_at(
+        p.plan_id,
+        CleanupBudget {
+            hash_bytes: 0,
+            ..CleanupBudget::default()
+        },
+        p.planned_at,
+        |_, _| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(count(&w.store, "temporary_blob_holds"), 1);
+    assert!(w.blob(id).unwrap().is_none());
+    w.finish().unwrap();
+    assert_eq!(reopen(&t).startup_state().unwrap(), StartupState::Clean);
+}
+#[test]
+fn an_older_cleanup_proof_does_not_hide_a_lost_later_upload() {
+    for manual in [false, true] {
+        let t = Temp::new();
+        let (mut w, p) = setup(&t);
+        execute(&mut w, &p);
+        if manual {
+            w.put_blob(p.blob_id, Cursor::new(bytes())).unwrap();
+        } else {
+            w.stage_blob(
+                p.blob_id,
+                Cursor::new(bytes()),
+                86400,
+                TemporaryLimits::default(),
+            )
+            .unwrap();
+        }
+        w.finish().unwrap();
+        let c = Connection::open(t.data().join(DB)).unwrap();
+        c.execute_batch(
+            "DROP TRIGGER blobs_no_delete; DELETE FROM manual_blob_holds; DELETE FROM blobs;",
+        )
+        .unwrap();
+        drop(c);
+        std::fs::remove_file(path(&t)).unwrap();
+        assert!(matches!(
+            RecordStore::open(&t.data(), Limits::default()),
+            Err(StorageError::Corrupt)
+        ));
+    }
+}

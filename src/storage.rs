@@ -16,7 +16,7 @@ use std::{
 };
 
 pub const IMPLEMENTATION: &str = "lngnb-rust-sqlite-1";
-pub const SCHEMA_VERSION: i64 = 10;
+pub const SCHEMA_VERSION: i64 = 11;
 const DB: &str = "database.sqlite";
 const SCHEMA: &str = "
 CREATE TABLE storage_state (
@@ -62,16 +62,26 @@ CREATE TRIGGER record_invalidates_inspection AFTER INSERT ON records BEGIN
  cursor=NULL,checked_records=0,checked_bytes=0,checkpoint_generation=NULL,checked_blob_files=0,checked_blob_bytes=0;
  DELETE FROM blob_inspection_files; DELETE FROM blob_inspection_inventory;
 END;
+CREATE TABLE blob_objects (
+ id BLOB PRIMARY KEY NOT NULL CHECK(length(id)=32),
+ byte_length INTEGER NOT NULL CHECK(byte_length>=0)
+) STRICT;
+CREATE TRIGGER objects_no_update BEFORE UPDATE ON blob_objects BEGIN SELECT RAISE(ABORT,'immutable_blob_object'); END;
+CREATE TRIGGER objects_no_delete BEFORE DELETE ON blob_objects BEGIN SELECT RAISE(ABORT,'immutable_blob_object'); END;
 CREATE TABLE blobs (
  id BLOB PRIMARY KEY NOT NULL CHECK(length(id)=32),
  byte_length INTEGER NOT NULL CHECK(byte_length>=0)
 ) STRICT;
+CREATE TRIGGER blob_register_object BEFORE INSERT ON blobs BEGIN
+ INSERT OR IGNORE INTO blob_objects(id,byte_length) VALUES(NEW.id,NEW.byte_length);
+ SELECT CASE WHEN (SELECT byte_length FROM blob_objects WHERE id=NEW.id)!=NEW.byte_length THEN RAISE(ABORT,'blob_length_changed') END;
+END;
 CREATE TABLE manual_blob_holds (
- blob_id BLOB PRIMARY KEY NOT NULL REFERENCES blobs(id)
+ blob_id BLOB PRIMARY KEY NOT NULL REFERENCES blob_objects(id)
 ) STRICT;
 CREATE TABLE temporary_blob_holds (
  hold_id BLOB PRIMARY KEY NOT NULL CHECK(length(hold_id)=32),
- blob_id BLOB NOT NULL REFERENCES blobs(id),
+ blob_id BLOB NOT NULL REFERENCES blob_objects(id),
  created_at INTEGER NOT NULL CHECK(created_at>=0),
  expires_at INTEGER NOT NULL CHECK(expires_at>created_at AND expires_at<=253402300799),
  generation INTEGER NOT NULL CHECK(generation>=0)
@@ -86,25 +96,53 @@ CREATE TRIGGER blob_invalidates_inspection AFTER INSERT ON blobs BEGIN
  DELETE FROM blob_inspection_files; DELETE FROM blob_inspection_inventory;
 END;
 CREATE TRIGGER blobs_no_update BEFORE UPDATE ON blobs BEGIN SELECT RAISE(ABORT,'immutable_blob'); END;
-CREATE TRIGGER blobs_no_delete BEFORE DELETE ON blobs BEGIN SELECT RAISE(ABORT,'immutable_blob'); END;
+CREATE TRIGGER blobs_no_delete BEFORE DELETE ON blobs WHEN NOT EXISTS(
+ SELECT 1 FROM blob_cleanup_runs r JOIN blob_cleanup_plans p ON p.plan_id=r.plan_id
+ WHERE p.blob_id=OLD.id AND r.finished_generation IS NULL AND p.cancelled_generation IS NULL AND p.completed_generation IS NULL
+) BEGIN SELECT RAISE(ABORT,'immutable_blob'); END;
+CREATE TRIGGER removed_blob_invalidates_state AFTER DELETE ON blobs BEGIN
+ UPDATE evaluation_state SET dirty=1,payload_epoch=payload_epoch+1;
+ UPDATE record_inspection SET source_epoch=source_epoch+1,
+ phase=CASE WHEN phase IN ('records','blobs') THEN 'records' ELSE 'idle' END,
+ cursor=NULL,checked_records=0,checked_bytes=0,checkpoint_generation=NULL,checked_blob_files=0,checked_blob_bytes=0;
+ DELETE FROM blob_inspection_files; DELETE FROM blob_inspection_inventory;
+END;
 CREATE TABLE blob_cleanup_plans (
  plan_id BLOB PRIMARY KEY NOT NULL CHECK(length(plan_id)=32),
- blob_id BLOB NOT NULL REFERENCES blobs(id),
+ blob_id BLOB NOT NULL REFERENCES blob_objects(id),
  byte_length INTEGER NOT NULL CHECK(byte_length>=0),
  planned_at INTEGER NOT NULL CHECK(planned_at BETWEEN 0 AND 253402300799),
  fingerprint TEXT NOT NULL CHECK(length(fingerprint) BETWEEN 1 AND 512),
  planned_generation INTEGER NOT NULL UNIQUE CHECK(planned_generation>=0),
  cancelled_generation INTEGER UNIQUE CHECK(cancelled_generation>planned_generation),
  cancellation TEXT CHECK(cancellation IN ('record_reference','manual_retention','temporary_promise')),
+ completed_generation INTEGER UNIQUE CHECK(completed_generation>planned_generation),
+ CHECK(cancelled_generation IS NULL OR completed_generation IS NULL),
  CHECK((cancelled_generation IS NULL)=(cancellation IS NULL))
 ) STRICT;
-CREATE UNIQUE INDEX one_pending_blob_cleanup ON blob_cleanup_plans(blob_id) WHERE cancelled_generation IS NULL;
+CREATE INDEX cleanup_plans_by_blob ON blob_cleanup_plans(blob_id,completed_generation);
+CREATE UNIQUE INDEX one_pending_blob_cleanup ON blob_cleanup_plans(blob_id) WHERE cancelled_generation IS NULL AND completed_generation IS NULL;
 CREATE TRIGGER cleanup_no_delete BEFORE DELETE ON blob_cleanup_plans BEGIN SELECT RAISE(ABORT,'immutable_cleanup_history'); END;
 CREATE TRIGGER cleanup_only_cancel BEFORE UPDATE ON blob_cleanup_plans WHEN
- OLD.cancelled_generation IS NOT NULL OR NEW.cancelled_generation IS NULL OR
+ OLD.cancelled_generation IS NOT NULL OR OLD.completed_generation IS NOT NULL OR
+ (NEW.cancelled_generation IS NULL AND NEW.completed_generation IS NULL) OR
+ (NEW.cancelled_generation IS NOT NULL AND NEW.completed_generation IS NOT NULL) OR
  NEW.plan_id IS NOT OLD.plan_id OR NEW.blob_id IS NOT OLD.blob_id OR NEW.byte_length!=OLD.byte_length OR
  NEW.planned_at!=OLD.planned_at OR NEW.fingerprint!=OLD.fingerprint OR NEW.planned_generation!=OLD.planned_generation
  BEGIN SELECT RAISE(ABORT,'immutable_cleanup_plan'); END;
+CREATE TABLE blob_cleanup_runs (
+ run_id BLOB PRIMARY KEY NOT NULL CHECK(length(run_id)=32),
+ plan_id BLOB NOT NULL UNIQUE REFERENCES blob_cleanup_plans(plan_id),
+ started_generation INTEGER NOT NULL UNIQUE CHECK(started_generation>=0),
+ finished_generation INTEGER UNIQUE CHECK(finished_generation>started_generation),
+ outcome TEXT CHECK(outcome IN ('removed','recovery_removed','recovery_absent')),
+ CHECK((finished_generation IS NULL)=(outcome IS NULL))
+) STRICT;
+CREATE TRIGGER cleanup_run_no_delete BEFORE DELETE ON blob_cleanup_runs BEGIN SELECT RAISE(ABORT,'immutable_cleanup_run'); END;
+CREATE TRIGGER cleanup_run_only_finish BEFORE UPDATE ON blob_cleanup_runs WHEN
+ OLD.finished_generation IS NOT NULL OR NEW.finished_generation IS NULL OR
+ NEW.run_id IS NOT OLD.run_id OR NEW.plan_id IS NOT OLD.plan_id OR NEW.started_generation!=OLD.started_generation
+ BEGIN SELECT RAISE(ABORT,'immutable_cleanup_run'); END;
 CREATE TABLE blob_failures (
  id BLOB PRIMARY KEY NOT NULL CHECK(length(id)=32),
  reason TEXT NOT NULL CHECK(reason IN ('transfer_hash_mismatch','transfer_failed')),
@@ -177,7 +215,7 @@ CREATE TABLE evaluations (
 CREATE TABLE known_invalid (
  record_id BLOB PRIMARY KEY NOT NULL REFERENCES records(id),
  reason TEXT NOT NULL CHECK(reason='declared_length_mismatch'),
- blob_id BLOB NOT NULL REFERENCES blobs(id), actual_length INTEGER NOT NULL CHECK(actual_length>=0),
+ blob_id BLOB NOT NULL REFERENCES blob_objects(id), actual_length INTEGER NOT NULL CHECK(actual_length>=0),
  rules TEXT NOT NULL CHECK(rules='lngnb-validation-1'),
  generation INTEGER NOT NULL, at TEXT NOT NULL
 ) STRICT;
@@ -190,6 +228,7 @@ CREATE TABLE history (
  actor TEXT NOT NULL, reason TEXT NOT NULL, rules TEXT NOT NULL,
  at TEXT NOT NULL
 ) STRICT;
+CREATE INDEX history_blob_retention ON history(target,generation) WHERE new_state IN ('blob_staged_local_only','blob_retained_local_only');
 ";
 
 #[derive(Debug)]
@@ -212,6 +251,7 @@ pub enum StorageError {
     StaleRecoveryReview,
     InvalidRecoveryReview,
     ProtectionChanged,
+    CleanupPending,
 }
 impl std::fmt::Display for StorageError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -233,6 +273,7 @@ impl std::fmt::Display for StorageError {
             Self::StaleRecoveryReview => "stale_recovery_review",
             Self::InvalidRecoveryReview => "invalid_recovery_review",
             Self::ProtectionChanged => "protection_snapshot_changed",
+            Self::CleanupPending => "blob_cleanup_pending",
         })
     }
 }
@@ -436,7 +477,6 @@ fn check_format(conn: &Connection) -> Result<()> {
         return Err(StorageError::UnsupportedFormat);
     }
     blobs::validate_holds(conn)?;
-    cleanup::validate(conn)?;
     let (implementation, namespace, generation, state): (String, Vec<u8>, i64, String) = conn
         .query_row(
             "SELECT implementation,namespace,generation,state FROM storage_state WHERE singleton=1",
@@ -460,6 +500,8 @@ fn check_format(conn: &Connection) -> Result<()> {
         "blob_staged_local_only",
         "blob_cleanup_planned_local_only",
         "blob_cleanup_cancelled_local_only",
+        "blob_cleanup_started_local_only",
+        "blob_cleanup_completed_local_only",
         "evaluated_local_only",
         "blob_failure_observed",
         "record_inspection_pending",
@@ -875,7 +917,7 @@ impl RecordWriter {
     /// 配信等は未実装。書込みと必要履歴が全て正常に終わった時だけ呼べる。
     /// selfを消費するので、正常停止印の後にこのwriterから変更できない。
     pub fn finish(mut self) -> Result<()> {
-        if self.failed {
+        if self.failed || cleanup::pending(&self.store.conn)? {
             return Err(StorageError::UnresolvedFailure);
         }
         transition(&mut self.store.conn, "clean", "finish_record_session")?;
@@ -918,4 +960,6 @@ pub use protection::{BlobProtection, BlobProtectionSnapshot, ProtectionBudget, P
 
 #[path = "blob_cleanup.rs"]
 mod cleanup;
-pub use cleanup::{BlobCleanupPlan, CleanupBudget, CleanupDecision};
+pub use cleanup::{
+    BlobCleanupPlan, CleanupBudget, CleanupDecision, CleanupExecution, CleanupOutcome,
+};

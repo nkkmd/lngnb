@@ -54,7 +54,7 @@ pub struct BlobProtectionSnapshot {
     /// 生Blob ID順。未掲載は「削除してよい」の意味ではない。
     pub blobs: Vec<BlobProtection>,
 }
-fn version(conn: &Connection) -> Result<ProtectionVersion> {
+pub(super) fn version(conn: &Connection) -> Result<ProtectionVersion> {
     let (ns,g,r,p,i):(Vec<u8>,i64,i64,i64,i64)=conn.query_row("SELECT storage_state.namespace,storage_state.generation,evaluation_state.record_epoch,evaluation_state.payload_epoch,record_inspection.source_epoch FROM storage_state,evaluation_state,record_inspection WHERE storage_state.singleton=1 AND evaluation_state.singleton=1 AND record_inspection.singleton=1",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)))?;
     if [g, r, p, i].iter().any(|n| *n < 0) {
         return Err(StorageError::Corrupt);
@@ -222,11 +222,10 @@ pub(super) fn collect(
         if created < 0 || expires <= created || expires > 253402300799 {
             return Err(StorageError::Corrupt);
         }
-        let target = rows.get_mut(&blob).ok_or(StorageError::Corrupt)?;
-        if target.recorded_length.is_none() {
-            return Err(StorageError::Corrupt);
-        }
-        target.temporary_holds.push(hold);
+        // 整理済み実体の過去の約束も保持する。現在の実体保持とは別。
+        entry(&mut rows, blob, budget.targets)?
+            .temporary_holds
+            .push(hold);
     }
     drop(query);
     drop(stmt);
