@@ -569,3 +569,185 @@ fn empty_storage_and_maximum_confirmation_are_supported_without_publication() {
     w.finish().unwrap();
     assert_eq!(open(&t).startup_state().unwrap(), StartupState::Clean);
 }
+
+#[test]
+fn mixed_recovery_findings_and_scan_budgets_preserve_evidence_until_explicit_resume() {
+    let t = Temp::new();
+    let bad = rev(&[], 15, "mixed known bad");
+    let child = rev(&[bad.id()], 14, "mixed descendant");
+    let missing = id::blob_id(b"ordinary missing payload");
+    let with_payload = |parents: &[Id], tag: &str| {
+        let mut body = rev(parents, 24, tag).body().clone();
+        let Value::Map(fields) = &mut body else {
+            panic!()
+        };
+        let p = &mut fields.iter_mut().find(|(k, _)| k == "payload").unwrap().1;
+        set(p, "blob_id", Value::Bytes(missing.bytes.to_vec()));
+        LocalRecord::sign(body, &key()).unwrap()
+    };
+    let ordinary = with_payload(&[], "ordinary unavailable");
+    let ordinary_child = with_payload(&[ordinary.id()], "ordinary child");
+    let retained = id::blob_id(b"independent retained");
+    let mut w = t.store().begin().unwrap();
+    let records = [
+        fixture(),
+        bad.clone(),
+        child.clone(),
+        ordinary.clone(),
+        ordinary_child.clone(),
+    ];
+    for r in records.iter().rev() {
+        w.insert(r).unwrap();
+    }
+    let original = super::super::tests::bytes();
+    w.put_blob(id::blob_id(&original), Cursor::new(&original))
+        .unwrap();
+    w.put_blob(retained, Cursor::new(b"independent retained"))
+        .unwrap();
+    w.revalidate(EvaluationLimits::default()).unwrap();
+    assert_eq!(known(&w.store), 1);
+    drop(w);
+    let retained_path = t.data().join("blobs").join(blobs::hex(&retained.bytes));
+    std::fs::remove_file(path(&t)).unwrap();
+    std::fs::write(&retained_path, b"corrupt").unwrap();
+    let orphan = t
+        .data()
+        .join("blobs")
+        .join(blobs::hex(&id::blob_id(b"orphan").bytes));
+    let staging = t.data().join("staging").join(format!(
+        "{}.part",
+        blobs::hex(&id::blob_id(b"partial").bytes)
+    ));
+    for (p, b) in [
+        (&orphan, b"orphan".as_slice()),
+        (&staging, b"partial".as_slice()),
+    ] {
+        std::fs::write(p, b).unwrap();
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let s = open(&t);
+    let snapshot = s.evaluate(EvaluationLimits::default()).unwrap();
+    assert_state(
+        &snapshot,
+        &bad,
+        Validation::Pending,
+        Some(Reason::EvidenceUnavailable),
+    );
+    assert_eq!(
+        snapshot
+            .records
+            .iter()
+            .find(|r| r.record_id == child.id())
+            .unwrap()
+            .validation,
+        Validation::Pending
+    );
+    for r in [&ordinary, &ordinary_child] {
+        assert_state(&snapshot, r, Validation::Valid, None);
+        assert_eq!(
+            snapshot
+                .records
+                .iter()
+                .find(|a| a.record_id == r.id())
+                .unwrap()
+                .payload_status,
+            Some(PayloadStatus::Missing)
+        );
+    }
+    assert!(matches!(review(s), Err(StorageError::Corrupt)));
+    assert_eq!(resume_count(&open(&t)), 0);
+    assert_eq!(known(&open(&t)), 1);
+    // 真正根拠だけを復元しても、他の保存障害や未登録実体は解消したことにならない。
+    std::fs::write(path(&t), &original).unwrap();
+    std::fs::set_permissions(path(&t), std::fs::Permissions::from_mode(0o600)).unwrap();
+    let r = review(open(&t)).unwrap();
+    assert!(matches!(
+        resumed(open(&t), r),
+        Err(StorageError::NeedsReview)
+    ));
+    assert_eq!(std::fs::read(&orphan).unwrap(), b"orphan");
+    assert_eq!(std::fs::read(&staging).unwrap(), b"partial");
+    assert_eq!(resume_count(&open(&t)), 0);
+    // 明示的な試験側操作で実体を修復し、未登録/途中実体を保存領域外へ退避する。
+    std::fs::write(&retained_path, b"independent retained").unwrap();
+    std::fs::rename(&orphan, t.root.join("orphan-preserved")).unwrap();
+    std::fs::rename(&staging, t.root.join("staging-preserved")).unwrap();
+    let s = open(&t);
+    assert!(s.blob_recovery().missing.is_empty() && s.blob_recovery().corrupt.is_empty());
+    assert_eq!(s.startup_state().unwrap(), StartupState::NeedsReview);
+    let r = review(s).unwrap();
+    let mut s = open(&t);
+    // open時の上限は十分でも、再開時の全走査を別に予算不足にする。
+    s.limits.scan_blob_bytes = 1;
+    assert!(matches!(resumed(s, r), Err(StorageError::BudgetExceeded)));
+    let s = open(&t);
+    assert_eq!(resume_count(&s), 0);
+    assert_eq!(s.startup_state().unwrap(), StartupState::NeedsReview);
+    assert_eq!(known(&s), 1);
+    assert!(matches!(
+        resumed(s, r),
+        Err(StorageError::StaleRecoveryReview)
+    ));
+    let r = review(open(&t)).unwrap();
+    let mut limited = open(&t);
+    limited.limits.scan_blob_files = 1;
+    assert!(matches!(
+        resumed(limited, r),
+        Err(StorageError::BudgetExceeded)
+    ));
+    assert_eq!(resume_count(&open(&t)), 0);
+    assert_eq!(known(&open(&t)), 1);
+    let r = review(open(&t)).unwrap();
+    assert!(matches!(
+        open(&t).resume_local_writes(
+            r,
+            CONFIRM,
+            EvaluationLimits {
+                blob_bytes: 13,
+                ..EvaluationLimits::default()
+            }
+        ),
+        Err(StorageError::BudgetExceeded)
+    ));
+    let r = review(open(&t)).unwrap();
+    let w = resumed(open(&t), r).unwrap();
+    let snapshot = w.store.evaluate(EvaluationLimits::default()).unwrap();
+    assert_state(
+        &snapshot,
+        &bad,
+        Validation::Invalid,
+        Some(Reason::DeclaredLengthMismatch),
+    );
+    assert_state(
+        &snapshot,
+        &child,
+        Validation::Invalid,
+        Some(Reason::InvalidParent),
+    );
+    for r in [&ordinary, &ordinary_child] {
+        assert_state(&snapshot, r, Validation::Valid, None);
+        assert_eq!(
+            snapshot
+                .records
+                .iter()
+                .find(|a| a.record_id == r.id())
+                .unwrap()
+                .payload_status,
+            Some(PayloadStatus::Missing)
+        );
+    }
+    assert_eq!(known(&w.store), 1);
+    for r in records {
+        assert_eq!(w.store.record(r.id()).unwrap().unwrap().bytes(), r.bytes());
+    }
+    assert_eq!(
+        std::fs::read(t.root.join("orphan-preserved")).unwrap(),
+        b"orphan"
+    );
+    assert_eq!(
+        std::fs::read(t.root.join("staging-preserved")).unwrap(),
+        b"partial"
+    );
+    w.finish().unwrap();
+    assert_eq!(open(&t).startup_state().unwrap(), StartupState::Clean);
+}
