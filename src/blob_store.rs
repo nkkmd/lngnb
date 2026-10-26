@@ -64,7 +64,7 @@ enum Hold {
 }
 fn temporary_budget(conn: &Connection, id: Id, length: u64, limits: TemporaryLimits) -> Result<()> {
     let (count, size, present): (i64,i64,bool) = conn.query_row(
-        "SELECT (SELECT count(*) FROM temporary_blob_holds),coalesce((SELECT sum(byte_length) FROM blobs WHERE id IN (SELECT blob_id FROM temporary_blob_holds)),0),EXISTS(SELECT 1 FROM temporary_blob_holds WHERE blob_id=?1)",
+        "SELECT (SELECT count(*) FROM temporary_blob_holds),coalesce((SELECT sum(byte_length) FROM blobs WHERE id IN (SELECT blob_id FROM temporary_blob_holds)),0),EXISTS(SELECT 1 FROM blobs b WHERE b.id=?1 AND EXISTS(SELECT 1 FROM temporary_blob_holds t WHERE t.blob_id=b.id))",
         [&id.bytes], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
     if count < 0 || size < 0 {
         return Err(StorageError::Corrupt);
@@ -82,6 +82,12 @@ pub(super) fn validate_holds(conn: &Connection) -> Result<()> {
     // 約束を失った場合、明示保持済みの同じBlobがあっても黙って忘れない。
     let bad: bool = conn.query_row(
         "SELECT EXISTS(
+            SELECT 1 FROM blobs b LEFT JOIN blob_objects o ON o.id=b.id WHERE o.id IS NULL OR b.byte_length!=o.byte_length
+        ) OR EXISTS(
+            SELECT 1 FROM blob_objects o WHERE NOT EXISTS(SELECT 1 FROM blobs b WHERE b.id=o.id)
+            AND NOT EXISTS(SELECT 1 FROM blob_cleanup_runs r JOIN blob_cleanup_plans p ON p.plan_id=r.plan_id WHERE p.blob_id=o.id AND r.finished_generation IS NOT NULL
+                AND r.finished_generation>=(SELECT coalesce(max(h.generation),0) FROM history h WHERE h.target=o.id AND h.new_state IN ('blob_staged_local_only','blob_retained_local_only')))
+        ) OR EXISTS(
             SELECT 1 FROM blobs b
             WHERE NOT EXISTS(SELECT 1 FROM manual_blob_holds m WHERE m.blob_id=b.id)
               AND NOT EXISTS(SELECT 1 FROM temporary_blob_holds t WHERE t.blob_id=b.id)
@@ -90,7 +96,7 @@ pub(super) fn validate_holds(conn: &Connection) -> Result<()> {
             WHERE b.id IS NULL
         ) OR EXISTS(
             SELECT 1 FROM temporary_blob_holds t
-            LEFT JOIN blobs b ON b.id=t.blob_id
+            LEFT JOIN blob_objects b ON b.id=t.blob_id
             LEFT JOIN history h ON h.generation=t.generation
             WHERE b.id IS NULL OR length(t.hold_id)!=32 OR t.created_at<0
                OR t.expires_at<=t.created_at OR t.expires_at>253402300799
@@ -106,6 +112,7 @@ pub(super) fn validate_holds(conn: &Connection) -> Result<()> {
     if bad {
         return Err(StorageError::Corrupt);
     }
+    cleanup::validate(conn)?;
     Ok(())
 }
 pub(super) fn unix_now() -> Result<i64> {
