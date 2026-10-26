@@ -1092,3 +1092,148 @@ fn post_recovery_scan_budget_failure_keeps_committed_cleanup_and_manual_hold() {
         Err(StorageError::NeedsReview)
     ));
 }
+
+// R24/R28/R30: 行数上限の外側で実行される台帳SQLも中断可能にする。
+fn sql_ledger(t: &Temp) -> (RecordWriter, BlobCleanupPlan, i64) {
+    let (mut w, first) = setup(t);
+    for i in 0u8..32 {
+        let body = [i; 3];
+        let a = w
+            .stage_blob(
+                id::blob_id(&body),
+                Cursor::new(body),
+                1,
+                TemporaryLimits::default(),
+            )
+            .unwrap();
+        assert!(matches!(
+            w.plan_at(a.id, CleanupBudget::default(), a.expires_at, |_, _| Ok(()))
+                .unwrap(),
+            CleanupDecision::Planned(_)
+        ));
+    }
+    let now: i64 = w
+        .store
+        .conn
+        .query_row("SELECT max(planned_at) FROM blob_cleanup_plans", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    (w, first, now)
+}
+fn small_sql_cleanup() -> CleanupBudget {
+    CleanupBudget {
+        protection: ProtectionBudget {
+            sql_inspection: SqlInspectionBudget {
+                callbacks: 1,
+                ..SqlInspectionBudget::default()
+            },
+            ..ProtectionBudget::default()
+        },
+        ..CleanupBudget::default()
+    }
+}
+#[test]
+fn cleanup_sql_budget_before_intent_is_retryable_and_diagnostics_are_bounded() {
+    let t = Temp::new();
+    let (mut w, p, now) = sql_ledger(&t);
+    let generation = w.store.generation().unwrap();
+    assert!(matches!(
+        w.plan_at(p.blob_id, small_sql_cleanup(), now, |_, _| Ok(())),
+        Err(StorageError::BudgetExceeded)
+    ));
+    assert!(matches!(
+        w.execute_at(p.plan_id, small_sql_cleanup(), now, |_, _| Ok(())),
+        Err(StorageError::BudgetExceeded)
+    ));
+    assert_eq!(w.store.generation().unwrap(), generation);
+    assert_eq!(count(&w.store, "blob_cleanup_runs"), 0);
+    assert_eq!(std::fs::read(path(&t)).unwrap(), bytes());
+    assert!(!w.failed);
+    w.store.limits.sql_inspection = small_sql_cleanup().protection.sql_inspection;
+    assert!(matches!(
+        w.store.blob_cleanup_plans(100),
+        Err(StorageError::BudgetExceeded)
+    ));
+    assert!(matches!(
+        w.store.blob_cleanup_executions(100),
+        Err(StorageError::BudgetExceeded)
+    ));
+    w.store.limits.sql_inspection = SqlInspectionBudget::default();
+    w.execute_at(p.plan_id, CleanupBudget::default(), now, |_, _| Ok(()))
+        .unwrap();
+    assert_eq!(count(&w.store, "blob_cleanup_runs"), 1);
+    w.finish().unwrap();
+    assert_eq!(reopen(&t).startup_state().unwrap(), StartupState::Clean);
+}
+#[test]
+fn cleanup_recovery_sql_budget_keeps_intent_and_requires_explicit_retry() {
+    let t = Temp::new();
+    let (mut w, p, now) = sql_ledger(&t);
+    assert!(
+        w.execute_at(p.plan_id, CleanupBudget::default(), now, |at, _| {
+            if at == Point::AfterIntentCommit {
+                Err(StorageError::Io(std::io::Error::from_raw_os_error(5)))
+            } else {
+                Ok(())
+            }
+        })
+        .is_err()
+    );
+    drop(w);
+    let mut s = reopen(&t);
+    let run = s.blob_cleanup_executions(100).unwrap().remove(0);
+    let generation = s.generation().unwrap();
+    assert!(matches!(
+        s.recover_at(
+            run.run_id,
+            small_sql_cleanup(),
+            "保存済み意思の確認",
+            now,
+            |_, _| Ok(())
+        ),
+        Err(StorageError::BudgetExceeded)
+    ));
+    assert_eq!(s.generation().unwrap(), generation);
+    assert_eq!(s.blob_cleanup_executions(100).unwrap(), vec![run.clone()]);
+    assert_eq!(std::fs::read(path(&t)).unwrap(), bytes());
+    let done = s
+        .recover_at(
+            run.run_id,
+            CleanupBudget::default(),
+            "予算を調整し意思と全根拠を再確認",
+            now,
+            |_, _| Ok(()),
+        )
+        .unwrap();
+    assert_eq!(done.outcome, Some(CleanupOutcome::RecoveryRemoved));
+    assert_eq!(s.startup_state().unwrap(), StartupState::NeedsReview);
+}
+#[test]
+fn interrupted_cancellation_sql_rolls_back_new_record_and_keeps_running_mark() {
+    let t = Temp::new();
+    let (mut w, p, _) = sql_ledger(&t);
+    w.insert(&fixture()).unwrap();
+    let r = rev(&[], 14, "SQL interrupted cancellation");
+    let generation = w.store.generation().unwrap();
+    w.store.limits.sql_inspection = small_sql_cleanup().protection.sql_inspection;
+    assert!(matches!(w.insert(&r), Err(StorageError::BudgetExceeded)));
+    assert!(w.failed);
+    assert!(w.store.record(r.id()).unwrap().is_none());
+    assert_eq!(w.store.generation().unwrap(), generation);
+    w.store.limits.sql_inspection = SqlInspectionBudget::default();
+    let p2 = w
+        .store
+        .blob_cleanup_plans(100)
+        .unwrap()
+        .into_iter()
+        .find(|x| x.plan_id == p.plan_id)
+        .unwrap();
+    assert!(p2.cancelled_generation.is_none());
+    assert_eq!(std::fs::read(path(&t)).unwrap(), bytes());
+    assert!(matches!(w.finish(), Err(StorageError::UnresolvedFailure)));
+    assert_eq!(
+        reopen(&t).startup_state().unwrap(),
+        StartupState::NeedsReview
+    );
+}

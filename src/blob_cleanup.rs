@@ -44,7 +44,11 @@ fn plan_reason(id: &[u8; 32], at: i64, n: i64, fingerprint: &str) -> String {
         blobs::hex(id)
     )
 }
-pub(super) fn validate(conn: &Connection) -> Result<()> {
+pub(super) fn validate(conn: &Connection, budget: SqlInspectionBudget) -> Result<()> {
+    sql_inspection::run(conn, budget, || validate_inner(conn))
+}
+// validate_holdsの予算scopeを共有する。ここへ独立handlerをネストしない。
+pub(super) fn validate_inner(conn: &Connection) -> Result<()> {
     let bad:bool=conn.query_row(
         "SELECT EXISTS(
             SELECT 1 FROM blob_cleanup_plans p
@@ -115,10 +119,15 @@ fn plans(conn: &Connection, limit: u64) -> Result<Vec<BlobCleanupPlan>> {
     Ok(out)
 }
 /// 呼出し側の変更transactionでだけ取り消す。新しい保持根拠と取消履歴を分離しない。
-pub(super) fn cancel(tx: &Transaction<'_>, blob: &[u8; 32], cause: &str) -> Result<()> {
+pub(super) fn cancel(
+    tx: &Transaction<'_>,
+    blob: &[u8; 32],
+    cause: &str,
+    budget: SqlInspectionBudget,
+) -> Result<()> {
     let pending:Option<Vec<u8>>=tx.query_row("SELECT plan_id FROM blob_cleanup_plans WHERE blob_id=?1 AND cancelled_generation IS NULL AND completed_generation IS NULL",[blob],|r|r.get(0)).optional()?;
     if let Some(raw) = pending {
-        validate(tx)?;
+        validate(tx, budget)?;
         let id = key(raw)?;
         advance(tx)?;
         tx.execute("UPDATE blob_cleanup_plans SET cancelled_generation=(SELECT generation FROM storage_state WHERE singleton=1),cancellation=?2 WHERE plan_id=?1",params![&id,cause])?;
@@ -135,7 +144,7 @@ pub(super) fn cancel(tx: &Transaction<'_>, blob: &[u8; 32], cause: &str) -> Resu
 impl RecordStore {
     pub fn blob_cleanup_plans(&self, limit: u64) -> Result<Vec<BlobCleanupPlan>> {
         let tx = self.conn.unchecked_transaction()?;
-        validate(&tx)?;
+        validate(&tx, self.limits.sql_inspection)?;
         let out = plans(&tx, limit)?;
         tx.commit()?;
         Ok(out)
@@ -208,9 +217,24 @@ impl RecordWriter {
         // BEGIN IMMEDIATEで保護の読取りから予定のcommitまで別writerを排除する。
         let tx =
             Transaction::new_unchecked(&self.store.conn, rusqlite::TransactionBehavior::Immediate)?;
-        validate(&tx)?;
+        validate(
+            &tx,
+            budget
+                .protection
+                .sql_inspection
+                .within(start, budget.protection.elapsed),
+        )?;
         let prior = plans(&tx, budget.plans)?;
-        let floor:i64=tx.query_row("SELECT max(coalesce((SELECT max(created_at) FROM temporary_blob_holds),0),coalesce((SELECT max(planned_at) FROM blob_cleanup_plans),0))",[],|r|r.get(0))?;
+        let floor: i64 = sql_inspection::run(
+            &tx,
+            budget
+                .protection
+                .sql_inspection
+                .within(start, budget.protection.elapsed),
+            || {
+                Ok(tx.query_row("SELECT max(coalesce((SELECT max(created_at) FROM temporary_blob_holds),0),coalesce((SELECT max(planned_at) FROM blob_cleanup_plans),0))", [], |r| r.get(0))?)
+            },
+        )?;
         if now < floor {
             return Err(StorageError::BudgetExceeded);
         }
@@ -354,10 +378,12 @@ pub(super) fn cancel_point(pause: Option<bool>, before: bool) -> Result<()> {
 #[path = "blob_cleanup_execution.rs"]
 mod execution;
 pub use execution::{CleanupExecution, CleanupOutcome};
-pub(super) fn pending(conn: &Connection) -> Result<bool> {
-    Ok(conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM blob_cleanup_runs WHERE finished_generation IS NULL)",
-        [],
-        |r| r.get(0),
-    )?)
+pub(super) fn pending(conn: &Connection, budget: SqlInspectionBudget) -> Result<bool> {
+    sql_inspection::run(conn, budget, || {
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM blob_cleanup_runs WHERE finished_generation IS NULL)",
+            [],
+            |r| r.get(0),
+        )?)
+    })
 }

@@ -498,3 +498,42 @@ fn kill_before_or_after_checkpoint_resumes_only_committed_progress_and_keeps_rev
         );
     }
 }
+
+#[test]
+fn split_blob_quick_check_budget_preserves_checkpoint_and_can_be_adjusted() {
+    use crate::storage::evaluation::tests::rev;
+    let t = Temp::new();
+    let mut w = t.store().begin().unwrap();
+    for i in 0..128 {
+        w.insert(&rev(&[], 14, &format!("quick check {i}")))
+            .unwrap();
+    }
+    w.finish().unwrap();
+    let mut inspection = RecordInspection::open(&t.data(), Limits::default()).unwrap();
+    let p = inspection
+        .step(InspectionBudget {
+            records: 128,
+            ..InspectionBudget::default()
+        })
+        .unwrap();
+    assert!(p.records_complete);
+    let before = inspection.progress().unwrap();
+    inspection.store.limits.sql_inspection = SqlInspectionBudget {
+        callbacks: 1,
+        ..SqlInspectionBudget::default()
+    };
+    assert!(matches!(
+        inspection.step(InspectionBudget::default()),
+        Err(StorageError::BudgetExceeded)
+    ));
+    assert_eq!(inspection.progress().unwrap(), before);
+    inspection.store.limits.sql_inspection = SqlInspectionBudget::default();
+    assert!(
+        inspection
+            .step(InspectionBudget::default())
+            .unwrap()
+            .checks_complete
+    );
+    let s = inspection.into_store().unwrap();
+    assert_eq!(s.startup_state().unwrap(), StartupState::Clean);
+}

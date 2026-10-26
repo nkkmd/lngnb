@@ -321,6 +321,7 @@ fn fingerprint(m: &std::fs::Metadata) -> String {
 
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
+    pub sql_inspection: SqlInspectionBudget,
     pub scan_records: u64,
     pub scan_bytes: u64,
     pub scan_blob_files: u64,
@@ -335,6 +336,7 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
+            sql_inspection: SqlInspectionBudget::default(),
             scan_records: 10_000,
             scan_bytes: 64 * 1024 * 1024,
             scan_blob_files: 10_000,
@@ -350,7 +352,9 @@ impl Default for Limits {
 }
 impl Limits {
     fn check(self) -> Result<Self> {
-        if self.scan_records == 0
+        if self.sql_inspection.callbacks == 0
+            || self.sql_inspection.elapsed.is_zero()
+            || self.scan_records == 0
             || self.scan_bytes == 0
             || self.scan_blob_files == 0
             || self.scan_blob_bytes == 0
@@ -471,12 +475,12 @@ fn connection(fd: &OwnedFd, readonly: bool) -> Result<Connection> {
     conn.busy_timeout(std::time::Duration::ZERO)?;
     Ok(conn)
 }
-fn check_format(conn: &Connection) -> Result<()> {
+fn check_format(conn: &Connection, budget: SqlInspectionBudget) -> Result<()> {
     let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
     if version != SCHEMA_VERSION {
         return Err(StorageError::UnsupportedFormat);
     }
-    blobs::validate_holds(conn)?;
+    blobs::validate_holds(conn, budget)?;
     let (implementation, namespace, generation, state): (String, Vec<u8>, i64, String) = conn
         .query_row(
             "SELECT implementation,namespace,generation,state FROM storage_state WHERE singleton=1",
@@ -671,7 +675,7 @@ impl RecordStore {
         let lock = lock(&dir, false)?;
         // 未対応版のDBを設定変更する前にread-onlyで照合する。
         let probe = connection(&dir, true)?;
-        check_format(&probe)?;
+        check_format(&probe, limits.sql_inspection)?;
         inspection::checkpoint(&probe)?;
         drop(probe);
         let conn = connection(&dir, false)?;
@@ -711,9 +715,11 @@ impl RecordStore {
             };
             self.record(id)?.ok_or(StorageError::Corrupt)?;
         }
-        let check: String = self
-            .conn
-            .query_row("PRAGMA quick_check", [], |r| r.get(0))?;
+        let check: String = sql_inspection::run(&self.conn, self.limits.sql_inspection, || {
+            Ok(self
+                .conn
+                .query_row("PRAGMA quick_check", [], |r| r.get(0))?)
+        })?;
         if check != "ok" {
             return Err(StorageError::Corrupt);
         }
@@ -884,7 +890,12 @@ impl RecordWriter {
                 params![&record.id().bytes, record.bytes()],
             )?;
             if let Some((blob, _)) = record.payload().map_err(|_| StorageError::Corrupt)? {
-                cleanup::cancel(&tx, &blob, "record_reference")?;
+                cleanup::cancel(
+                    &tx,
+                    &blob,
+                    "record_reference",
+                    self.store.limits.sql_inspection,
+                )?;
             }
             advance(&tx)?;
             audit(
@@ -917,7 +928,7 @@ impl RecordWriter {
     /// 配信等は未実装。書込みと必要履歴が全て正常に終わった時だけ呼べる。
     /// selfを消費するので、正常停止印の後にこのwriterから変更できない。
     pub fn finish(mut self) -> Result<()> {
-        if self.failed || cleanup::pending(&self.store.conn)? {
+        if self.failed || cleanup::pending(&self.store.conn, self.store.limits.sql_inspection)? {
             return Err(StorageError::UnresolvedFailure);
         }
         transition(&mut self.store.conn, "clean", "finish_record_session")?;
@@ -963,3 +974,7 @@ mod cleanup;
 pub use cleanup::{
     BlobCleanupPlan, CleanupBudget, CleanupDecision, CleanupExecution, CleanupOutcome,
 };
+
+#[path = "sql_inspection.rs"]
+mod sql_inspection;
+pub use sql_inspection::SqlInspectionBudget;

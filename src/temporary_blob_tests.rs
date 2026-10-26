@@ -446,3 +446,77 @@ fn temporary_upload_does_not_adopt_an_unregistered_existing_file() {
     assert_eq!(count(&w.store, "temporary_blob_holds"), 0);
     assert!(matches!(w.finish(), Err(StorageError::UnresolvedFailure)));
 }
+
+#[test]
+fn temporary_capacity_sql_budget_is_not_a_capacity_or_corruption_result() {
+    let t = Temp::new();
+    let mut w = t.store().begin().unwrap();
+    for _ in 0..512 {
+        stage(&mut w, b"ledger capacity", 1);
+    }
+    let budget = SqlInspectionBudget {
+        callbacks: 1,
+        ..SqlInspectionBudget::default()
+    };
+    let before = w.store.generation().unwrap();
+    assert!(matches!(
+        temporary_budget(
+            &w.store.conn,
+            id::blob_id(b"new capacity"),
+            12,
+            TemporaryLimits::default(),
+            budget
+        ),
+        Err(StorageError::BudgetExceeded)
+    ));
+    assert_eq!(w.store.generation().unwrap(), before);
+    temporary_budget(
+        &w.store.conn,
+        id::blob_id(b"new capacity"),
+        12,
+        TemporaryLimits::default(),
+        SqlInspectionBudget::default(),
+    )
+    .unwrap();
+    w.finish().unwrap();
+}
+#[test]
+fn capacity_sql_interruption_after_file_placement_keeps_orphan_and_manual_hold() {
+    let t = Temp::new();
+    let mut w = t.store().begin().unwrap();
+    for _ in 0..512 {
+        stage(&mut w, b"ledger capacity", 1);
+    }
+    let target = id::blob_id(b"placed but not committed");
+    let before = w.store.generation().unwrap();
+    let holds = count(&w.store, "temporary_blob_holds");
+    w.store.limits.sql_inspection = SqlInspectionBudget {
+        callbacks: 1,
+        ..SqlInspectionBudget::default()
+    };
+    // stageの読取り先行検査の後に使う共通確定経路を直接試験する。
+    assert!(matches!(
+        w.put_with_hold(
+            target,
+            Cursor::new(b"placed but not committed"),
+            Hold::Temporary {
+                ttl: 1,
+                limits: TemporaryLimits::default(),
+                id: [77; 32]
+            }
+        ),
+        Err(StorageError::BudgetExceeded)
+    ));
+    assert!(w.failed);
+    assert_eq!(w.store.generation().unwrap(), before);
+    assert_eq!(count(&w.store, "temporary_blob_holds"), holds);
+    assert!(w.store.blob(target).unwrap().is_none());
+    let file = t.data().join("blobs").join(hex(&target.bytes));
+    assert_eq!(std::fs::read(&file).unwrap(), b"placed but not committed");
+    assert!(matches!(w.finish(), Err(StorageError::UnresolvedFailure)));
+    let s = RecordStore::open(&t.data(), Limits::default()).unwrap();
+    assert_eq!(s.startup_state().unwrap(), StartupState::NeedsReview);
+    assert!(s.blob_recovery().orphaned.contains(&target));
+    assert!(s.blob(target).unwrap().is_none());
+    assert!(file.exists());
+}

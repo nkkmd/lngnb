@@ -118,7 +118,15 @@ fn eligible(
     if !(0..=253402300799).contains(&now) || now < p.planned_at {
         return Err(StorageError::BudgetExceeded);
     }
-    let floor:i64=conn.query_row("SELECT max(coalesce((SELECT max(created_at) FROM temporary_blob_holds),0),coalesce((SELECT max(planned_at) FROM blob_cleanup_plans),0))",[],|r|r.get(0))?;
+    let floor: i64 = sql_inspection::run(
+        conn,
+        b.protection
+            .sql_inspection
+            .within(start, b.protection.elapsed),
+        || {
+            Ok(conn.query_row("SELECT max(coalesce((SELECT max(created_at) FROM temporary_blob_holds),0),coalesce((SELECT max(planned_at) FROM blob_cleanup_plans),0))", [], |r| r.get(0))?)
+        },
+    )?;
     if now < floor {
         return Err(StorageError::BudgetExceeded);
     }
@@ -145,8 +153,18 @@ fn eligible(
     check(start, b)?;
     Ok(s.version)
 }
-fn selected(conn: &Connection, id: [u8; 32], b: CleanupBudget) -> Result<BlobCleanupPlan> {
-    validate(conn)?;
+fn selected(
+    conn: &Connection,
+    id: [u8; 32],
+    b: CleanupBudget,
+    start: Instant,
+) -> Result<BlobCleanupPlan> {
+    validate(
+        conn,
+        b.protection
+            .sql_inspection
+            .within(start, b.protection.elapsed),
+    )?;
     plans(conn, b.plans)?
         .into_iter()
         .find(|p| p.plan_id == id)
@@ -180,7 +198,7 @@ fn finish_run(
 ) -> Result<CleanupExecution> {
     capacity(s)?;
     let tx = Transaction::new_unchecked(&s.conn, rusqlite::TransactionBehavior::Immediate)?;
-    let p = selected(&tx, run.plan_id, b)?;
+    let p = selected(&tx, run.plan_id, b, start)?;
     let current = executions(&tx, b.plans)?
         .into_iter()
         .find(|r| r.run_id == run.run_id)
@@ -286,7 +304,12 @@ fn finish_run(
     if protection::version(&tx)? != expected {
         return Err(StorageError::ProtectionChanged);
     }
-    blobs::validate_holds(&tx)?;
+    blobs::validate_holds(
+        &tx,
+        b.protection
+            .sql_inspection
+            .within(start, b.protection.elapsed),
+    )?;
     check(start, b)?;
     tx.commit()?;
     hook(Point::AfterFinishCommit, &s.conn)?;
@@ -317,7 +340,7 @@ impl RecordWriter {
             return Err(StorageError::UnresolvedFailure);
         }
         let result = (|| {
-            if pending(&self.store.conn)? {
+            if pending(&self.store.conn, self.store.limits.sql_inspection)? {
                 return Err(StorageError::CleanupPending);
             }
             capacity(&self.store)?;
@@ -327,7 +350,7 @@ impl RecordWriter {
                 &self.store.conn,
                 rusqlite::TransactionBehavior::Immediate,
             )?;
-            let p = selected(&tx, plan_id, b)?;
+            let p = selected(&tx, plan_id, b, start)?;
             if p.cancelled_generation.is_some() || p.completed_generation.is_some() {
                 return Err(StorageError::ProtectionChanged);
             }
@@ -407,7 +430,7 @@ impl RecordWriter {
             )
         })();
         if result.is_err()
-            && (pending(&self.store.conn).unwrap_or(true)
+            && (pending(&self.store.conn, self.store.limits.sql_inspection).unwrap_or(true)
                 || result.as_ref().is_err_and(|e| {
                     !matches!(e, StorageError::BudgetExceeded | StorageError::Capacity)
                 }))
@@ -420,7 +443,7 @@ impl RecordWriter {
 impl RecordStore {
     pub fn blob_cleanup_executions(&self, limit: u64) -> Result<Vec<CleanupExecution>> {
         let tx = self.conn.unchecked_transaction()?;
-        validate(&tx)?;
+        validate(&tx, self.limits.sql_inspection)?;
         let out = executions(&tx, limit)?;
         tx.commit()?;
         Ok(out)
@@ -456,7 +479,7 @@ impl RecordStore {
         if state(&self.conn)? != StartupState::NeedsReview {
             return Err(StorageError::NeedsReview);
         }
-        validate(&self.conn)?;
+        validate(&self.conn, b.protection.sql_inspection)?;
         let run = executions(&self.conn, b.plans)?
             .into_iter()
             .find(|r| r.run_id == run_id && r.finished_generation.is_none())
