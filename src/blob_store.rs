@@ -62,7 +62,23 @@ enum Hold {
         id: [u8; 32],
     },
 }
-fn temporary_budget(conn: &Connection, id: Id, length: u64, limits: TemporaryLimits) -> Result<()> {
+fn temporary_budget(
+    conn: &Connection,
+    id: Id,
+    length: u64,
+    limits: TemporaryLimits,
+    budget: SqlInspectionBudget,
+) -> Result<()> {
+    sql_inspection::run(conn, budget, || {
+        temporary_budget_inner(conn, id, length, limits)
+    })
+}
+fn temporary_budget_inner(
+    conn: &Connection,
+    id: Id,
+    length: u64,
+    limits: TemporaryLimits,
+) -> Result<()> {
     let (count, size, present): (i64,i64,bool) = conn.query_row(
         "SELECT (SELECT count(*) FROM temporary_blob_holds),coalesce((SELECT sum(byte_length) FROM blobs WHERE id IN (SELECT blob_id FROM temporary_blob_holds)),0),EXISTS(SELECT 1 FROM blobs b WHERE b.id=?1 AND EXISTS(SELECT 1 FROM temporary_blob_holds t WHERE t.blob_id=b.id))",
         [&id.bytes], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
@@ -78,7 +94,10 @@ fn temporary_budget(conn: &Connection, id: Id, length: u64, limits: TemporaryLim
     }
     Ok(())
 }
-pub(super) fn validate_holds(conn: &Connection) -> Result<()> {
+pub(super) fn validate_holds(conn: &Connection, budget: SqlInspectionBudget) -> Result<()> {
+    sql_inspection::run(conn, budget, || validate_holds_inner(conn))
+}
+fn validate_holds_inner(conn: &Connection) -> Result<()> {
     // 約束を失った場合、明示保持済みの同じBlobがあっても黙って忘れない。
     let bad: bool = conn.query_row(
         "SELECT EXISTS(
@@ -112,7 +131,7 @@ pub(super) fn validate_holds(conn: &Connection) -> Result<()> {
     if bad {
         return Err(StorageError::Corrupt);
     }
-    cleanup::validate(conn)?;
+    cleanup::validate_inner(conn)?;
     Ok(())
 }
 pub(super) fn unix_now() -> Result<i64> {
@@ -367,8 +386,10 @@ impl RecordWriter {
         if ttl_seconds == 0 || ttl_seconds > 253402300799 {
             return Err(StorageError::BudgetExceeded);
         }
-        if let Err(e) = validate_holds(&self.store.conn) {
-            self.failed = true;
+        if let Err(e) = validate_holds(&self.store.conn, self.store.limits.sql_inspection) {
+            if !matches!(e, StorageError::BudgetExceeded) {
+                self.failed = true;
+            }
             return Err(e);
         }
         temporary_budget(
@@ -376,6 +397,7 @@ impl RecordWriter {
             id,
             self.store.limits.max_blob_bytes,
             limits,
+            self.store.limits.sql_inspection,
         )?;
         let hold_id = Id::random_knowledge()
             .map_err(|_| StorageError::RandomUnavailable)?
@@ -579,13 +601,16 @@ impl RecordWriter {
                 limits,
                 id: hold_id,
             } => {
-                temporary_budget(&tx, id, length, limits)?;
+                temporary_budget(&tx, id, length, limits, self.store.limits.sql_inspection)?;
                 let now = unix_now()?;
-                let previous: i64 = tx.query_row(
-                    "SELECT coalesce(max(created_at),0) FROM temporary_blob_holds",
-                    [],
-                    |r| r.get(0),
-                )?;
+                let previous: i64 =
+                    sql_inspection::run(&tx, self.store.limits.sql_inspection, || {
+                        Ok(tx.query_row(
+                            "SELECT coalesce(max(created_at),0) FROM temporary_blob_holds",
+                            [],
+                            |r| r.get(0),
+                        )?)
+                    })?;
                 let expires = now
                     .checked_add(i64::try_from(ttl).map_err(|_| StorageError::BudgetExceeded)?)
                     .filter(|n| *n <= 253402300799)
@@ -653,6 +678,7 @@ impl RecordWriter {
             } else {
                 "manual_retention"
             },
+            self.store.limits.sql_inspection,
         )?;
         #[cfg(test)]
         cleanup::cancel_point(self.cleanup_cancel_pause, true)?;

@@ -320,9 +320,15 @@ pub(super) fn prepare(
     }
     let mut done = !pending && start.elapsed() < budget.elapsed;
     if done {
-        let check: String = store
-            .conn
-            .query_row("PRAGMA quick_check", [], |r| r.get(0))?;
+        let check: String = sql_inspection::run(
+            &store.conn,
+            store.limits.sql_inspection.within(start, budget.elapsed),
+            || {
+                Ok(store
+                    .conn
+                    .query_row("PRAGMA quick_check", [], |r| r.get(0))?)
+            },
+        )?;
         if check != "ok" {
             return Err(StorageError::Corrupt);
         }

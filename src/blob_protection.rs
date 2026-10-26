@@ -8,6 +8,7 @@ use std::{
 
 #[derive(Debug, Clone, Copy)]
 pub struct ProtectionBudget {
+    pub sql_inspection: SqlInspectionBudget,
     pub records: u64,
     pub record_bytes: u64,
     pub retained_blobs: u64,
@@ -19,6 +20,7 @@ pub struct ProtectionBudget {
 impl Default for ProtectionBudget {
     fn default() -> Self {
         Self {
+            sql_inspection: SqlInspectionBudget::default(),
             records: 10_000,
             record_bytes: 64 * 1024 * 1024,
             retained_blobs: 10_000,
@@ -146,7 +148,7 @@ pub(super) fn collect(
     };
     check()?;
     let source = version(conn)?;
-    blobs::validate_holds(conn)?;
+    blobs::validate_holds(conn, budget.sql_inspection.within(start, budget.elapsed))?;
     let mut rows = BTreeMap::new();
     let mut inputs = BTreeMap::new();
     // 派生要約を使わず、一次Recordから全参照を再構成する。
