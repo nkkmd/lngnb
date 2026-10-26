@@ -33,7 +33,9 @@ pub struct EvaluationJob {
 impl RecordStore {
     /// 起動局所検査済みStoreから評価だけを再開する。通常writerや手動解除を公開しない。
     pub fn evaluation_job(mut self) -> Result<EvaluationJob> {
-        if !self.records_checked || inspection::checkpoint(&self.conn)?.pending() {
+        if !self.records_checked
+            || inspection::checkpoint(&self.conn, self.limits.sql_inspection)?.pending()
+        {
             return Err(StorageError::InspectionPending);
         }
         let started_clean = self.startup_state()? == StartupState::Clean;

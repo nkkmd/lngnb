@@ -64,7 +64,15 @@ fn id(row: &Entry) -> Result<Id> {
     };
     blobs::parse_name(stem)
 }
-fn load(store: &RecordStore, epoch: i64) -> Result<Option<(Inventory, Vec<Entry>)>> {
+// 読取りだけを囲み、checkpoint保存・ファイルI/O・quick_checkとはscopeを分ける。
+fn load(
+    store: &RecordStore,
+    epoch: i64,
+    budget: SqlInspectionBudget,
+) -> Result<Option<(Inventory, Vec<Entry>)>> {
+    sql_inspection::run(&store.conn, budget, || load_inner(store, epoch))
+}
+fn load_inner(store: &RecordStore, epoch: i64) -> Result<Option<(Inventory, Vec<Entry>)>> {
     let header:Option<(i64,String,String,Vec<u8>)>=store.conn.query_row("SELECT epoch,blobs_fingerprint,staging_fingerprint,digest FROM blob_inspection_inventory WHERE singleton=1",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
     let Some((saved, b, s, hash)) = header else {
         let n: i64 =
@@ -251,7 +259,11 @@ pub(super) fn prepare(
     budget: InspectionBudget,
     start: Instant,
 ) -> Result<BlobPlan> {
-    let (mut saved, mut rows, fresh) = match load(store, epoch)? {
+    let (mut saved, mut rows, fresh) = match load(
+        store,
+        epoch,
+        store.limits.sql_inspection.within(start, budget.elapsed),
+    )? {
         Some((saved, rows)) => (saved, rows, false),
         None => {
             let (s, r) = inventory(store, epoch)?;
@@ -419,7 +431,7 @@ pub(super) fn restore(
     epoch: i64,
     checked: (i64, i64),
 ) -> Result<BlobRecovery> {
-    if let Some((_, rows)) = load(store, epoch)? {
+    if let Some((_, rows)) = load(store, epoch, store.limits.sql_inspection)? {
         if totals(&rows)? != checked {
             return Err(StorageError::Corrupt);
         }
@@ -437,7 +449,8 @@ pub(super) fn validate_complete(
     epoch: i64,
     checked: (i64, i64),
 ) -> Result<()> {
-    let (saved, rows) = load(store, epoch)?.ok_or(StorageError::Corrupt)?;
+    let (saved, rows) =
+        load(store, epoch, store.limits.sql_inspection)?.ok_or(StorageError::Corrupt)?;
     if totals(&rows)? != checked || rows.iter().any(|r| r.result == "pending") {
         return Err(StorageError::Corrupt);
     }

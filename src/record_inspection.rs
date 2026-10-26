@@ -69,7 +69,10 @@ type StoredCheckpoint = (
     i64,
     i64,
 );
-pub(super) fn checkpoint(conn: &Connection) -> Result<Checkpoint> {
+pub(super) fn checkpoint(conn: &Connection, budget: SqlInspectionBudget) -> Result<Checkpoint> {
+    sql_inspection::run(conn, budget, || checkpoint_inner(conn))
+}
+fn checkpoint_inner(conn: &Connection) -> Result<Checkpoint> {
     let (epoch,phase,raw,count,bytes,generation,blob_files,blob_bytes):StoredCheckpoint=conn.query_row(
         "SELECT source_epoch,phase,cursor,checked_records,checked_bytes,checkpoint_generation,checked_blob_files,checked_blob_bytes FROM record_inspection WHERE singleton=1",[],
         |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?)))?;
@@ -207,7 +210,7 @@ impl RecordInspection {
     pub fn open(path: &Path, limits: Limits) -> Result<Self> {
         let mut store = RecordStore::open_locked(path, limits)?;
         let started_clean = state(&store.conn)? == StartupState::Clean;
-        let old = checkpoint(&store.conn)?;
+        let old = checkpoint(&store.conn, store.limits.sql_inspection)?;
         let previous_report =
             blob_checks::restore(&store, old.epoch, (old.blob_files, old.blob_bytes))?;
         // 一般配信/管理変更を許可する前の印。検査cursorを書くだけでも先に確定する。
@@ -239,7 +242,7 @@ impl RecordInspection {
         })
     }
     pub fn progress(&self) -> Result<InspectionProgress> {
-        Ok(checkpoint(&self.store.conn)?.progress())
+        Ok(checkpoint(&self.store.conn, self.store.limits.sql_inspection)?.progress())
     }
     pub fn step(&mut self, budget: InspectionBudget) -> Result<InspectionProgress> {
         if self.failed {
@@ -258,7 +261,13 @@ impl RecordInspection {
         if budget.records == 0 || budget.bytes == 0 || budget.elapsed.is_zero() {
             return Err(StorageError::BudgetExceeded);
         }
-        let old = checkpoint(&self.store.conn)?;
+        let old = checkpoint(
+            &self.store.conn,
+            self.store
+                .limits
+                .sql_inspection
+                .within(start, budget.elapsed),
+        )?;
         if old.epoch != self.epoch || old.phase == "idle" {
             return Err(StorageError::Corrupt);
         }
@@ -366,7 +375,7 @@ impl RecordInspection {
         if self.failed || self.store.blob_recovery.needs_review() {
             return Err(StorageError::UnresolvedFailure);
         }
-        checkpoint(&self.store.conn)?;
+        checkpoint(&self.store.conn, self.store.limits.sql_inspection)?;
         if self.started_clean {
             transition(&mut self.store.conn, "clean", "pause_record_inspection")?;
         }
@@ -395,10 +404,13 @@ impl RecordInspection {
         if self.failed {
             return Err(StorageError::UnresolvedFailure);
         }
-        if !checkpoint(&self.store.conn)?.progress().checks_complete {
+        if !checkpoint(&self.store.conn, self.store.limits.sql_inspection)?
+            .progress()
+            .checks_complete
+        {
             return Err(StorageError::InspectionPending);
         }
-        let cp = checkpoint(&self.store.conn)?;
+        let cp = checkpoint(&self.store.conn, self.store.limits.sql_inspection)?;
         blob_checks::validate_complete(&self.store, cp.epoch, (cp.blob_files, cp.blob_bytes))?;
         if restore_clean && self.started_clean && !self.store.blob_recovery.needs_review() {
             transition(&mut self.store.conn, "clean", "finish_record_inspection")?;
@@ -416,12 +428,12 @@ mod tests;
 mod blob_checks;
 
 pub(super) fn validate_aux(store: &RecordStore) -> Result<()> {
-    let cp = checkpoint(&store.conn)?;
+    let cp = checkpoint(&store.conn, store.limits.sql_inspection)?;
     blob_checks::restore(store, cp.epoch, (cp.blob_files, cp.blob_bytes))?;
     Ok(())
 }
 pub(super) fn validate_for_resume(store: &RecordStore) -> Result<()> {
-    let cp = checkpoint(&store.conn)?;
+    let cp = checkpoint(&store.conn, store.limits.sql_inspection)?;
     if !store.records_checked || cp.pending() {
         return Err(StorageError::InspectionPending);
     }
