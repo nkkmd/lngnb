@@ -118,126 +118,8 @@ impl RecordStore {
         };
         check()?;
         let tx = self.conn.unchecked_transaction()?;
-        let source = version(&tx)?;
-        blobs::validate_holds(&tx)?;
-        let mut rows = BTreeMap::new();
-        let mut inputs = BTreeMap::new();
-        // 派生要約を使わず、一次Recordから全参照を再構成する。
-        let mut stmt = tx.prepare("SELECT id,length(bytes) FROM records ORDER BY id")?;
-        let mut query = stmt.query([])?;
-        let mut bytes = 0u64;
-        while let Some(row) = query.next()? {
-            check()?;
-            if inputs.len() as u64 >= budget.records {
-                return Err(StorageError::BudgetExceeded);
-            }
-            let id = key(row.get(0)?)?;
-            let n: i64 = row.get(1)?;
-            if !(1..=MAX_RECORD as i64).contains(&n) {
-                return Err(StorageError::Corrupt);
-            }
-            bytes = bytes
-                .checked_add(n as u64)
-                .ok_or(StorageError::BudgetExceeded)?;
-            if bytes > budget.record_bytes {
-                return Err(StorageError::BudgetExceeded);
-            }
-            let record = self.record(record_id(id))?.ok_or(StorageError::Corrupt)?;
-            let payload = record.payload().map_err(|_| StorageError::Corrupt)?;
-            if let Some((blob, _)) = payload {
-                entry(&mut rows, blob, budget.targets)?
-                    .referencing_records
-                    .push(record_id(id));
-            }
-            inputs.insert(id, payload);
-        }
-        drop(query);
-        drop(stmt);
-        let mut stmt = tx.prepare("SELECT b.id,b.byte_length,EXISTS(SELECT 1 FROM manual_blob_holds m WHERE m.blob_id=b.id) FROM blobs b ORDER BY b.id")?;
-        let mut query = stmt.query([])?;
-        let mut retained = 0u64;
-        while let Some(row) = query.next()? {
-            check()?;
-            if retained >= budget.retained_blobs {
-                return Err(StorageError::BudgetExceeded);
-            }
-            retained += 1;
-            let id = key(row.get(0)?)?;
-            let length: i64 = row.get(1)?;
-            if length < 0 {
-                return Err(StorageError::Corrupt);
-            }
-            let query_manual: bool = row.get(2)?;
-            let row = entry(&mut rows, id, budget.targets)?;
-            row.manual_retention_recorded = query_manual;
-            row.recorded_length = Some(length as u64);
-        }
-        drop(query);
-        drop(stmt);
-        let mut stmt=tx.prepare("SELECT hold_id,blob_id,created_at,expires_at FROM temporary_blob_holds ORDER BY hold_id")?;
-        let mut query = stmt.query([])?;
-        let mut holds = 0u64;
-        while let Some(row) = query.next()? {
-            check()?;
-            if holds >= budget.temporary_holds {
-                return Err(StorageError::BudgetExceeded);
-            }
-            holds += 1;
-            let hold = key(row.get(0)?)?;
-            let blob = key(row.get(1)?)?;
-            let created: i64 = row.get(2)?;
-            let expires: i64 = row.get(3)?;
-            if created < 0 || expires <= created || expires > 253402300799 {
-                return Err(StorageError::Corrupt);
-            }
-            let target = rows.get_mut(&blob).ok_or(StorageError::Corrupt)?;
-            if target.recorded_length.is_none() {
-                return Err(StorageError::Corrupt);
-            }
-            target.temporary_holds.push(hold);
-        }
-        drop(query);
-        drop(stmt);
-        if rows.values().any(|r| {
-            r.recorded_length.is_some()
-                && !r.manual_retention_recorded
-                && r.temporary_holds.is_empty()
-        }) {
-            return Err(StorageError::Corrupt);
-        }
-        let mut stmt=tx.prepare("SELECT record_id,blob_id,actual_length,reason,rules,generation,length(at) FROM known_invalid ORDER BY record_id")?;
-        let mut query = stmt.query([])?;
-        let mut roots = 0u64;
-        while let Some(row) = query.next()? {
-            check()?;
-            if roots >= budget.evidence {
-                return Err(StorageError::BudgetExceeded);
-            }
-            roots += 1;
-            let record = key(row.get(0)?)?;
-            let blob = key(row.get(1)?)?;
-            let actual: i64 = row.get(2)?;
-            let reason: String = row.get(3)?;
-            let rules: String = row.get(4)?;
-            let generation: i64 = row.get(5)?;
-            let at: i64 = row.get(6)?;
-            let payload = inputs.get(&record).ok_or(StorageError::Corrupt)?;
-            let target = rows.get_mut(&blob).ok_or(StorageError::Corrupt)?;
-            if actual < 0
-                || reason != "declared_length_mismatch"
-                || rules != "lngnb-validation-1"
-                || generation < 0
-                || generation > source.generation
-                || !(1..=64).contains(&at)
-                || !payload.is_some_and(|(id, n)| id == blob && n != actual as u64)
-                || target.recorded_length != Some(actual as u64)
-            {
-                return Err(StorageError::Corrupt);
-            }
-            target.known_invalid_records.push(record_id(record));
-        }
-        drop(query);
-        drop(stmt);
+        let snapshot = collect(&tx, budget, start)?;
+        let source = snapshot.version.clone();
         before_commit()?;
         check()?;
         tx.commit()?;
@@ -246,11 +128,151 @@ impl RecordStore {
             return Err(StorageError::ProtectionChanged);
         }
         check()?;
-        Ok(BlobProtectionSnapshot {
-            version: source,
-            blobs: rows.into_values().collect(),
-        })
+        Ok(snapshot)
     }
+}
+/// 呼出し側が所有する同じtransactionから全根拠を収集する。
+pub(super) fn collect(
+    conn: &Connection,
+    budget: ProtectionBudget,
+    start: Instant,
+) -> Result<BlobProtectionSnapshot> {
+    let check = || {
+        if start.elapsed() >= budget.elapsed {
+            Err(StorageError::BudgetExceeded)
+        } else {
+            Ok(())
+        }
+    };
+    check()?;
+    let source = version(conn)?;
+    blobs::validate_holds(conn)?;
+    let mut rows = BTreeMap::new();
+    let mut inputs = BTreeMap::new();
+    // 派生要約を使わず、一次Recordから全参照を再構成する。
+    let mut stmt = conn.prepare("SELECT id,length(bytes) FROM records ORDER BY id")?;
+    let mut query = stmt.query([])?;
+    let mut bytes = 0u64;
+    while let Some(row) = query.next()? {
+        check()?;
+        if inputs.len() as u64 >= budget.records {
+            return Err(StorageError::BudgetExceeded);
+        }
+        let id = key(row.get(0)?)?;
+        let n: i64 = row.get(1)?;
+        if !(1..=MAX_RECORD as i64).contains(&n) {
+            return Err(StorageError::Corrupt);
+        }
+        bytes = bytes
+            .checked_add(n as u64)
+            .ok_or(StorageError::BudgetExceeded)?;
+        if bytes > budget.record_bytes {
+            return Err(StorageError::BudgetExceeded);
+        }
+        let raw: Vec<u8> =
+            conn.query_row("SELECT bytes FROM records WHERE id=?1", [&id], |r| r.get(0))?;
+        let record =
+            LocalRecord::check(&raw, Some(record_id(id))).map_err(|_| StorageError::Corrupt)?;
+        let payload = record.payload().map_err(|_| StorageError::Corrupt)?;
+        if let Some((blob, _)) = payload {
+            entry(&mut rows, blob, budget.targets)?
+                .referencing_records
+                .push(record_id(id));
+        }
+        inputs.insert(id, payload);
+    }
+    drop(query);
+    drop(stmt);
+    let mut stmt = conn.prepare("SELECT b.id,b.byte_length,EXISTS(SELECT 1 FROM manual_blob_holds m WHERE m.blob_id=b.id) FROM blobs b ORDER BY b.id")?;
+    let mut query = stmt.query([])?;
+    let mut retained = 0u64;
+    while let Some(row) = query.next()? {
+        check()?;
+        if retained >= budget.retained_blobs {
+            return Err(StorageError::BudgetExceeded);
+        }
+        retained += 1;
+        let id = key(row.get(0)?)?;
+        let length: i64 = row.get(1)?;
+        if length < 0 {
+            return Err(StorageError::Corrupt);
+        }
+        let query_manual: bool = row.get(2)?;
+        let row = entry(&mut rows, id, budget.targets)?;
+        row.manual_retention_recorded = query_manual;
+        row.recorded_length = Some(length as u64);
+    }
+    drop(query);
+    drop(stmt);
+    let mut stmt = conn.prepare(
+        "SELECT hold_id,blob_id,created_at,expires_at FROM temporary_blob_holds ORDER BY hold_id",
+    )?;
+    let mut query = stmt.query([])?;
+    let mut holds = 0u64;
+    while let Some(row) = query.next()? {
+        check()?;
+        if holds >= budget.temporary_holds {
+            return Err(StorageError::BudgetExceeded);
+        }
+        holds += 1;
+        let hold = key(row.get(0)?)?;
+        let blob = key(row.get(1)?)?;
+        let created: i64 = row.get(2)?;
+        let expires: i64 = row.get(3)?;
+        if created < 0 || expires <= created || expires > 253402300799 {
+            return Err(StorageError::Corrupt);
+        }
+        let target = rows.get_mut(&blob).ok_or(StorageError::Corrupt)?;
+        if target.recorded_length.is_none() {
+            return Err(StorageError::Corrupt);
+        }
+        target.temporary_holds.push(hold);
+    }
+    drop(query);
+    drop(stmt);
+    if rows.values().any(|r| {
+        r.recorded_length.is_some() && !r.manual_retention_recorded && r.temporary_holds.is_empty()
+    }) {
+        return Err(StorageError::Corrupt);
+    }
+    let mut stmt=conn.prepare("SELECT record_id,blob_id,actual_length,reason,rules,generation,length(at) FROM known_invalid ORDER BY record_id")?;
+    let mut query = stmt.query([])?;
+    let mut roots = 0u64;
+    while let Some(row) = query.next()? {
+        check()?;
+        if roots >= budget.evidence {
+            return Err(StorageError::BudgetExceeded);
+        }
+        roots += 1;
+        let record = key(row.get(0)?)?;
+        let blob = key(row.get(1)?)?;
+        let actual: i64 = row.get(2)?;
+        let reason: String = row.get(3)?;
+        let rules: String = row.get(4)?;
+        let generation: i64 = row.get(5)?;
+        let at: i64 = row.get(6)?;
+        let payload = inputs.get(&record).ok_or(StorageError::Corrupt)?;
+        let target = rows.get_mut(&blob).ok_or(StorageError::Corrupt)?;
+        if actual < 0
+            || reason != "declared_length_mismatch"
+            || rules != "lngnb-validation-1"
+            || generation < 0
+            || generation > source.generation
+            || !(1..=64).contains(&at)
+            || !payload.is_some_and(|(id, n)| id == blob && n != actual as u64)
+            || target.recorded_length != Some(actual as u64)
+        {
+            return Err(StorageError::Corrupt);
+        }
+        target.known_invalid_records.push(record_id(record));
+    }
+    drop(query);
+    drop(stmt);
+    check()?;
+    Ok(BlobProtectionSnapshot {
+        version: source,
+        blobs: rows.into_values().collect(),
+    })
 }
 impl RecordWriter {
     pub fn blob_protection(&mut self, budget: ProtectionBudget) -> Result<BlobProtectionSnapshot> {
