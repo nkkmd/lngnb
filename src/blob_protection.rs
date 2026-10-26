@@ -12,6 +12,7 @@ pub struct ProtectionBudget {
     pub record_bytes: u64,
     pub retained_blobs: u64,
     pub evidence: u64,
+    pub temporary_holds: u64,
     pub targets: u64,
     pub elapsed: Duration,
 }
@@ -22,6 +23,7 @@ impl Default for ProtectionBudget {
             record_bytes: 64 * 1024 * 1024,
             retained_blobs: 10_000,
             evidence: 10_000,
+            temporary_holds: 100_000,
             targets: 20_000,
             elapsed: Duration::from_secs(60),
         }
@@ -30,9 +32,11 @@ impl Default for ProtectionBudget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlobProtection {
     pub blob_id: Id,
-    /// schema 8の台帳は管理者による明示保持。現在の実体の存在や正常性とは別。
+    /// 明示保持の台帳。現在の実体の存在や正常性とは別。
     pub manual_retention_recorded: bool,
     pub recorded_length: Option<u64>,
+    /// 期限切れも未整理の間は保守的に保護する。HTTP受付票ではない。
+    pub temporary_holds: Vec<[u8; 32]>,
     pub referencing_records: Vec<Id>,
     pub known_invalid_records: Vec<Id>,
 }
@@ -87,6 +91,7 @@ fn entry(
         },
         manual_retention_recorded: false,
         recorded_length: None,
+        temporary_holds: Vec::new(),
         referencing_records: Vec::new(),
         known_invalid_records: Vec::new(),
     }))
@@ -114,6 +119,7 @@ impl RecordStore {
         check()?;
         let tx = self.conn.unchecked_transaction()?;
         let source = version(&tx)?;
+        blobs::validate_holds(&tx)?;
         let mut rows = BTreeMap::new();
         let mut inputs = BTreeMap::new();
         // 派生要約を使わず、一次Recordから全参照を再構成する。
@@ -147,7 +153,7 @@ impl RecordStore {
         }
         drop(query);
         drop(stmt);
-        let mut stmt = tx.prepare("SELECT id,byte_length FROM blobs ORDER BY id")?;
+        let mut stmt = tx.prepare("SELECT b.id,b.byte_length,EXISTS(SELECT 1 FROM manual_blob_holds m WHERE m.blob_id=b.id) FROM blobs b ORDER BY b.id")?;
         let mut query = stmt.query([])?;
         let mut retained = 0u64;
         while let Some(row) = query.next()? {
@@ -161,12 +167,44 @@ impl RecordStore {
             if length < 0 {
                 return Err(StorageError::Corrupt);
             }
+            let query_manual: bool = row.get(2)?;
             let row = entry(&mut rows, id, budget.targets)?;
-            row.manual_retention_recorded = true;
+            row.manual_retention_recorded = query_manual;
             row.recorded_length = Some(length as u64);
         }
         drop(query);
         drop(stmt);
+        let mut stmt=tx.prepare("SELECT hold_id,blob_id,created_at,expires_at FROM temporary_blob_holds ORDER BY hold_id")?;
+        let mut query = stmt.query([])?;
+        let mut holds = 0u64;
+        while let Some(row) = query.next()? {
+            check()?;
+            if holds >= budget.temporary_holds {
+                return Err(StorageError::BudgetExceeded);
+            }
+            holds += 1;
+            let hold = key(row.get(0)?)?;
+            let blob = key(row.get(1)?)?;
+            let created: i64 = row.get(2)?;
+            let expires: i64 = row.get(3)?;
+            if created < 0 || expires <= created || expires > 253402300799 {
+                return Err(StorageError::Corrupt);
+            }
+            let target = rows.get_mut(&blob).ok_or(StorageError::Corrupt)?;
+            if target.recorded_length.is_none() {
+                return Err(StorageError::Corrupt);
+            }
+            target.temporary_holds.push(hold);
+        }
+        drop(query);
+        drop(stmt);
+        if rows.values().any(|r| {
+            r.recorded_length.is_some()
+                && !r.manual_retention_recorded
+                && r.temporary_holds.is_empty()
+        }) {
+            return Err(StorageError::Corrupt);
+        }
         let mut stmt=tx.prepare("SELECT record_id,blob_id,actual_length,reason,rules,generation,length(at) FROM known_invalid ORDER BY record_id")?;
         let mut query = stmt.query([])?;
         let mut roots = 0u64;
@@ -192,7 +230,6 @@ impl RecordStore {
                 || generation > source.generation
                 || !(1..=64).contains(&at)
                 || !payload.is_some_and(|(id, n)| id == blob && n != actual as u64)
-                || !target.manual_retention_recorded
                 || target.recorded_length != Some(actual as u64)
             {
                 return Err(StorageError::Corrupt);

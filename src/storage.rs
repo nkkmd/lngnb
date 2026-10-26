@@ -16,7 +16,7 @@ use std::{
 };
 
 pub const IMPLEMENTATION: &str = "lngnb-rust-sqlite-1";
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 const DB: &str = "database.sqlite";
 const SCHEMA: &str = "
 CREATE TABLE storage_state (
@@ -66,6 +66,19 @@ CREATE TABLE blobs (
  id BLOB PRIMARY KEY NOT NULL CHECK(length(id)=32),
  byte_length INTEGER NOT NULL CHECK(byte_length>=0)
 ) STRICT;
+CREATE TABLE manual_blob_holds (
+ blob_id BLOB PRIMARY KEY NOT NULL REFERENCES blobs(id)
+) STRICT;
+CREATE TABLE temporary_blob_holds (
+ hold_id BLOB PRIMARY KEY NOT NULL CHECK(length(hold_id)=32),
+ blob_id BLOB NOT NULL REFERENCES blobs(id),
+ created_at INTEGER NOT NULL CHECK(created_at>=0),
+ expires_at INTEGER NOT NULL CHECK(expires_at>created_at AND expires_at<=253402300799),
+ generation INTEGER NOT NULL CHECK(generation>=0)
+) STRICT;
+CREATE INDEX temporary_by_blob ON temporary_blob_holds(blob_id);
+CREATE TRIGGER temporary_no_update BEFORE UPDATE ON temporary_blob_holds BEGIN SELECT RAISE(ABORT,'immutable_temporary_promise'); END;
+CREATE TRIGGER temporary_no_delete BEFORE DELETE ON temporary_blob_holds BEGIN SELECT RAISE(ABORT,'temporary_cleanup_unimplemented'); END;
 CREATE TRIGGER blob_invalidates_inspection AFTER INSERT ON blobs BEGIN
  UPDATE record_inspection SET source_epoch=source_epoch+1,
  phase=CASE WHEN phase IN ('records','blobs') THEN 'records' ELSE 'idle' END,
@@ -404,6 +417,7 @@ fn check_format(conn: &Connection) -> Result<()> {
     if version != SCHEMA_VERSION {
         return Err(StorageError::UnsupportedFormat);
     }
+    blobs::validate_holds(conn)?;
     let (implementation, namespace, generation, state): (String, Vec<u8>, i64, String) = conn
         .query_row(
             "SELECT implementation,namespace,generation,state FROM storage_state WHERE singleton=1",
@@ -424,6 +438,7 @@ fn check_format(conn: &Connection) -> Result<()> {
     let expected_state = if [
         "stored_local_only",
         "blob_retained_local_only",
+        "blob_staged_local_only",
         "evaluated_local_only",
         "blob_failure_observed",
         "record_inspection_pending",
@@ -846,7 +861,7 @@ mod tests;
 
 #[path = "blob_store.rs"]
 mod blobs;
-pub use blobs::{BlobRecovery, BlobStored};
+pub use blobs::{BlobRecovery, BlobStored, TemporaryBlob, TemporaryLimits};
 
 #[path = "evaluation.rs"]
 mod evaluation;

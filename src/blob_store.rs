@@ -1,4 +1,4 @@
-//! A9.2の物理Blob保存。ローカル管理者による明示保持のみ。投稿/公開/Revision判定は行わない。
+//! A8/A9.2の物理Blob保存。明示保持と期限付き内部仮保存。HTTP受付/公開資格は付与しない。
 use super::*;
 use crate::id::BlobHasher;
 use std::{
@@ -27,6 +27,93 @@ pub struct BlobStored {
     pub id: Id,
     pub byte_length: u64,
     pub newly_retained: bool,
+}
+
+/// 内部仮保存の集合上限。期限切れも整理されるまでは枠と保護を消費する。
+#[derive(Debug, Clone, Copy)]
+pub struct TemporaryLimits {
+    pub bytes: u64,
+    pub holds: u64,
+}
+impl Default for TemporaryLimits {
+    fn default() -> Self {
+        Self {
+            bytes: 256 * 1024 * 1024,
+            holds: 100_000,
+        }
+    }
+}
+/// 管理用の保存結果。HTTP receiptでも本人照会資格でもない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TemporaryBlob {
+    pub id: Id,
+    pub byte_length: u64,
+    pub hold_id: [u8; 32],
+    /// Unix秒。成功確定時点を基準とする。既存の約束は更新しない。
+    pub created_at: i64,
+    pub expires_at: i64,
+}
+#[derive(Clone, Copy)]
+enum Hold {
+    Manual,
+    Temporary {
+        ttl: u64,
+        limits: TemporaryLimits,
+        id: [u8; 32],
+    },
+}
+fn temporary_budget(conn: &Connection, id: Id, length: u64, limits: TemporaryLimits) -> Result<()> {
+    let (count, size, present): (i64,i64,bool) = conn.query_row(
+        "SELECT (SELECT count(*) FROM temporary_blob_holds),coalesce((SELECT sum(byte_length) FROM blobs WHERE id IN (SELECT blob_id FROM temporary_blob_holds)),0),EXISTS(SELECT 1 FROM temporary_blob_holds WHERE blob_id=?1)",
+        [&id.bytes], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+    if count < 0 || size < 0 {
+        return Err(StorageError::Corrupt);
+    }
+    if count as u64 >= limits.holds
+        || (size as u64)
+            .checked_add(if present { 0 } else { length })
+            .is_none_or(|n| n > limits.bytes)
+    {
+        return Err(StorageError::BudgetExceeded);
+    }
+    Ok(())
+}
+pub(super) fn validate_holds(conn: &Connection) -> Result<()> {
+    // 約束を失った場合、明示保持済みの同じBlobがあっても黙って忘れない。
+    let bad: bool = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM blobs b
+            WHERE NOT EXISTS(SELECT 1 FROM manual_blob_holds m WHERE m.blob_id=b.id)
+              AND NOT EXISTS(SELECT 1 FROM temporary_blob_holds t WHERE t.blob_id=b.id)
+        ) OR EXISTS(
+            SELECT 1 FROM manual_blob_holds m LEFT JOIN blobs b ON b.id=m.blob_id
+            WHERE b.id IS NULL
+        ) OR EXISTS(
+            SELECT 1 FROM temporary_blob_holds t
+            LEFT JOIN blobs b ON b.id=t.blob_id
+            LEFT JOIN history h ON h.generation=t.generation
+            WHERE b.id IS NULL OR length(t.hold_id)!=32 OR t.created_at<0
+               OR t.expires_at<=t.created_at OR t.expires_at>253402300799
+               OR h.generation IS NULL OR h.target IS NOT t.blob_id
+               OR h.namespace IS NOT (SELECT namespace FROM storage_state WHERE singleton=1)
+               OR h.new_state!='blob_staged_local_only' OR h.rules!='lngnb-validation-1'
+               OR h.reason!='temporary_local_blob_promise:'||lower(hex(t.hold_id))||':'||t.created_at||':'||t.expires_at
+        ) OR EXISTS(
+            SELECT 1 FROM history h LEFT JOIN temporary_blob_holds t ON t.generation=h.generation
+            WHERE h.new_state='blob_staged_local_only' AND t.hold_id IS NULL
+        )", [], |r| r.get(0),
+    )?;
+    if bad {
+        return Err(StorageError::Corrupt);
+    }
+    Ok(())
+}
+fn unix_now() -> Result<i64> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| StorageError::BudgetExceeded)?
+        .as_secs();
+    i64::try_from(now).map_err(|_| StorageError::BudgetExceeded)
 }
 
 pub(super) fn initialize_directories(root: &OwnedFd) -> Result<()> {
@@ -252,6 +339,57 @@ impl RecordWriter {
     /// 転送は一Blob上限＋超過検出1byte、容量は上限全量を開始前に予約する。
     /// 中止した受信bytes/試行件数も消費し、予算不足ならreaderを読まない。
     pub fn put_blob(&mut self, id: Id, input: impl Read) -> Result<BlobStored> {
+        self.put_with_hold(id, input, Hold::Manual)
+            .map(|(stored, _)| stored)
+    }
+    /// 検査・配置・期限付き約束・履歴を確定する内部経路。既定TTLは呼出し側で86400秒。
+    /// 全存続約束を保守的に数え、期限終了だけでは解放/削除しない。
+    pub fn stage_blob(
+        &mut self,
+        id: Id,
+        input: impl Read,
+        ttl_seconds: u64,
+        limits: TemporaryLimits,
+    ) -> Result<TemporaryBlob> {
+        if self.failed {
+            return Err(StorageError::UnresolvedFailure);
+        }
+        if id.kind != Kind::Blob {
+            return Err(StorageError::InvalidBlobId);
+        }
+        if ttl_seconds == 0 || ttl_seconds > 253402300799 {
+            return Err(StorageError::BudgetExceeded);
+        }
+        if let Err(e) = validate_holds(&self.store.conn) {
+            self.failed = true;
+            return Err(e);
+        }
+        temporary_budget(
+            &self.store.conn,
+            id,
+            self.store.limits.max_blob_bytes,
+            limits,
+        )?;
+        let hold_id = Id::random_knowledge()
+            .map_err(|_| StorageError::RandomUnavailable)?
+            .bytes;
+        let (_, temporary) = self.put_with_hold(
+            id,
+            input,
+            Hold::Temporary {
+                ttl: ttl_seconds,
+                limits,
+                id: hold_id,
+            },
+        )?;
+        temporary.ok_or(StorageError::Corrupt)
+    }
+    fn put_with_hold(
+        &mut self,
+        id: Id,
+        input: impl Read,
+        hold: Hold,
+    ) -> Result<(BlobStored, Option<TemporaryBlob>)> {
         if self.failed {
             return Err(StorageError::UnresolvedFailure);
         }
@@ -278,7 +416,7 @@ impl RecordWriter {
         self.reserved += reserve;
         self.blobs += 1;
         let mut clean_abort = false;
-        let result = self.put_blob_inner(id, input, max, &mut clean_abort);
+        let result = self.put_blob_inner(id, input, max, &mut clean_abort, hold);
         // 壊れた転送は宣言矛盾の証明ではない。失敗観測だけを別に記録する。
         let failure = match &result {
             Err(StorageError::BlobHashMismatch) => Some("transfer_hash_mismatch"),
@@ -306,7 +444,8 @@ impl RecordWriter {
         mut input: impl Read,
         max: u64,
         clean_abort: &mut bool,
-    ) -> Result<BlobStored> {
+        hold: Hold,
+    ) -> Result<(BlobStored, Option<TemporaryBlob>)> {
         let staging = blob_directory(&self.store.dir, "staging")?;
         let target = blob_directory(&self.store.dir, "blobs")?;
         let random = Id::random_knowledge().map_err(|_| StorageError::RandomUnavailable)?;
@@ -375,6 +514,16 @@ impl RecordWriter {
         ) {
             Ok(()) => (),
             Err(rustix::io::Errno::EXIST) => {
+                if matches!(hold, Hold::Temporary { .. }) {
+                    let registered: bool = self.store.conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM blobs WHERE id=?1)",
+                        [&id.bytes],
+                        |r| r.get(0),
+                    )?;
+                    if !registered {
+                        return Err(StorageError::Corrupt);
+                    }
+                }
                 let (old, _) =
                     verify_file(&target, id, Some(length), self.store.limits.scan_blob_bytes)?;
                 old.sync_all()?;
@@ -388,51 +537,118 @@ impl RecordWriter {
         fs::fsync(&staging)?;
         #[cfg(test)]
         self.blob_fault_point(BlobFault::AfterDirectorySync)?;
-        let old: Option<i64> = self
-            .store
-            .conn
+        #[cfg(test)]
+        self.blob_fault_point(BlobFault::BeforeCommit)?;
+        let tx = self.store.conn.transaction()?;
+        let old: Option<i64> = tx
             .query_row(
                 "SELECT byte_length FROM blobs WHERE id=?1",
                 [&id.bytes],
                 |r| r.get(0),
             )
             .optional()?;
-        if let Some(old) = old {
-            if old < 0 || old as u64 != length {
-                return Err(StorageError::Corrupt);
-            }
-            return Ok(BlobStored {
-                id,
-                byte_length: length,
-                newly_retained: false,
-            });
+        if old.is_some_and(|n| n < 0 || n as u64 != length) {
+            return Err(StorageError::Corrupt);
         }
-        #[cfg(test)]
-        self.blob_fault_point(BlobFault::BeforeCommit)?;
-        let tx = self.store.conn.transaction()?;
-        tx.execute(
-            "INSERT INTO blobs(id,byte_length) VALUES(?1,?2)",
-            params![
-                &id.bytes,
-                i64::try_from(length).map_err(|_| StorageError::BudgetExceeded)?
-            ],
+        let manual: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM manual_blob_holds WHERE blob_id=?1)",
+            [&id.bytes],
+            |r| r.get(0),
         )?;
+        if manual && matches!(hold, Hold::Manual) {
+            return Ok((
+                BlobStored {
+                    id,
+                    byte_length: length,
+                    newly_retained: false,
+                },
+                None,
+            ));
+        }
+        let temporary = match hold {
+            Hold::Manual => None,
+            Hold::Temporary {
+                ttl,
+                limits,
+                id: hold_id,
+            } => {
+                temporary_budget(&tx, id, length, limits)?;
+                let now = unix_now()?;
+                let previous: i64 = tx.query_row(
+                    "SELECT coalesce(max(created_at),0) FROM temporary_blob_holds",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let expires = now
+                    .checked_add(i64::try_from(ttl).map_err(|_| StorageError::BudgetExceeded)?)
+                    .filter(|n| *n <= 253402300799)
+                    .ok_or(StorageError::BudgetExceeded)?;
+                // 時計巻戻りで新しい約束を短くせず、既存台帳も更新しない。
+                if now < previous {
+                    return Err(StorageError::BudgetExceeded);
+                }
+                Some(TemporaryBlob {
+                    id,
+                    byte_length: length,
+                    hold_id,
+                    created_at: now,
+                    expires_at: expires,
+                })
+            }
+        };
+        if old.is_none() {
+            tx.execute(
+                "INSERT INTO blobs(id,byte_length) VALUES(?1,?2)",
+                params![
+                    &id.bytes,
+                    i64::try_from(length).map_err(|_| StorageError::BudgetExceeded)?
+                ],
+            )?;
+        }
         advance(&tx)?;
+        if let Some(t) = temporary {
+            tx.execute("INSERT INTO temporary_blob_holds(hold_id,blob_id,created_at,expires_at,generation) SELECT ?1,?2,?3,?4,generation FROM storage_state WHERE singleton=1",params![&t.hold_id,&id.bytes,t.created_at,t.expires_at])?;
+        } else {
+            tx.execute(
+                "INSERT INTO manual_blob_holds(blob_id) VALUES(?1)",
+                [&id.bytes],
+            )?;
+        }
         audit(
             &tx,
             Some(&id.bytes),
-            "absent",
-            "blob_retained_local_only",
-            "explicit_local_blob_retention",
+            if old.is_some() {
+                "blob_recorded"
+            } else {
+                "absent"
+            },
+            if temporary.is_some() {
+                "blob_staged_local_only"
+            } else {
+                "blob_retained_local_only"
+            },
+            &temporary
+                .map(|t| {
+                    format!(
+                        "temporary_local_blob_promise:{}:{}:{}",
+                        hex(&t.hold_id),
+                        t.created_at,
+                        t.expires_at
+                    )
+                })
+                .unwrap_or_else(|| "explicit_local_blob_retention".into()),
         )?;
         tx.commit()?;
         #[cfg(test)]
         self.blob_fault_point(BlobFault::AfterCommit)?;
-        Ok(BlobStored {
-            id,
-            byte_length: length,
-            newly_retained: true,
-        })
+        Ok((
+            BlobStored {
+                id,
+                byte_length: length,
+                newly_retained: temporary.is_none(),
+            },
+            temporary,
+        ))
     }
 }
 fn remove_staging(dir: &OwnedFd, name: &str) -> Result<()> {
@@ -488,3 +704,7 @@ pub(super) fn recovery_files(root: &OwnedFd, max_files: u64) -> Result<Vec<(Stri
     }
     Ok(out)
 }
+
+#[cfg(test)]
+#[path = "temporary_blob_tests.rs"]
+mod temporary_tests;
