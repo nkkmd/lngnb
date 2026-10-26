@@ -38,6 +38,8 @@ jobs:
         env:
           TMPDIR: ${{ runner.temp }}
         run: cargo test --locked --offline --all-targets
+      - name: Isolated ext4 storage qualification
+        run: bash tests/qualify-ext4.sh
       - name: Release build
         run: cargo build --locked --offline --release
       - name: CLI smoke test

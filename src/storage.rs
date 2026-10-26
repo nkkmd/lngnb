@@ -980,3 +980,7 @@ pub use cleanup::{
 #[path = "sql_inspection.rs"]
 mod sql_inspection;
 pub use sql_inspection::SqlInspectionBudget;
+
+#[cfg(test)]
+#[path = "storage_filesystem_tests.rs"]
+mod filesystem_tests;
