@@ -269,6 +269,14 @@ fn ledger_change_discards_old_manifest_and_invalidates_active_handle() {
             [&id::blob_id(b"new").bytes],
         )
         .unwrap();
+    check
+        .store
+        .conn
+        .execute(
+            "INSERT INTO manual_blob_holds(blob_id) VALUES(?1)",
+            [&id::blob_id(b"new").bytes],
+        )
+        .unwrap();
     assert!(check.step(budget()).is_err());
     assert!(check.pause().is_err());
     let mut check = RecordInspection::open(&t.data(), Limits::default()).unwrap();
