@@ -1,4 +1,4 @@
-//! A11: 暗号化鍵データの内部基盤。ファイルI/O・端末入力・IPCはここでは行わない。
+//! A11: 暗号化鍵データの内部基盤。Linuxのファイル操作はfilesへ分離し、端末・IPCは扱わない。
 use crate::{
     cbor::{self, Value},
     record::LocalRecord,
@@ -203,3 +203,9 @@ pub fn unlock(input: &[u8], passphrase: &str) -> Result<UnlockedKey> {
 #[cfg(test)]
 #[path = "keyfile_tests.rs"]
 mod tests;
+
+#[cfg(target_os = "linux")]
+#[path = "keyfile_storage.rs"]
+mod files;
+#[cfg(target_os = "linux")]
+pub use files::{KeyDirectory, KeyFileError};
