@@ -759,3 +759,45 @@ fn an_older_cleanup_proof_does_not_hide_a_lost_later_upload() {
         ));
     }
 }
+
+#[test]
+fn cleaned_blob_reupload_is_charged_again_even_though_old_promises_remain() {
+    struct NeverRead;
+    impl std::io::Read for NeverRead {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            panic!("quota must reject before reading")
+        }
+    }
+    let t = Temp::new();
+    let (mut w, p) = setup(&t);
+    execute(&mut w, &p);
+    w.store.limits.max_blob_bytes = 14;
+    let other = b"abcdefghijklmn";
+    assert_eq!(other.len(), 14);
+    let full = TemporaryLimits {
+        bytes: 14,
+        holds: 10,
+    };
+    w.stage_blob(id::blob_id(other), Cursor::new(other), 1, full)
+        .unwrap();
+    let generation = w.store.generation().unwrap();
+    assert!(matches!(
+        w.stage_blob(p.blob_id, NeverRead, 1, full),
+        Err(StorageError::BudgetExceeded)
+    ));
+    assert_eq!(w.store.generation().unwrap(), generation);
+    assert_eq!(count(&w.store, "blobs"), 1);
+    assert_eq!(count(&w.store, "temporary_blob_holds"), 2);
+    let adjusted = TemporaryLimits { bytes: 28, ..full };
+    w.stage_blob(p.blob_id, Cursor::new(bytes()), 1, adjusted)
+        .unwrap();
+    // 現在の集計に入っている本文の再投稿は、物理容量を重複計上しない。
+    w.stage_blob(p.blob_id, Cursor::new(bytes()), 1, adjusted)
+        .unwrap();
+    let size:i64=w.store.conn.query_row("SELECT sum(byte_length) FROM blobs WHERE id IN (SELECT blob_id FROM temporary_blob_holds)",[],|r|r.get(0)).unwrap();
+    assert_eq!(size, 28);
+    assert_eq!(count(&w.store, "blobs"), 2);
+    assert_eq!(count(&w.store, "temporary_blob_holds"), 4);
+    w.finish().unwrap();
+    assert_eq!(reopen(&t).startup_state().unwrap(), StartupState::Clean);
+}

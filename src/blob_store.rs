@@ -64,7 +64,7 @@ enum Hold {
 }
 fn temporary_budget(conn: &Connection, id: Id, length: u64, limits: TemporaryLimits) -> Result<()> {
     let (count, size, present): (i64,i64,bool) = conn.query_row(
-        "SELECT (SELECT count(*) FROM temporary_blob_holds),coalesce((SELECT sum(byte_length) FROM blobs WHERE id IN (SELECT blob_id FROM temporary_blob_holds)),0),EXISTS(SELECT 1 FROM temporary_blob_holds WHERE blob_id=?1)",
+        "SELECT (SELECT count(*) FROM temporary_blob_holds),coalesce((SELECT sum(byte_length) FROM blobs WHERE id IN (SELECT blob_id FROM temporary_blob_holds)),0),EXISTS(SELECT 1 FROM blobs b WHERE b.id=?1 AND EXISTS(SELECT 1 FROM temporary_blob_holds t WHERE t.blob_id=b.id))",
         [&id.bytes], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
     if count < 0 || size < 0 {
         return Err(StorageError::Corrupt);
