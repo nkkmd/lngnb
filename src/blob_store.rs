@@ -108,7 +108,7 @@ pub(super) fn validate_holds(conn: &Connection) -> Result<()> {
     }
     Ok(())
 }
-fn unix_now() -> Result<i64> {
+pub(super) fn unix_now() -> Result<i64> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|_| StorageError::BudgetExceeded)?
@@ -638,7 +638,20 @@ impl RecordWriter {
                 })
                 .unwrap_or_else(|| "explicit_local_blob_retention".into()),
         )?;
+        cleanup::cancel(
+            &tx,
+            &id.bytes,
+            if temporary.is_some() {
+                "temporary_promise"
+            } else {
+                "manual_retention"
+            },
+        )?;
+        #[cfg(test)]
+        cleanup::cancel_point(self.cleanup_cancel_pause, true)?;
         tx.commit()?;
+        #[cfg(test)]
+        cleanup::cancel_point(self.cleanup_cancel_pause, false)?;
         #[cfg(test)]
         self.blob_fault_point(BlobFault::AfterCommit)?;
         Ok((

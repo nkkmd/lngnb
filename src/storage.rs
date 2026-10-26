@@ -16,7 +16,7 @@ use std::{
 };
 
 pub const IMPLEMENTATION: &str = "lngnb-rust-sqlite-1";
-pub const SCHEMA_VERSION: i64 = 9;
+pub const SCHEMA_VERSION: i64 = 10;
 const DB: &str = "database.sqlite";
 const SCHEMA: &str = "
 CREATE TABLE storage_state (
@@ -87,6 +87,24 @@ CREATE TRIGGER blob_invalidates_inspection AFTER INSERT ON blobs BEGIN
 END;
 CREATE TRIGGER blobs_no_update BEFORE UPDATE ON blobs BEGIN SELECT RAISE(ABORT,'immutable_blob'); END;
 CREATE TRIGGER blobs_no_delete BEFORE DELETE ON blobs BEGIN SELECT RAISE(ABORT,'immutable_blob'); END;
+CREATE TABLE blob_cleanup_plans (
+ plan_id BLOB PRIMARY KEY NOT NULL CHECK(length(plan_id)=32),
+ blob_id BLOB NOT NULL REFERENCES blobs(id),
+ byte_length INTEGER NOT NULL CHECK(byte_length>=0),
+ planned_at INTEGER NOT NULL CHECK(planned_at BETWEEN 0 AND 253402300799),
+ fingerprint TEXT NOT NULL CHECK(length(fingerprint) BETWEEN 1 AND 512),
+ planned_generation INTEGER NOT NULL UNIQUE CHECK(planned_generation>=0),
+ cancelled_generation INTEGER UNIQUE CHECK(cancelled_generation>planned_generation),
+ cancellation TEXT CHECK(cancellation IN ('record_reference','manual_retention','temporary_promise')),
+ CHECK((cancelled_generation IS NULL)=(cancellation IS NULL))
+) STRICT;
+CREATE UNIQUE INDEX one_pending_blob_cleanup ON blob_cleanup_plans(blob_id) WHERE cancelled_generation IS NULL;
+CREATE TRIGGER cleanup_no_delete BEFORE DELETE ON blob_cleanup_plans BEGIN SELECT RAISE(ABORT,'immutable_cleanup_history'); END;
+CREATE TRIGGER cleanup_only_cancel BEFORE UPDATE ON blob_cleanup_plans WHEN
+ OLD.cancelled_generation IS NOT NULL OR NEW.cancelled_generation IS NULL OR
+ NEW.plan_id IS NOT OLD.plan_id OR NEW.blob_id IS NOT OLD.blob_id OR NEW.byte_length!=OLD.byte_length OR
+ NEW.planned_at!=OLD.planned_at OR NEW.fingerprint!=OLD.fingerprint OR NEW.planned_generation!=OLD.planned_generation
+ BEGIN SELECT RAISE(ABORT,'immutable_cleanup_plan'); END;
 CREATE TABLE blob_failures (
  id BLOB PRIMARY KEY NOT NULL CHECK(length(id)=32),
  reason TEXT NOT NULL CHECK(reason IN ('transfer_hash_mismatch','transfer_failed')),
@@ -418,6 +436,7 @@ fn check_format(conn: &Connection) -> Result<()> {
         return Err(StorageError::UnsupportedFormat);
     }
     blobs::validate_holds(conn)?;
+    cleanup::validate(conn)?;
     let (implementation, namespace, generation, state): (String, Vec<u8>, i64, String) = conn
         .query_row(
             "SELECT implementation,namespace,generation,state FROM storage_state WHERE singleton=1",
@@ -439,6 +458,8 @@ fn check_format(conn: &Connection) -> Result<()> {
         "stored_local_only",
         "blob_retained_local_only",
         "blob_staged_local_only",
+        "blob_cleanup_planned_local_only",
+        "blob_cleanup_cancelled_local_only",
         "evaluated_local_only",
         "blob_failure_observed",
         "record_inspection_pending",
@@ -744,6 +765,8 @@ pub struct RecordWriter {
     blob_fault: Option<blobs::BlobFault>,
     #[cfg(test)]
     evaluation_pause: bool,
+    #[cfg(test)]
+    cleanup_cancel_pause: Option<bool>,
 }
 impl RecordWriter {
     fn new(store: RecordStore) -> Self {
@@ -758,6 +781,8 @@ impl RecordWriter {
             blob_fault: None,
             #[cfg(test)]
             evaluation_pause: false,
+            #[cfg(test)]
+            cleanup_cancel_pause: None,
         }
     }
     pub fn record(&mut self, id: Id) -> Result<Option<LocalRecord>> {
@@ -816,6 +841,9 @@ impl RecordWriter {
                 "INSERT INTO records(id,bytes) VALUES(?1,?2)",
                 params![&record.id().bytes, record.bytes()],
             )?;
+            if let Some((blob, _)) = record.payload().map_err(|_| StorageError::Corrupt)? {
+                cleanup::cancel(&tx, &blob, "record_reference")?;
+            }
             advance(&tx)?;
             audit(
                 &tx,
@@ -824,7 +852,11 @@ impl RecordWriter {
                 "stored_local_only",
                 "store_record",
             )?;
+            #[cfg(test)]
+            cleanup::cancel_point(self.cleanup_cancel_pause, true)?;
             tx.commit()?;
+            #[cfg(test)]
+            cleanup::cancel_point(self.cleanup_cancel_pause, false)?;
             Ok(())
         })();
         self.reserved -= reserve;
@@ -883,3 +915,7 @@ pub use startup::{LocalStartup, LocalStartupBudget, LocalStartupProgress};
 #[path = "blob_protection.rs"]
 mod protection;
 pub use protection::{BlobProtection, BlobProtectionSnapshot, ProtectionBudget, ProtectionVersion};
+
+#[path = "blob_cleanup.rs"]
+mod cleanup;
+pub use cleanup::{BlobCleanupPlan, CleanupBudget, CleanupDecision};
