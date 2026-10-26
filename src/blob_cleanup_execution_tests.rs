@@ -801,3 +801,294 @@ fn cleaned_blob_reupload_is_charged_again_even_though_old_promises_remain() {
     w.finish().unwrap();
     assert_eq!(reopen(&t).startup_state().unwrap(), StartupState::Clean);
 }
+
+// R08/R20/R26/R30: 保存済みの全段階を通して整理・再取得・復旧を確認する。
+fn split_startup(t: &Temp) -> (LocalStartup, EvaluationSnapshot) {
+    let mut startup = LocalStartup::open(&t.data(), Limits::default()).unwrap();
+    let budget = LocalStartupBudget {
+        inspection: InspectionBudget {
+            records: 1,
+            blob_files: 1,
+            ..InspectionBudget::default()
+        },
+        records: EvaluationInputBudget {
+            records: 1,
+            ..EvaluationInputBudget::default()
+        },
+        blobs: EvaluationBlobBudget {
+            targets: 1,
+            ..EvaluationBlobBudget::default()
+        },
+        evaluation: EvaluationStepBudget { nodes: 1 },
+    };
+    for _ in 0..100 {
+        if let LocalStartupProgress::Evaluation(p) =
+            startup.step(EvaluationLimits::default(), budget).unwrap()
+        {
+            if let Some(snapshot) = p.snapshot {
+                return (startup, snapshot);
+            }
+        }
+    }
+    panic!("split startup did not complete");
+}
+fn epochs(s: &RecordStore) -> (i64, i64, i64) {
+    s.conn.query_row("SELECT source_epoch,record_epoch,payload_epoch FROM record_inspection,evaluation_state WHERE record_inspection.singleton=1 AND evaluation_state.singleton=1", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap()
+}
+#[test]
+fn cleanup_invalidates_completed_startup_manifest_and_keeps_record_cache() {
+    let t = Temp::new();
+    let (mut w, p) = setup(&t);
+    w.insert(&fixture()).unwrap();
+    w.finish().unwrap();
+    let (startup, _) = split_startup(&t);
+    let mut w = startup.into_writer().unwrap();
+    let before = epochs(&w.store);
+    assert_eq!(count(&w.store, "evaluation_nodes"), 1);
+    assert_eq!(count(&w.store, "blob_inspection_inventory"), 1);
+    assert_eq!(count(&w.store, "blob_inspection_files"), 1);
+    execute(&mut w, &p);
+    let after = epochs(&w.store);
+    assert_eq!(after, (before.0 + 1, before.1, before.2 + 1));
+    assert_eq!(count(&w.store, "evaluation_nodes"), 1);
+    assert_eq!(count(&w.store, "blob_inspection_inventory"), 0);
+    assert_eq!(count(&w.store, "blob_inspection_files"), 0);
+    let phase: String = w
+        .store
+        .conn
+        .query_row("SELECT phase FROM record_inspection", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(phase, "idle");
+    let dirty: bool = w
+        .store
+        .conn
+        .query_row("SELECT dirty FROM evaluation_state", [], |r| r.get(0))
+        .unwrap();
+    assert!(dirty);
+    w.finish().unwrap();
+    let (startup, snapshot) = split_startup(&t);
+    assert!(snapshot.committed);
+    let w = startup.into_writer().unwrap();
+    let cp: (i64, String, i64, i64) = w.store.conn.query_row("SELECT source_epoch,phase,checked_blob_files,checked_blob_bytes FROM record_inspection", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+    assert_eq!(cp, (after.0, "complete".into(), 0, 0));
+    w.finish().unwrap();
+}
+#[test]
+fn split_reevaluation_after_cleanup_and_reupload_updates_descendants_and_keeps_evidence() {
+    use crate::storage::evaluation::tests::assert_state;
+    let t = Temp::new();
+    let (w, p) = setup(&t);
+    w.finish().unwrap();
+    let (startup, _) = split_startup(&t);
+    let mut w = startup.into_writer().unwrap();
+    execute(&mut w, &p);
+    let root = rev(&[], 15, "late wrong length");
+    let child = rev(&[root.id()], 14, "late child");
+    let grandchild = rev(&[child.id()], 14, "late grandchild");
+    let branch = rev(&[], 14, "independent branch");
+    let records = vec![
+        fixture(),
+        root.clone(),
+        child.clone(),
+        grandchild.clone(),
+        branch.clone(),
+    ];
+    // 子を先に保存し、Record収集と親評価の順序に依存しないことも確認する。
+    for r in records.iter().rev() {
+        w.insert(r).unwrap();
+    }
+    w.finish().unwrap();
+    let (startup, missing) = split_startup(&t);
+    for r in &records[1..] {
+        assert_state(&missing, r, Validation::Valid, None);
+        assert_eq!(
+            missing
+                .records
+                .iter()
+                .find(|a| a.record_id == r.id())
+                .unwrap()
+                .payload_status,
+            Some(PayloadStatus::Missing)
+        );
+    }
+    let mut w = startup.into_writer().unwrap();
+    w.put_blob(p.blob_id, Cursor::new(bytes())).unwrap();
+    w.finish().unwrap();
+    let (startup, present) = split_startup(&t);
+    assert_state(
+        &present,
+        &root,
+        Validation::Invalid,
+        Some(Reason::DeclaredLengthMismatch),
+    );
+    for r in [&child, &grandchild] {
+        assert_state(
+            &present,
+            r,
+            Validation::Invalid,
+            Some(Reason::InvalidParent),
+        );
+        assert_eq!(
+            present
+                .records
+                .iter()
+                .find(|a| a.record_id == r.id())
+                .unwrap()
+                .payload_status,
+            Some(PayloadStatus::Verified)
+        );
+    }
+    assert_state(&present, &branch, Validation::Valid, None);
+    assert_oracle(&[
+        (oracle_case(&records, false), missing),
+        (oracle_case(&records, true), present),
+    ]);
+    let mut w = startup.into_writer().unwrap();
+    assert_eq!(count(&w.store, "known_invalid"), 1);
+    // 再投稿・古い整理予定の再利用では既知不正や根拠を消さない。
+    w.insert(&root).unwrap();
+    assert!(matches!(
+        w.plan_blob_cleanup(p.blob_id, CleanupBudget::default())
+            .unwrap(),
+        CleanupDecision::Protected
+    ));
+    assert_eq!(count(&w.store, "known_invalid"), 1);
+    for r in &records {
+        assert_eq!(w.store.record(r.id()).unwrap().unwrap().bytes(), r.bytes());
+    }
+    w.finish().unwrap();
+}
+#[test]
+fn interrupted_cleanup_with_saved_jobs_requires_fresh_checks_and_explicit_resume() {
+    for point in [
+        Point::AfterIntentCommit,
+        Point::AfterUnlink,
+        Point::BeforeFinishCommit,
+    ] {
+        let t = Temp::new();
+        let (w, p) = setup(&t);
+        w.finish().unwrap();
+        let (startup, _) = split_startup(&t);
+        let mut w = startup.into_writer().unwrap();
+        let old = epochs(&w.store);
+        assert!(
+            w.execute_at(
+                p.plan_id,
+                CleanupBudget::default(),
+                p.planned_at,
+                |at, _| {
+                    if at == point {
+                        Err(StorageError::Io(std::io::Error::from_raw_os_error(5)))
+                    } else {
+                        Ok(())
+                    }
+                }
+            )
+            .is_err()
+        );
+        drop(w);
+        let mut s = reopen(&t);
+        let run = s.blob_cleanup_executions(1).unwrap().remove(0);
+        assert!(run.finished_generation.is_none());
+        recover(&mut s, &run, &p);
+        assert_eq!(s.startup_state().unwrap(), StartupState::NeedsReview);
+        assert_eq!(epochs(&s), (old.0 + 1, old.1, old.2 + 1));
+        assert_eq!(count(&s, "blob_inspection_inventory"), 0);
+        drop(s);
+        let (startup, snapshot) = split_startup(&t);
+        assert!(snapshot.committed);
+        assert!(startup.needs_review());
+        // 検査と評価が完了してもwriterは取得できない。
+        assert!(matches!(
+            startup.into_writer(),
+            Err(StorageError::NeedsReview)
+        ));
+        let s = reopen(&t);
+        let generation = s.generation().unwrap();
+        let review = s
+            .confirm_evidence_recovery(
+                generation,
+                "整理意思と完了台帳、全保存範囲を再検査",
+                "本試験はSQL/I/O注入で実デバイス試験ではない",
+                EvaluationLimits::default(),
+            )
+            .unwrap();
+        let w = reopen(&t)
+            .resume_local_writes(
+                review,
+                "未確定制限を確認、残る保存障害なし。ローカル書込みのみ再開",
+                EvaluationLimits::default(),
+            )
+            .unwrap();
+        assert!(w.store.blob(p.blob_id).unwrap().is_none());
+        assert_eq!(count(&w.store, "temporary_blob_holds"), 1);
+        w.finish().unwrap();
+        assert_eq!(reopen(&t).startup_state().unwrap(), StartupState::Clean);
+    }
+}
+
+#[test]
+fn post_recovery_scan_budget_failure_keeps_committed_cleanup_and_manual_hold() {
+    let t = Temp::new();
+    let (mut w, p) = setup(&t);
+    let other = id::blob_id(b"independent retained body");
+    w.put_blob(other, Cursor::new(b"independent retained body"))
+        .unwrap();
+    assert!(
+        w.execute_at(
+            p.plan_id,
+            CleanupBudget::default(),
+            p.planned_at,
+            |at, _| {
+                if at == Point::AfterUnlink {
+                    Err(StorageError::Io(std::io::Error::from_raw_os_error(5)))
+                } else {
+                    Ok(())
+                }
+            }
+        )
+        .is_err()
+    );
+    drop(w);
+    let mut s = reopen(&t);
+    let run = s.blob_cleanup_executions(1).unwrap().remove(0);
+    // 整理完了後の全Blob再検査だけを予算不足にする。対象は既に不在。
+    s.limits.scan_blob_bytes = 1;
+    assert!(matches!(
+        s.recover_at(
+            run.run_id,
+            CleanupBudget::default(),
+            "削除意思と不在を確認",
+            p.planned_at,
+            |_, _| Ok(())
+        ),
+        Err(StorageError::BudgetExceeded)
+    ));
+    let done = s.blob_cleanup_executions(1).unwrap().remove(0);
+    assert_eq!(done.outcome, Some(CleanupOutcome::RecoveryAbsent));
+    assert!(done.finished_generation.is_some());
+    assert_eq!(s.startup_state().unwrap(), StartupState::NeedsReview);
+    assert!(!path(&t).exists());
+    // Errを「整理がrollbackした」と解釈せず、台帳を照合し直す。
+    drop(s);
+    let mut s = reopen(&t);
+    assert_eq!(s.blob_cleanup_executions(1).unwrap(), vec![done]);
+    assert!(s.blob(other).unwrap().is_some());
+    assert!(matches!(
+        s.recover_at(
+            run.run_id,
+            CleanupBudget::default(),
+            "再実行しない",
+            p.planned_at,
+            |_, _| Ok(())
+        ),
+        Err(StorageError::Corrupt)
+    ));
+    drop(s);
+    let (startup, _) = split_startup(&t);
+    assert!(startup.needs_review());
+    assert!(matches!(
+        startup.into_writer(),
+        Err(StorageError::NeedsReview)
+    ));
+}
