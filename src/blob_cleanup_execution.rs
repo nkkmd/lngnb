@@ -503,3 +503,7 @@ impl RecordStore {
 #[cfg(test)]
 #[path = "blob_cleanup_execution_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "cleanup_audit_tests.rs"]
+mod audit_tests;
