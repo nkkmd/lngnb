@@ -46,7 +46,9 @@ impl RecordStore {
         {
             return Err(StorageError::InvalidRecoveryReview);
         }
-        if !self.records_checked || inspection::checkpoint(&self.conn)?.pending() {
+        if !self.records_checked
+            || inspection::checkpoint(&self.conn, self.limits.sql_inspection)?.pending()
+        {
             return Err(StorageError::InspectionPending);
         }
         if state(&self.conn)? != StartupState::NeedsReview {

@@ -460,3 +460,137 @@ fn a_changed_valid_result_value_cannot_erase_a_persisted_recovery_finding() {
         assert_eq!(before, std::fs::read(t.data().join(DB)).unwrap());
     }
 }
+
+fn many_blobs(t: &Temp) -> RecordInspection {
+    let mut w = t.store().begin().unwrap();
+    for i in 0..128u8 {
+        let bytes = [i; 3];
+        w.put_blob(id::blob_id(&bytes), Cursor::new(bytes)).unwrap();
+    }
+    w.finish().unwrap();
+    let mut check = start(t);
+    let p = check.step(budget()).unwrap();
+    assert_eq!(p.checked_blob_files, 1);
+    assert!(!p.checks_complete);
+    check
+}
+#[test]
+fn inventory_sql_interrupt_preserves_all_tables_and_retries_before_checkpoint_save() {
+    use crate::storage::tests::logical_snapshot;
+    let t = Temp::new();
+    let mut check = many_blobs(&t);
+    let p = check.progress().unwrap();
+    let before = logical_snapshot(&check.store.conn);
+    check.store.limits.sql_inspection.callbacks = 1;
+    // Record prefixは空で小さい。ここではBlob inventoryの読取りSQLを中断する。
+    assert_eq!(check.progress().unwrap(), p);
+    assert!(matches!(
+        check.step(budget()),
+        Err(StorageError::BudgetExceeded)
+    ));
+    assert!(!check.failed);
+    assert!(matches!(
+        restore(&check.store, check.epoch, (1, 3)),
+        Err(StorageError::BudgetExceeded)
+    ));
+    assert_eq!(logical_snapshot(&check.store.conn), before);
+    check.store.limits.sql_inspection = SqlInspectionBudget::default();
+    assert!(matches!(
+        prepare(
+            &check.store,
+            check.epoch,
+            (1, 3),
+            InspectionBudget {
+                elapsed: Duration::ZERO,
+                ..budget()
+            },
+            Instant::now()
+        ),
+        Err(StorageError::BudgetExceeded)
+    ));
+    assert_eq!(logical_snapshot(&check.store.conn), before);
+    assert_eq!(check.progress().unwrap(), p);
+    let done = check.step(InspectionBudget::default()).unwrap();
+    assert!(done.checks_complete);
+    assert_eq!(done.checked_blob_files, 128);
+    let s = check.into_store().unwrap();
+    assert_eq!(s.startup_state().unwrap(), StartupState::Clean);
+    s.begin().unwrap().finish().unwrap();
+}
+#[test]
+fn completion_inventory_budget_cannot_expose_clean_store_or_clear_abnormal_review() {
+    use crate::storage::tests::logical_snapshot;
+    let t = Temp::new();
+    let mut check = many_blobs(&t);
+    assert!(
+        check
+            .step(InspectionBudget::default())
+            .unwrap()
+            .checks_complete
+    );
+    let before = logical_snapshot(&check.store.conn);
+    check.store.limits.sql_inspection.callbacks = 1;
+    assert!(matches!(
+        validate_complete(&check.store, check.epoch, (128, 384)),
+        Err(StorageError::BudgetExceeded)
+    ));
+    assert_eq!(logical_snapshot(&check.store.conn), before);
+    assert!(matches!(
+        check.into_store(),
+        Err(StorageError::BudgetExceeded)
+    ));
+    let c = Connection::open(t.data().join(DB)).unwrap();
+    assert_eq!(logical_snapshot(&c), before);
+    assert_eq!(state(&c).unwrap(), StartupState::NeedsReview);
+    drop(c);
+    let mut check = RecordInspection::open(&t.data(), Limits::default()).unwrap();
+    assert_eq!(check.progress().unwrap().checked_blob_files, 0);
+    for _ in 0..3 {
+        if check
+            .step(InspectionBudget::default())
+            .unwrap()
+            .checks_complete
+        {
+            break;
+        }
+    }
+    let store = check.into_store().unwrap();
+    assert_eq!(store.startup_state().unwrap(), StartupState::NeedsReview);
+    assert!(matches!(store.begin(), Err(StorageError::NeedsReview)));
+}
+#[test]
+fn inventory_budget_exhaustion_is_not_corruption_but_retry_still_rejects_bad_digest() {
+    use crate::storage::tests::logical_snapshot;
+    let t = Temp::new();
+    let mut check = many_blobs(&t);
+    check
+        .store
+        .conn
+        .execute(
+            "UPDATE blob_inspection_inventory SET digest=zeroblob(32)",
+            [],
+        )
+        .unwrap();
+    let altered = logical_snapshot(&check.store.conn);
+    check.store.limits.sql_inspection.callbacks = 1;
+    assert!(matches!(
+        check.step(budget()),
+        Err(StorageError::BudgetExceeded)
+    ));
+    assert!(!check.failed);
+    assert_eq!(logical_snapshot(&check.store.conn), altered);
+    check.store.limits.sql_inspection = SqlInspectionBudget::default();
+    assert!(matches!(check.step(budget()), Err(StorageError::Corrupt)));
+    assert_eq!(logical_snapshot(&check.store.conn), altered);
+    assert!(matches!(
+        check.pause(),
+        Err(StorageError::UnresolvedFailure)
+    ));
+    // 再起動も自動reset・自動修復で不整合を消さない。
+    assert!(matches!(
+        RecordInspection::open(&t.data(), Limits::default()),
+        Err(StorageError::Corrupt)
+    ));
+    let c = Connection::open(t.data().join(DB)).unwrap();
+    assert_eq!(logical_snapshot(&c), altered);
+}

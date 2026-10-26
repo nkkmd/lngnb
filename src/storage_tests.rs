@@ -8,6 +8,37 @@ use std::{
     process::{Command, Stdio},
 };
 
+// SQL中断前後で、WALを含む論理内容を全tableで比較する。小規模fixture専用。
+pub(super) fn logical_snapshot(conn: &Connection) -> Vec<(String, Vec<String>)> {
+    let names = conn
+        .prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    names
+        .into_iter()
+        .map(|name| {
+            let mut stmt = conn
+                .prepare(&format!("SELECT * FROM \"{}\"", name.replace('"', "\"\"")))
+                .unwrap();
+            let columns = stmt.column_count();
+            let mut rows = stmt
+                .query_map([], |r| {
+                    (0..columns)
+                        .map(|i| r.get::<_, rusqlite::types::Value>(i))
+                        .collect::<std::result::Result<Vec<_>, _>>()
+                })
+                .unwrap()
+                .map(|r| format!("{:?}", r.unwrap()))
+                .collect::<Vec<_>>();
+            rows.sort();
+            (name, rows)
+        })
+        .collect()
+}
+
 pub(super) struct Temp {
     pub(super) root: PathBuf,
 }

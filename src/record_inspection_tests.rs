@@ -233,7 +233,12 @@ fn running_mark_is_committed_before_first_checkpoint() {
     assert!(RecordInspection::open(&t.data(), Limits::default()).is_err());
     let store = RecordStore::open(&t.data(), Limits::default()).unwrap();
     assert_eq!(store.startup_state().unwrap(), StartupState::Clean);
-    assert_eq!(checkpoint(&store.conn).unwrap().phase, "idle");
+    assert_eq!(
+        checkpoint(&store.conn, store.limits.sql_inspection)
+            .unwrap()
+            .phase,
+        "idle"
+    );
     drop(store);
     let conn = raw(&t);
     conn.execute_batch("DROP TRIGGER reject_start; CREATE TRIGGER reject_first_checkpoint BEFORE UPDATE ON record_inspection BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
@@ -523,11 +528,20 @@ fn split_blob_quick_check_budget_preserves_checkpoint_and_can_be_adjusted() {
         ..SqlInspectionBudget::default()
     };
     assert!(matches!(
-        inspection.step(InspectionBudget::default()),
+        blob_checks::prepare(
+            &inspection.store,
+            inspection.epoch,
+            (
+                before.checked_blob_files as i64,
+                before.checked_blob_bytes as i64
+            ),
+            InspectionBudget::default(),
+            Instant::now(),
+        ),
         Err(StorageError::BudgetExceeded)
     ));
-    assert_eq!(inspection.progress().unwrap(), before);
     inspection.store.limits.sql_inspection = SqlInspectionBudget::default();
+    assert_eq!(inspection.progress().unwrap(), before);
     assert!(
         inspection
             .step(InspectionBudget::default())
@@ -536,4 +550,134 @@ fn split_blob_quick_check_budget_preserves_checkpoint_and_can_be_adjusted() {
     );
     let s = inspection.into_store().unwrap();
     assert_eq!(s.startup_state().unwrap(), StartupState::Clean);
+}
+
+#[test]
+fn checkpoint_sql_interrupt_preserves_all_tables_and_allows_same_handle_retry() {
+    use crate::storage::tests::logical_snapshot;
+    let t = Temp::new();
+    populate(&t, 255);
+    let mut check = RecordInspection::open(&t.data(), Limits::default()).unwrap();
+    let p = check
+        .step(InspectionBudget {
+            records: 224,
+            ..one()
+        })
+        .unwrap();
+    assert_eq!(p.checked_records, 224);
+    let before = logical_snapshot(&check.store.conn);
+    check.store.limits.sql_inspection.callbacks = 1;
+    assert!(matches!(
+        check.progress(),
+        Err(StorageError::BudgetExceeded)
+    ));
+    assert!(matches!(
+        check.step(one()),
+        Err(StorageError::BudgetExceeded)
+    ));
+    assert!(!check.failed);
+    assert_eq!(logical_snapshot(&check.store.conn), before);
+    check.store.limits.sql_inspection = SqlInspectionBudget::default();
+    assert_eq!(check.progress().unwrap(), p);
+    assert_eq!(check.step(one()).unwrap().checked_records, 225);
+    complete(&mut check);
+    let store = check.into_store().unwrap();
+    assert_eq!(store.startup_state().unwrap(), StartupState::Clean);
+    // handlerが保存transactionや通常writerまで残っていない。
+    store.begin().unwrap().finish().unwrap();
+}
+
+#[test]
+fn checkpoint_sql_reopen_keeps_committed_prefix_and_abnormal_review() {
+    use crate::storage::tests::logical_snapshot;
+    let t = Temp::new();
+    populate(&t, 255);
+    let mut check = RecordInspection::open(&t.data(), Limits::default()).unwrap();
+    let p = check
+        .step(InspectionBudget {
+            records: 224,
+            ..one()
+        })
+        .unwrap();
+    drop(check);
+    let c = raw(&t);
+    let before = logical_snapshot(&c);
+    assert!(matches!(
+        checkpoint(
+            &c,
+            SqlInspectionBudget {
+                callbacks: 1,
+                ..SqlInspectionBudget::default()
+            }
+        ),
+        Err(StorageError::BudgetExceeded)
+    ));
+    assert_eq!(logical_snapshot(&c), before);
+    drop(c);
+    assert!(matches!(
+        RecordInspection::open(
+            &t.data(),
+            Limits {
+                sql_inspection: SqlInspectionBudget {
+                    callbacks: 1,
+                    ..SqlInspectionBudget::default()
+                },
+                ..Limits::default()
+            }
+        ),
+        Err(StorageError::BudgetExceeded)
+    ));
+    let c = raw(&t);
+    assert_eq!(logical_snapshot(&c), before);
+    drop(c);
+    let mut check = RecordInspection::open(&t.data(), Limits::default()).unwrap();
+    assert_eq!(check.progress().unwrap(), p);
+    complete(&mut check);
+    let store = check.into_store().unwrap();
+    assert_eq!(store.startup_state().unwrap(), StartupState::NeedsReview);
+    assert!(matches!(store.begin(), Err(StorageError::NeedsReview)));
+}
+
+#[test]
+fn expired_step_checkpoint_budget_neither_advances_nor_hides_corruption() {
+    use crate::storage::tests::logical_snapshot;
+    let t = Temp::new();
+    populate(&t, 3);
+    let mut check = RecordInspection::open(&t.data(), Limits::default()).unwrap();
+    let p = check.step(one()).unwrap();
+    let before = logical_snapshot(&check.store.conn);
+    assert!(matches!(
+        check.step(InspectionBudget {
+            elapsed: Duration::from_nanos(1),
+            ..one()
+        }),
+        Err(StorageError::BudgetExceeded)
+    ));
+    assert_eq!(logical_snapshot(&check.store.conn), before);
+    assert_eq!(check.progress().unwrap(), p);
+    check
+        .store
+        .conn
+        .execute(
+            "UPDATE record_inspection SET checked_bytes=checked_bytes+1",
+            [],
+        )
+        .unwrap();
+    let altered = logical_snapshot(&check.store.conn);
+    assert!(matches!(
+        checkpoint(
+            &check.store.conn,
+            SqlInspectionBudget {
+                elapsed: Duration::ZERO,
+                ..SqlInspectionBudget::default()
+            }
+        ),
+        Err(StorageError::BudgetExceeded)
+    ));
+    assert!(matches!(check.step(one()), Err(StorageError::Corrupt)));
+    assert_eq!(logical_snapshot(&check.store.conn), altered);
+    assert!(matches!(
+        check.pause(),
+        Err(StorageError::UnresolvedFailure)
+    ));
 }

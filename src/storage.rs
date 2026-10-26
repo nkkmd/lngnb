@@ -676,7 +676,7 @@ impl RecordStore {
         // 未対応版のDBを設定変更する前にread-onlyで照合する。
         let probe = connection(&dir, true)?;
         check_format(&probe, limits.sql_inspection)?;
-        inspection::checkpoint(&probe)?;
+        inspection::checkpoint(&probe, limits.sql_inspection)?;
         drop(probe);
         let conn = connection(&dir, false)?;
         configure(&conn)?;
@@ -729,7 +729,9 @@ impl RecordStore {
         if self.blob_recovery.needs_review() || state(&self.conn)? == StartupState::NeedsReview {
             return Ok(StartupState::NeedsReview);
         }
-        if !self.records_checked || inspection::checkpoint(&self.conn)?.pending() {
+        if !self.records_checked
+            || inspection::checkpoint(&self.conn, self.limits.sql_inspection)?.pending()
+        {
             return Ok(StartupState::InspectionPending);
         }
         Ok(StartupState::Clean)
