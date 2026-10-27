@@ -23,6 +23,8 @@ pub enum KeyFileError {
     ScanLimit,
     /// 診断中にディレクトリ一覧または対象暗号文の変化を検出した。
     RecoveryChanged,
+    /// 保全先の永続化確認済みだが、最後の保全元照合等が未完了/不一致。
+    PreservationReviewRequired,
     /// 交換/配置済みだがdirectory fsync成功を確認できない。成功/rollbackを断定しない。
     CommitUncertain,
     /// 新鍵の永続化確認済み。旧暗号文の整理だけが未完了/不確実。
@@ -45,6 +47,7 @@ impl std::fmt::Display for KeyFileError {
             Self::PendingRecovery => "key_recovery_required",
             Self::ScanLimit => "key_directory_scan_limit",
             Self::RecoveryChanged => "key_recovery_input_changed",
+            Self::PreservationReviewRequired => "key_preservation_committed_review_required",
             Self::CommitUncertain => "key_commit_uncertain",
             Self::CleanupUncertain => "key_committed_cleanup_uncertain",
             Self::Key(e) => return e.fmt(f),
@@ -264,6 +267,73 @@ impl KeyDirectory {
             return Err(KeyFileError::RecoveryChanged);
         }
         Ok(key.public_key())
+    }
+    /// 明示指定した残存暗号文を認証し、別の専用領域の新しい通常名へ同じbytesを保全。
+    /// 元の領域は書換え/採用/削除せず、過去の更新結果や新旧も推測しない。
+    /// 両領域の排他を保持する。別ハンドルで同じinodeを開くと非待機lockで拒否される。
+    pub fn preserve_recovery_file(
+        &mut self,
+        residue: &str,
+        passphrase: &str,
+        backup: &mut KeyDirectory,
+        backup_name: &str,
+    ) -> Result<[u8; 32]> {
+        self.preserve_recovery_file_with(residue, passphrase, backup, backup_name, &mut |_| Ok(()))
+    }
+    fn preserve_recovery_file_with(
+        &mut self,
+        residue: &str,
+        passphrase: &str,
+        backup: &mut KeyDirectory,
+        backup_name: &str,
+        hook: &mut impl FnMut(Stage) -> Result<()>,
+    ) -> Result<[u8; 32]> {
+        if !recovery_name(residue) {
+            return Err(KeyFileError::UnsafePath);
+        }
+        name(backup_name)?;
+        backup.pending()?;
+        match fs::statat(&backup.dir, backup_name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(_) => return Err(KeyFileError::Exists),
+            Err(rustix::io::Errno::NOENT) => (),
+            Err(_) => return Err(KeyFileError::Io),
+        }
+        let input = self.read(residue)?;
+        let public = unlock(&input, passphrase)?.public_key();
+        if self
+            .read(residue)
+            .map_err(|_| KeyFileError::RecoveryChanged)?
+            != input
+        {
+            return Err(KeyFileError::RecoveryChanged);
+        }
+        // 作成と同じ検査・file fsync・読戻し/認証・NOREPLACE・dir fsyncを共有する。
+        // 再暗号化ではなく同一暗号文の保全であり、新たなseed/salt/nonceは生成しない。
+        let copied = backup
+            .install(backup_name, &input, passphrase, None, &mut |stage| {
+                hook(stage)?;
+                if stage == Stage::BeforeInstall
+                    && self
+                        .read(residue)
+                        .map_err(|_| KeyFileError::RecoveryChanged)?
+                        != input
+                {
+                    return Err(KeyFileError::RecoveryChanged);
+                }
+                Ok(())
+            })
+            .map_err(|e| {
+                if e == KeyFileError::CleanupUncertain {
+                    // 新規コピーには旧暗号文のunlinkがない。directory fsync後の未完了を区別。
+                    KeyFileError::PreservationReviewRequired
+                } else {
+                    e
+                }
+            })?;
+        if copied != public || self.read(residue).ok().as_deref() != Some(input.as_slice()) {
+            return Err(KeyFileError::PreservationReviewRequired);
+        }
+        Ok(public)
     }
     fn pending(&self) -> Result<()> {
         self.secure()?;
