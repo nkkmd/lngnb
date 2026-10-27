@@ -39,7 +39,7 @@ def decode_key(path, password):
     ident = b"ky1_" + base64.b32encode(hashlib.sha256(b"lngnb:key:ed25519:1\x00" + public).digest()).lower().rstrip(b"=")
     return seed, obj, ident
 
-def invoke(directory, action, payloads, expected=0, cancel=None, closed_output=False, residue=None):
+def invoke(directory, action, payloads, expected=0, cancel=None, closed_output=False, residue=None, backup=None):
     master, slave = pty.openpty()
     before = termios.tcgetattr(slave)
     before[3] |= termios.ECHO | termios.ECHONL | termios.ICANON | termios.ISIG
@@ -50,6 +50,8 @@ def invoke(directory, action, payloads, expected=0, cancel=None, closed_output=F
         fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
     sink = open("/dev/full", "wb") if closed_output else subprocess.PIPE
     selection = ["--residue", residue] if residue is not None else ["--name", "publisher"]
+    if backup is not None:
+        selection += ["--backup-dir", str(backup[0]), "--backup-name", backup[1]]
     child = subprocess.Popen([BINARY, "key", action, "--key-dir", str(directory)] + selection,
                              stdin=subprocess.DEVNULL, stdout=sink, stderr=subprocess.PIPE,
                              pass_fds=(slave,), preexec_fn=setup)
@@ -161,6 +163,34 @@ with tempfile.TemporaryDirectory(prefix="lngnb-cli-public-test-") as root:
     assert recovery.read_bytes() == original and path.read_bytes() == updated
     assert unsafe_residue.is_symlink() and incomplete.read_bytes() == b"public incomplete keyfile"
     invoke(directory, "change-passphrase", [NEW, OLD, OLD], 1)
+    # 認証した暗号文だけを明示先へ保全。元ファイル/変更停止はそのまま。
+    backup_dir = Path(root) / "backup"
+    backup_dir.mkdir(mode=0o700)
+    invoke(directory, "preserve-residue", [NEW], 1, residue=recovery.name, backup=(backup_dir, "saved"))
+    invoke(directory, "preserve-residue", [], 130, cancel=signal.SIGTERM, residue=recovery.name, backup=(backup_dir, "saved"))
+    assert list(backup_dir.iterdir()) == []
+    invoke(directory, "preserve-residue", [OLD], 1, residue=unsafe_residue.name, backup=(backup_dir, "saved"))
+    invoke(directory, "preserve-residue", [OLD], 1, residue=incomplete.name, backup=(backup_dir, "saved"))
+    assert list(backup_dir.iterdir()) == []
+    out, _ = invoke(directory, "preserve-residue", [OLD], residue=recovery.name, backup=(backup_dir, "saved"))
+    saved = backup_dir / "saved"
+    assert ident in out and "同じbytesを保存".encode() in out
+    assert saved.read_bytes() == original and saved.stat().st_mode & 0o7777 == 0o600
+    assert decode_key(saved, OLD)[0] == seed
+    invoke(directory, "preserve-residue", [OLD], 1, residue=recovery.name, backup=(backup_dir, "saved"))
+    assert saved.read_bytes() == original
+    _, err = invoke(directory, "preserve-residue", [OLD], 1, closed_output=True, residue=recovery.name, backup=(backup_dir, "saved-output"))
+    assert "保全先への暗号文保存は完了".encode() in err
+    assert decode_key(backup_dir / "saved-output", OLD)[0] == seed
+    same_dir = subprocess.run([BINARY, "key", "preserve-residue", "--key-dir", str(directory), "--residue", recovery.name,
+                               "--backup-dir", str(directory), "--backup-name", "saved"],
+                              stdin=subprocess.DEVNULL, capture_output=True, start_new_session=True, timeout=10)
+    assert same_dir.returncode == 1 and not same_dir.stdout and b"key_directory_busy" in same_dir.stderr
+    (backup_dir / ".lngnb-key-public-pending").write_bytes(b"public pending backup")
+    invoke(directory, "preserve-residue", [OLD], 1, residue=recovery.name, backup=(backup_dir, "blocked"))
+    assert not (backup_dir / "blocked").exists()
+    assert recovery.read_bytes() == original and path.read_bytes() == updated
+    assert b"pending_recovery: true" in recovery_status().stdout
     recovery.unlink()  # 製品操作でなく、試験所有のfixtureだけを明示破棄。
     unsafe_residue.unlink()
     incomplete.unlink()

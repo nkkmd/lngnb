@@ -14,12 +14,24 @@ pub enum Action {
     Change,
     RecoveryStatus,
     CheckResidue,
+    PreserveResidue,
 }
 #[derive(Debug, PartialEq, Eq)]
 pub struct Command {
     action: Action,
     directory: PathBuf,
     name: Option<String>,
+    backup: Option<(PathBuf, String)>,
+}
+
+fn regular_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 128
+        && s != "."
+        && s != ".."
+        && !s.starts_with(".lngnb-key-")
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
 }
 
 pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
@@ -33,20 +45,39 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
         Some("change-passphrase") => Action::Change,
         Some("recovery-status") => Action::RecoveryStatus,
         Some("check-residue") => Action::CheckResidue,
+        Some("preserve-residue") => Action::PreserveResidue,
         _ => return Err(usage()),
     };
     let mut directory = None;
     let mut name = None;
+    let mut backup_dir = None;
+    let mut backup_name = None;
     for pair in rest.chunks(2) {
         let [option, value] = pair else {
             return Err(usage());
         };
         if option == "--key-dir" && directory.is_none() && !value.is_empty() {
             directory = Some(PathBuf::from(value));
+        } else if option == "--backup-dir"
+            && action == Action::PreserveResidue
+            && backup_dir.is_none()
+            && !value.is_empty()
+        {
+            backup_dir = Some(PathBuf::from(value));
+        } else if option == "--backup-name"
+            && action == Action::PreserveResidue
+            && backup_name.is_none()
+        {
+            let s = value.to_str().ok_or_else(usage)?;
+            if !regular_name(s) {
+                return Err(usage());
+            }
+            backup_name = Some(s.to_owned());
         } else if ((option == "--name"
-            && action != Action::CheckResidue
+            && !matches!(action, Action::CheckResidue | Action::PreserveResidue)
             && action != Action::RecoveryStatus)
-            || (option == "--residue" && action == Action::CheckResidue))
+            || (option == "--residue"
+                && matches!(action, Action::CheckResidue | Action::PreserveResidue)))
             && name.is_none()
         {
             let s = value.to_str().ok_or_else(usage)?;
@@ -56,19 +87,11 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
                         .bytes()
                         .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
             });
-            if action == Action::CheckResidue {
+            if matches!(action, Action::CheckResidue | Action::PreserveResidue) {
                 if !valid_residue {
                     return Err(usage());
                 }
-            } else if s.is_empty()
-                || s.len() > 128
-                || s == "."
-                || s == ".."
-                || s.starts_with(".lngnb-key-")
-                || !s
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
-            {
+            } else if !regular_name(s) {
                 return Err(usage());
             }
             name = Some(s.to_owned());
@@ -83,6 +106,14 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
         } else {
             Some(name.ok_or_else(usage)?)
         },
+        backup: if action == Action::PreserveResidue {
+            Some((
+                backup_dir.ok_or_else(usage)?,
+                backup_name.ok_or_else(usage)?,
+            ))
+        } else {
+            None
+        },
         action,
     })
 }
@@ -91,6 +122,8 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
 pub enum Error {
     Input(SecretInputError),
     File(KeyFileError),
+    Preserve(KeyFileError),
+    PreservationOutput,
     Output { changed: bool },
 }
 impl From<SecretInputError> for Error {
@@ -107,8 +140,12 @@ impl Error {
     pub fn exit_code(&self) -> u8 {
         match self {
             Self::Input(SecretInputError::Cancelled) => 130,
-            Self::File(KeyFileError::CommitUncertain) => 3,
-            Self::File(KeyFileError::CleanupUncertain) => 4,
+            Self::File(KeyFileError::CommitUncertain)
+            | Self::Preserve(KeyFileError::CommitUncertain) => 3,
+            Self::File(KeyFileError::CleanupUncertain)
+            | Self::Preserve(KeyFileError::CleanupUncertain) => 4,
+            Self::File(KeyFileError::PreservationReviewRequired)
+            | Self::Preserve(KeyFileError::PreservationReviewRequired) => 5,
             _ => 1,
         }
     }
@@ -130,11 +167,18 @@ impl fmt::Display for Error {
                     KeyFileError::CleanupUncertain => "新しい鍵ファイルの永続化は確認済みですが、旧暗号文の整理は未完了または不確実です。残存ファイルを保全し、旧パスフレーズが使えると仮定しないでください。",
                     KeyFileError::PendingRecovery => "残存する回復用ファイルがあるため変更を停止しました。自動採用・削除はしません。現在名は key check で読込み確認できますが、過去の更新完了や残存ファイルの安全性は確認しません。明示復旧CLIは未実装です。",
                     KeyFileError::RecoveryChanged => "診断中の入力変化を検出しました。結果は確定せず、全ファイルを保全したまま再診断してください。",
+                    KeyFileError::PreservationReviewRequired => "保全先の永続化は確認済みですが、保全元の最終照合等は未完了または不一致です。両領域の全ファイルを保持し、再実行・削除をせず確認してください。",
                     KeyFileError::Exists => "既存ファイルを上書きしていません。対象を確認してください。",
                     KeyFileError::UnsafePath => "所有者専用0700ディレクトリ・0600通常ファイルと安全な経路を確認してください。自動で権限変更しません。",
                     _ => "成功は確認できません。現在名と残存ファイルを保全し、変更を繰り返さず確認してください。",
                 })
             }
+            Self::Preserve(e) => {
+                f.write_str("残存鍵の保全処理: ")?;
+                Self::File(*e).fmt(f)?;
+                f.write_str(" 保全元への書換え・削除は行っていません。保全先の未確定ファイルも保持し、元の更新結果や削除可否を推測しないでください。")
+            }
+            Self::PreservationOutput => f.write_str("保全先への暗号文保存は完了しましたが、結果出力に失敗しました。保全元・保全先を保持し、再実行せず保全先を key check で確認してください。過去の更新確定や残存物の削除許可ではありません。"),
             Self::Output { changed: true } => f.write_str("鍵ファイル操作は完了しましたが、結果の出力に失敗しました。再実行せず key check で現在名を確認してください。"),
             Self::Output { changed: false } => f.write_str("案内または確認結果の出力に失敗しました。"),
         }
@@ -150,6 +194,25 @@ pub fn run(command: Command, output: &mut impl Write) -> Result<(), Error> {
         return report_inventory(&directory.recovery_inventory()?, output);
     }
     let name = command.name.as_deref().unwrap_or("");
+    if command.action == Action::PreserveResidue {
+        let (path, backup_name) = command
+            .backup
+            .as_ref()
+            .ok_or(Error::File(KeyFileError::UnsafePath))?;
+        // どちらも非待機lock。同じinode/逆順の競合でも待ち合わせない。
+        let mut backup = KeyDirectory::open(path).map_err(Error::Preserve)?;
+        let mut terminal = SecretTerminal::open_interruptible(signals)?;
+        let p = terminal.recovery_passphrase()?;
+        signals.check_cancelled()?;
+        let public = directory
+            .preserve_recovery_file(name, p.as_str(), &mut backup, backup_name)
+            .map_err(Error::Preserve)?;
+        drop(p);
+        drop(terminal);
+        drop(backup);
+        drop(directory);
+        return report(&command.action, &public, output);
+    }
     let mut terminal = SecretTerminal::open_interruptible(signals)?;
     let public = match command.action {
         Action::Create => {
@@ -176,6 +239,7 @@ pub fn run(command: Command, output: &mut impl Write) -> Result<(), Error> {
             directory.check_recovery_file(name, p.as_str())?
         }
         Action::RecoveryStatus => unreachable!("inventory returns before terminal input"),
+        Action::PreserveResidue => unreachable!("preservation uses both directory locks above"),
     };
     drop(terminal);
     drop(directory);
@@ -193,6 +257,9 @@ fn report(action: &Action, public: &[u8; 32], output: &mut impl Write) -> Result
             "指定した残存暗号文を認証復号し公開鍵の一致を確認しました。元の対象名・新旧・更新確定・削除可否は未確認です。書換え・採用・削除は行っていません"
         }
         Action::RecoveryStatus => unreachable!("inventory has a separate report"),
+        Action::PreserveResidue => {
+            "指定した残存暗号文を認証し、明示した保全先の新しい名前へ同じbytesを保存しました。保全元の現在名・残存物は書換え・削除していません。過去の更新確定・新旧判定・残存物の整理許可ではありません"
+        }
     };
     let text = format!(
         "{status}\nkey_id: {}\n暗号化鍵ファイルとパスフレーズを別々に保全してください。パスフレーズ紛失は管理トークンで回復できません。\n鍵紛失・漏洩時の同一Knowledgeの鍵交代は未対応です。新鍵・新Knowledgeへ由来を付けて移行します。他リレーでの起点採用は別操作です。\n",
@@ -201,8 +268,14 @@ fn report(action: &Action, public: &[u8; 32], output: &mut impl Write) -> Result
     output
         .write_all(text.as_bytes())
         .and_then(|()| output.flush())
-        .map_err(|_| Error::Output {
-            changed: matches!(action, Action::Create | Action::Change),
+        .map_err(|_| {
+            if *action == Action::PreserveResidue {
+                Error::PreservationOutput
+            } else {
+                Error::Output {
+                    changed: matches!(action, Action::Create | Action::Change),
+                }
+            }
         })
 }
 
@@ -232,6 +305,52 @@ fn report_inventory(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn preservation_requires_both_explicit_targets_and_distinguishes_committed_review() {
+        let residue = format!(".lngnb-key-{}", "a".repeat(64));
+        let args = [
+            "preserve-residue",
+            "--key-dir",
+            "/source",
+            "--residue",
+            &residue,
+            "--backup-dir",
+            "/backup",
+            "--backup-name",
+            "saved",
+        ];
+        let parsed = parse(&args.iter().map(OsString::from).collect::<Vec<_>>()).unwrap();
+        assert_eq!(
+            parsed.backup,
+            Some((PathBuf::from("/backup"), "saved".into()))
+        );
+        assert!(parse(&args[..7].iter().map(OsString::from).collect::<Vec<_>>()).is_err());
+        for name in ["../escape", ".lngnb-key-reserved", ""] {
+            let mut bad = args.iter().map(OsString::from).collect::<Vec<_>>();
+            bad[8] = name.into();
+            assert!(parse(&bad).is_err());
+        }
+        for (e, code) in [
+            (KeyFileError::Io, 1),
+            (KeyFileError::CommitUncertain, 3),
+            (KeyFileError::PreservationReviewRequired, 5),
+        ] {
+            let error = Error::Preserve(e);
+            assert_eq!(error.exit_code(), code);
+            assert!(
+                error
+                    .to_string()
+                    .contains("保全元への書換え・削除は行っていません")
+            );
+        }
+        assert!(
+            Error::Preserve(KeyFileError::PreservationReviewRequired)
+                .to_string()
+                .contains("保全先の永続化は確認済み")
+        );
+        assert_eq!(Error::PreservationOutput.exit_code(), 1);
+        assert!(Error::PreservationOutput.to_string().contains("再実行せず"));
+    }
     #[test]
     fn parsing_requires_explicit_paths_and_never_echoes_unknown_secret_arguments() {
         for args in [
@@ -399,5 +518,9 @@ mod tests {
             .exit_code(),
             1
         );
+        assert!(matches!(
+            report(&Action::PreserveResidue, &[0; 32], &mut FailFlush),
+            Err(Error::PreservationOutput)
+        ));
     }
 }

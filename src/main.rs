@@ -18,6 +18,7 @@ const HELP: &str = "lngnb — 分散図書館・知識基盤（開発初期段�
   lngnb key change-passphrase --key-dir PATH --name NAME
   lngnb key recovery-status --key-dir PATH
   lngnb key check-residue --key-dir PATH --residue NAME
+  lngnb key preserve-residue --key-dir PATH --residue NAME --backup-dir PATH --backup-name NAME
 
 key は既存の所有者専用0700ディレクトリを使います（自動作成・権限変更なし）。
 NAMEは1〜128 bytesのASCII英数字/._-（dot/dotdot・予約prefixを除く）。
@@ -27,6 +28,8 @@ NAMEは1〜128 bytesのASCII英数字/._-（dot/dotdot・予約prefixを除く�
 recovery-status は残存名と上限付き読取りだけを診断します（端末不要）。
 check-residue は一覧中の生成形式名を明示し、端末入力で認証復号します。
 どちらも書換え・採用・削除、元の対象名・新旧・過去の更新結果の確定は行いません。
+preserve-residue は認証した暗号文を別の既存0700領域へ非上書きで保存します。
+保全元・残存物は残し、過去の更新確定や残存物の削除許可にはしません。
 
 config show は設定候補の表示だけを行います。
 データ領域の初期化・設定の保存・既存設定の読込み・接続は行いません。

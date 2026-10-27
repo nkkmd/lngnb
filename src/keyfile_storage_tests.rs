@@ -624,6 +624,261 @@ fn selected_residue_requires_authentication_and_cannot_be_used_for_signing_or_ad
 }
 
 #[test]
+fn preservation_copies_authenticated_ciphertext_without_changing_source_or_overwriting() {
+    let source = Area::new();
+    let target = Area::new();
+    let (bytes, p) = fixture();
+    let residue = residue_name(1);
+    source.put("key", &bytes);
+    source.put(&residue, &bytes);
+    source.put(".lngnb-key-unknown", b"public unknown residue");
+    let source_before = fingerprint(&stdfs::metadata(&source.0).unwrap());
+    let mut s = KeyDirectory::open(&source.0).unwrap();
+    let mut t = KeyDirectory::open(&target.0).unwrap();
+    let public = s
+        .preserve_recovery_file(&residue, &p, &mut t, "saved.key")
+        .unwrap();
+    assert_eq!(public, unlock(&bytes, &p).unwrap().public_key());
+    assert_eq!(stdfs::read(target.0.join("saved.key")).unwrap(), bytes);
+    assert_eq!(
+        stdfs::metadata(target.0.join("saved.key")).unwrap().mode() & 0o7777,
+        0o600
+    );
+    assert!(t.recovery_inventory().unwrap().entries.is_empty());
+    assert_eq!(t.load("saved.key", &p).unwrap().public_key(), public);
+    e(
+        s.preserve_recovery_file(&residue, &p, &mut t, "saved.key"),
+        KeyFileError::Exists,
+    );
+    e(
+        s.change_passphrase("key", &p, &p),
+        KeyFileError::PendingRecovery,
+    );
+    assert_eq!(stdfs::read(source.0.join("key")).unwrap(), bytes);
+    assert_eq!(stdfs::read(source.0.join(&residue)).unwrap(), bytes);
+    assert_eq!(
+        stdfs::read(source.0.join(".lngnb-key-unknown")).unwrap(),
+        b"public unknown residue"
+    );
+    assert_eq!(
+        source_before,
+        fingerprint(&stdfs::metadata(&source.0).unwrap())
+    );
+}
+
+#[test]
+fn preservation_rejects_authentication_names_unsafe_paths_and_pending_destination_before_creation()
+{
+    let source = Area::new();
+    let target = Area::new();
+    let (bytes, p) = fixture();
+    let residue = residue_name(1);
+    source.put(&residue, &bytes);
+    let mut s = KeyDirectory::open(&source.0).unwrap();
+    let mut t = KeyDirectory::open(&target.0).unwrap();
+    e(
+        s.preserve_recovery_file(&residue, "public wrong password", &mut t, "saved"),
+        KeyError::AuthenticationFailed.into(),
+    );
+    for (r, n) in [
+        ("key", "saved"),
+        (&residue, "../escape"),
+        (&residue, ".lngnb-key-reserved"),
+    ] {
+        e(
+            s.preserve_recovery_file(r, &p, &mut t, n),
+            KeyFileError::UnsafePath,
+        );
+    }
+    assert!(stdfs::read_dir(&target.0).unwrap().next().is_none());
+    source.put(&residue_name(2), b"public incomplete ciphertext");
+    e(
+        s.preserve_recovery_file(&residue_name(2), &p, &mut t, "saved"),
+        KeyError::InvalidFormat.into(),
+    );
+    symlink(&residue, source.0.join(residue_name(3))).unwrap();
+    e(
+        s.preserve_recovery_file(&residue_name(3), &p, &mut t, "saved"),
+        KeyFileError::UnsafePath,
+    );
+    assert!(stdfs::read_dir(&target.0).unwrap().next().is_none());
+    target.put("existing", b"public existing target");
+    symlink("existing", target.0.join("link")).unwrap();
+    for n in ["existing", "link"] {
+        e(
+            s.preserve_recovery_file(&residue, &p, &mut t, n),
+            KeyFileError::Exists,
+        );
+    }
+    target.put(".lngnb-key-unknown", b"public pending target");
+    e(
+        s.preserve_recovery_file(&residue, &p, &mut t, "saved"),
+        KeyFileError::PendingRecovery,
+    );
+    assert_eq!(stdfs::read_dir(&target.0).unwrap().count(), 3);
+    e(KeyDirectory::open(&source.0), KeyFileError::Busy);
+    assert_eq!(stdfs::read(source.0.join(&residue)).unwrap(), bytes);
+}
+
+#[test]
+fn preservation_failures_keep_source_and_distinguish_unconfirmed_and_confirmed_copy() {
+    let source = Area::new();
+    let (bytes, p) = fixture();
+    let residue = residue_name(1);
+    source.put(&residue, &bytes);
+    let mut s = KeyDirectory::open(&source.0).unwrap();
+    for stage in [
+        Stage::TempCreated,
+        Stage::Written,
+        Stage::FileSynced,
+        Stage::Validated,
+        Stage::BeforeInstall,
+        Stage::Installed,
+        Stage::DirectorySynced,
+    ] {
+        let target = Area::new();
+        let mut t = KeyDirectory::open(&target.0).unwrap();
+        let expected = match stage {
+            Stage::Installed => KeyFileError::CommitUncertain,
+            Stage::DirectorySynced => KeyFileError::PreservationReviewRequired,
+            _ => KeyFileError::Io,
+        };
+        e(
+            s.preserve_recovery_file_with(&residue, &p, &mut t, "saved", &mut |at| {
+                if at == stage {
+                    Err(KeyFileError::Io)
+                } else {
+                    Ok(())
+                }
+            }),
+            expected,
+        );
+        assert_eq!(stdfs::read(source.0.join(&residue)).unwrap(), bytes);
+        if matches!(stage, Stage::Installed | Stage::DirectorySynced) {
+            assert_eq!(stdfs::read(target.0.join("saved")).unwrap(), bytes);
+        } else {
+            assert!(!target.0.join("saved").exists());
+            assert_eq!(t.recovery_inventory().unwrap().entries.len(), 1);
+            e(t.create("other", &p), KeyFileError::PendingRecovery);
+        }
+    }
+}
+
+#[test]
+fn preservation_detects_source_changes_before_and_after_copy_without_rolling_them_back() {
+    let (bytes, p) = fixture();
+    for stage in [Stage::BeforeInstall, Stage::DirectorySynced] {
+        let source = Area::new();
+        let target = Area::new();
+        let residue = residue_name(1);
+        source.put(&residue, &bytes);
+        let mut s = KeyDirectory::open(&source.0).unwrap();
+        let mut t = KeyDirectory::open(&target.0).unwrap();
+        let expected = if stage == Stage::BeforeInstall {
+            KeyFileError::RecoveryChanged
+        } else {
+            KeyFileError::PreservationReviewRequired
+        };
+        e(
+            s.preserve_recovery_file_with(&residue, &p, &mut t, "saved", &mut |at| {
+                if at == stage {
+                    stdfs::write(source.0.join(&residue), b"public changed source").unwrap();
+                }
+                Ok(())
+            }),
+            expected,
+        );
+        assert_eq!(
+            stdfs::read(source.0.join(&residue)).unwrap(),
+            b"public changed source"
+        );
+        if stage == Stage::BeforeInstall {
+            assert!(!target.0.join("saved").exists());
+        } else {
+            assert_eq!(stdfs::read(target.0.join("saved")).unwrap(), bytes);
+        }
+    }
+}
+
+#[test]
+fn preservation_process_kill_keeps_original_residue_and_releases_both_locks() {
+    if let Ok(path) = std::env::var("LNGNB_PUBLIC_PRESERVATION_KILL_SOURCE") {
+        let source = PathBuf::from(path);
+        let target = PathBuf::from(std::env::var("LNGNB_PUBLIC_PRESERVATION_KILL_TARGET").unwrap());
+        for path in [&source, &target] {
+            assert!(path.starts_with(std::env::temp_dir()));
+            assert!(
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("lngnb-keytest-")
+            );
+            assert_eq!(
+                stdfs::read(path.join("fixture-marker")).unwrap(),
+                b"public preservation fixture"
+            );
+        }
+        let stage = std::env::var("LNGNB_PUBLIC_PRESERVATION_KILL_STAGE").unwrap();
+        let (_, p) = fixture();
+        let mut s = KeyDirectory::open(&source).unwrap();
+        let mut t = KeyDirectory::open(&target).unwrap();
+        let _ = s.preserve_recovery_file_with(&residue_name(1), &p, &mut t, "saved", &mut |at| {
+            if format!("{at:?}") == stage {
+                println!("READY");
+                std::io::stdout().flush().unwrap();
+                loop {
+                    std::thread::park();
+                }
+            }
+            Ok(())
+        });
+        panic!("preservation kill point not reached");
+    }
+    let (bytes, p) = fixture();
+    for stage in ["FileSynced", "Installed", "DirectorySynced"] {
+        let source = Area::new();
+        let target = Area::new();
+        source.put(&residue_name(1), &bytes);
+        for a in [&source, &target] {
+            a.put("fixture-marker", b"public preservation fixture");
+        }
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "keyfile::files::tests::preservation_process_kill_keeps_original_residue_and_releases_both_locks", "--nocapture"])
+            .env("LNGNB_PUBLIC_PRESERVATION_KILL_SOURCE", &source.0)
+            .env("LNGNB_PUBLIC_PRESERVATION_KILL_TARGET", &target.0)
+            .env("LNGNB_PUBLIC_PRESERVATION_KILL_STAGE", stage)
+            .stdout(Stdio::piped()).spawn().unwrap();
+        let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        loop {
+            line.clear();
+            assert!(stdout.read_line(&mut line).unwrap() > 0);
+            if line.trim() == "READY" {
+                break;
+            }
+        }
+        child.kill().unwrap();
+        assert!(!child.wait().unwrap().success());
+        let mut s = KeyDirectory::open(&source.0).unwrap();
+        let mut t = KeyDirectory::open(&target.0).unwrap();
+        assert_eq!(stdfs::read(source.0.join(residue_name(1))).unwrap(), bytes);
+        assert!(s.recovery_inventory().unwrap().has_residues());
+        if stage == "FileSynced" {
+            assert!(!target.0.join("saved").exists());
+            assert_eq!(t.recovery_inventory().unwrap().entries.len(), 1);
+            e(t.create("other", &p), KeyFileError::PendingRecovery);
+        } else {
+            assert_eq!(stdfs::read(target.0.join("saved")).unwrap(), bytes);
+            assert_eq!(
+                t.load("saved", &p).unwrap().public_key(),
+                unlock(&bytes, &p).unwrap().public_key()
+            );
+        }
+        e(s.create("other", &p), KeyFileError::PendingRecovery);
+    }
+}
+
+#[test]
 fn cleanup_never_unlinks_a_changed_recovery_file() {
     let (b, p) = fixture();
     let a = Area::new();
