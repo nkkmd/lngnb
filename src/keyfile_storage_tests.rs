@@ -1171,3 +1171,89 @@ fn restoration_process_kill_keeps_residue_and_releases_lock() {
         );
     }
 }
+
+#[test]
+fn preserved_copy_can_be_used_after_reopen_without_clearing_or_rewriting_source_recovery() {
+    let source = Area::new();
+    let destination = Area::new();
+    let (bytes, old) = fixture();
+    let new = "public preserved copy new password only";
+    let public = unlock(&bytes, &old).unwrap().public_key();
+    let current = unlock(&bytes, &old).unwrap().encrypt(new).unwrap();
+    let residue = residue_name(1);
+    source.put("publisher", &current);
+    source.put(&residue, &bytes);
+    source.put(".lngnb-key-unknown", b"public unclassified residue");
+    let snapshot: Vec<_> = ["publisher", &residue, ".lngnb-key-unknown"]
+        .iter()
+        .map(|name| {
+            let path = source.0.join(name);
+            (
+                path.clone(),
+                stdfs::read(&path).unwrap(),
+                fingerprint(&stdfs::metadata(path).unwrap()),
+            )
+        })
+        .collect();
+    let directory_before = fingerprint(&stdfs::metadata(&source.0).unwrap());
+    {
+        let mut s = KeyDirectory::open(&source.0).unwrap();
+        let mut d = KeyDirectory::open(&destination.0).unwrap();
+        assert_eq!(
+            s.preserve_recovery_file(&residue, &old, &mut d, "publisher")
+                .unwrap(),
+            public
+        );
+    }
+    // 再openを境に、選択した領域でだけ通常操作の条件を確認する。
+    let mut s = KeyDirectory::open(&source.0).unwrap();
+    let mut d = KeyDirectory::open(&destination.0).unwrap();
+    assert!(s.recovery_inventory().unwrap().has_residues());
+    assert!(!d.recovery_inventory().unwrap().has_residues());
+    assert_eq!(d.load("publisher", &old).unwrap().public_key(), public);
+    e(
+        d.change_passphrase("publisher", "public wrong password", new),
+        KeyError::AuthenticationFailed.into(),
+    );
+    assert_eq!(stdfs::read(destination.0.join("publisher")).unwrap(), bytes);
+    assert_eq!(d.change_passphrase("publisher", &old, new).unwrap(), public);
+    assert_eq!(d.load("publisher", new).unwrap().public_key(), public);
+    e(
+        d.load("publisher", &old),
+        KeyError::AuthenticationFailed.into(),
+    );
+    assert_ne!(stdfs::read(destination.0.join("publisher")).unwrap(), bytes);
+    assert_eq!(
+        stdfs::metadata(destination.0.join("publisher"))
+            .unwrap()
+            .mode()
+            & 0o7777,
+        0o600
+    );
+    assert!(!d.recovery_inventory().unwrap().has_residues());
+    // コピー先の更新は元暗号文の失効や、元領域の停止解除ではない。
+    assert_eq!(s.check_recovery_file(&residue, &old).unwrap(), public);
+    assert_eq!(s.load("publisher", new).unwrap().public_key(), public);
+    e(
+        s.change_passphrase("publisher", new, &old),
+        KeyFileError::PendingRecovery,
+    );
+    for (path, original, metadata) in snapshot {
+        assert_eq!(stdfs::read(&path).unwrap(), original);
+        assert_eq!(fingerprint(&stdfs::metadata(path).unwrap()), metadata);
+    }
+    assert_eq!(
+        fingerprint(&stdfs::metadata(&source.0).unwrap()),
+        directory_before
+    );
+    // 新しい領域でも残存物ができれば通常変更を再び止める。
+    destination.put(
+        ".lngnb-key-unclassified",
+        b"public destination recovery marker",
+    );
+    e(
+        d.change_passphrase("publisher", new, &old),
+        KeyFileError::PendingRecovery,
+    );
+    assert_eq!(d.load("publisher", new).unwrap().public_key(), public);
+}
