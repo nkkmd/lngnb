@@ -419,6 +419,24 @@ fn process_kill_preserves_old_or_new_key_and_releases_lock() {
             assert_eq!(stdfs::read(&a.pending()[0]).unwrap(), b);
         }
         assert_eq!(a.pending().len(), 1);
+        let current = stdfs::read(a.0.join("key")).unwrap();
+        let pending_path = a.pending().pop().unwrap();
+        let pending_bytes = stdfs::read(&pending_path).unwrap();
+        let inventory = d.recovery_inventory().unwrap();
+        assert_eq!(inventory.entries.len(), 1);
+        assert_eq!(inventory.entries[0].read_error, None);
+        let password = if stage == "FileSynced" {
+            "new public test password"
+        } else {
+            &p
+        };
+        assert_eq!(
+            d.check_recovery_file(&inventory.entries[0].name, password)
+                .unwrap(),
+            unlock(&b, &p).unwrap().public_key()
+        );
+        assert_eq!(stdfs::read(a.0.join("key")).unwrap(), current);
+        assert_eq!(stdfs::read(&pending_path).unwrap(), pending_bytes);
         e(
             d.change_passphrase("key", &p, &p),
             KeyFileError::PendingRecovery,
@@ -451,14 +469,158 @@ fn tampered_readback_and_orphan_inputs_are_never_adopted() {
 #[test]
 fn pending_scan_has_an_explicit_boundary_without_deleting_entries() {
     let a = Area::new();
-    let d = KeyDirectory::open(&a.0).unwrap();
+    let mut d = KeyDirectory::open(&a.0).unwrap();
     for i in 0..SCAN_LIMIT {
         File::create(a.0.join(format!("entry-{i}"))).unwrap();
     }
     d.pending().unwrap();
+    assert!(!d.recovery_inventory().unwrap().has_residues());
     File::create(a.0.join("one-more")).unwrap();
     e(d.pending(), KeyFileError::ScanLimit);
+    e(d.recovery_inventory(), KeyFileError::ScanLimit);
     assert_eq!(stdfs::read_dir(&a.0).unwrap().count(), SCAN_LIMIT + 1);
+}
+
+fn residue_name(index: u8) -> String {
+    format!("{PREFIX}{}", data_encoding::HEXLOWER.encode(&[index; 32]))
+}
+#[test]
+fn recovery_inventory_is_bounded_sorted_unauthenticated_and_never_adopts() {
+    let a = Area::new();
+    let (b, p) = fixture();
+    a.put("key", &b);
+    a.put(&residue_name(2), &b);
+    a.put(&residue_name(1), b"public incomplete ciphertext");
+    a.put(
+        ".lngnb-key-unknown\npublic-untrusted-filename",
+        b"public unknown input",
+    );
+    use std::os::unix::ffi::OsStringExt;
+    let n = std::ffi::OsString::from_vec([PREFIX.as_bytes(), &[0xff]].concat());
+    a.put("ordinary", b"public ordinary fixture");
+    stdfs::write(a.0.join(n), b"public non-UTF8 name fixture").unwrap();
+    let before = fingerprint(&stdfs::metadata(&a.0).unwrap());
+    let mut d = KeyDirectory::open(&a.0).unwrap();
+    let inventory = d.recovery_inventory().unwrap();
+    assert!(inventory.has_residues());
+    assert_eq!(inventory.unrecognized_entries, 2);
+    assert_eq!(
+        inventory
+            .entries
+            .iter()
+            .map(|e| (&e.name, e.read_error))
+            .collect::<Vec<_>>(),
+        vec![(&residue_name(1), None), (&residue_name(2), None)]
+    );
+    // 通常fileの読取り成功を、不完全暗号文の認証成功へ読み替えない。
+    e(
+        d.check_recovery_file(&residue_name(1), &p),
+        KeyError::InvalidFormat.into(),
+    );
+    e(d.create("other", &p), KeyFileError::PendingRecovery);
+    e(
+        d.change_passphrase("key", &p, &p),
+        KeyFileError::PendingRecovery,
+    );
+    assert_eq!(stdfs::read(a.0.join("key")).unwrap(), b);
+    assert_eq!(stdfs::read(a.0.join(residue_name(2))).unwrap(), b);
+    assert_eq!(before, fingerprint(&stdfs::metadata(&a.0).unwrap()));
+    assert_eq!(stdfs::read_dir(&a.0).unwrap().count(), 6);
+}
+#[test]
+fn recovery_inventory_reports_unsafe_entries_without_following_or_deleting_them() {
+    let a = Area::new();
+    let (b, _) = fixture();
+    a.put("key", &b);
+    symlink("key", a.0.join(residue_name(1))).unwrap();
+    stdfs::hard_link(a.0.join("key"), a.0.join(residue_name(2))).unwrap();
+    let mut d = KeyDirectory::open(&a.0).unwrap();
+    os(fs::mknodat(
+        &d.dir,
+        residue_name(3),
+        fs::FileType::Fifo,
+        Mode::RUSR | Mode::WUSR,
+        0,
+    ))
+    .unwrap();
+    stdfs::create_dir(a.0.join(residue_name(4))).unwrap();
+    a.put(&residue_name(5), &b);
+    stdfs::set_permissions(
+        a.0.join(residue_name(5)),
+        stdfs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    a.put(&residue_name(6), &vec![0; MAX_KEYFILE_BYTES + 1]);
+    let inventory = d.recovery_inventory().unwrap();
+    assert_eq!(inventory.entries.len(), 6);
+    for entry in &inventory.entries[..5] {
+        assert_eq!(entry.read_error, Some(KeyFileError::UnsafePath));
+    }
+    assert_eq!(
+        inventory.entries[5].read_error,
+        Some(KeyError::InvalidFormat.into())
+    );
+    assert_eq!(stdfs::read(a.0.join("key")).unwrap(), b);
+    assert_eq!(stdfs::read_dir(&a.0).unwrap().count(), 7);
+}
+#[test]
+fn inventory_change_is_not_a_complete_diagnosis_and_preserves_inputs() {
+    let a = Area::new();
+    let mut d = KeyDirectory::open(&a.0).unwrap();
+    e(
+        d.recovery_inventory_with(&mut || {
+            a.put(&residue_name(1), b"public added fixture");
+            Ok(())
+        }),
+        KeyFileError::RecoveryChanged,
+    );
+    assert!(d.recovery_inventory().unwrap().has_residues());
+    assert_eq!(
+        stdfs::read(a.0.join(residue_name(1))).unwrap(),
+        b"public added fixture"
+    );
+    stdfs::set_permissions(&a.0, stdfs::Permissions::from_mode(0o755)).unwrap();
+    e(d.recovery_inventory(), KeyFileError::UnsafePath);
+    stdfs::set_permissions(&a.0, stdfs::Permissions::from_mode(0o700)).unwrap();
+}
+#[test]
+fn selected_residue_requires_authentication_and_cannot_be_used_for_signing_or_adoption() {
+    let a = Area::new();
+    let (b, p) = fixture();
+    let n = residue_name(1);
+    a.put(&n, &b);
+    let mut d = KeyDirectory::open(&a.0).unwrap();
+    assert_eq!(
+        d.check_recovery_file(&n, &p).unwrap(),
+        unlock(&b, &p).unwrap().public_key()
+    );
+    e(
+        d.check_recovery_file(&n, "public wrong password"),
+        KeyError::AuthenticationFailed.into(),
+    );
+    for bad in [
+        "key",
+        ".lngnb-key-user",
+        "../escape",
+        &format!("{n}/child"),
+        &n.to_uppercase(),
+    ] {
+        e(d.check_recovery_file(bad, &p), KeyFileError::UnsafePath);
+    }
+    e(d.load(&n, &p), KeyFileError::UnsafePath);
+    e(d.create("key", &p), KeyFileError::PendingRecovery);
+    e(
+        d.check_recovery_file_with(&n, &p, &mut || {
+            stdfs::write(a.0.join(&n), b"public changed ciphertext").unwrap();
+            Ok(())
+        }),
+        KeyFileError::RecoveryChanged,
+    );
+    assert_eq!(
+        stdfs::read(a.0.join(&n)).unwrap(),
+        b"public changed ciphertext"
+    );
+    assert!(!a.0.join("key").exists());
 }
 
 #[test]

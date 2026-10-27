@@ -21,6 +21,8 @@ pub enum KeyFileError {
     Io,
     PendingRecovery,
     ScanLimit,
+    /// 診断中にディレクトリ一覧または対象暗号文の変化を検出した。
+    RecoveryChanged,
     /// 交換/配置済みだがdirectory fsync成功を確認できない。成功/rollbackを断定しない。
     CommitUncertain,
     /// 新鍵の永続化確認済み。旧暗号文の整理だけが未完了/不確実。
@@ -42,6 +44,7 @@ impl std::fmt::Display for KeyFileError {
             Self::Io => "key_file_io_failed",
             Self::PendingRecovery => "key_recovery_required",
             Self::ScanLimit => "key_directory_scan_limit",
+            Self::RecoveryChanged => "key_recovery_input_changed",
             Self::CommitUncertain => "key_commit_uncertain",
             Self::CleanupUncertain => "key_committed_cleanup_uncertain",
             Self::Key(e) => return e.fmt(f),
@@ -97,6 +100,31 @@ fn directory(path: &Path) -> Result<File> {
 /// 所有者/rootが悪意を持ってファイルを差し替える攻撃への保証は追加しない。
 pub struct KeyDirectory {
     dir: File,
+}
+/// 現在観測した残存名と上限付き読取りの結果。形式・認証・復旧の成功ではない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyRecoveryEntry {
+    pub name: String,
+    pub read_error: Option<KeyFileError>,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyRecoveryInventory {
+    pub entries: Vec<KeyRecoveryEntry>,
+    /// 予約prefixだが生成名の形式に一致しないentry数。危険な生の名前は返さない。
+    pub unrecognized_entries: usize,
+}
+impl KeyRecoveryInventory {
+    pub fn has_residues(&self) -> bool {
+        !self.entries.is_empty() || self.unrecognized_entries != 0
+    }
+}
+fn recovery_name(n: &str) -> bool {
+    n.strip_prefix(PREFIX).is_some_and(|suffix| {
+        suffix.len() == 64
+            && suffix
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
 }
 impl Drop for KeyDirectory {
     fn drop(&mut self) {
@@ -168,6 +196,74 @@ impl KeyDirectory {
     pub fn load(&mut self, n: &str, passphrase: &str) -> Result<UnlockedKey> {
         name(n)?;
         Ok(unlock(&self.read(n)?, passphrase)?)
+    }
+    /// 書換え・fsync・採用・削除をせず一覧を診断する。既存の排他とI/O上限を共有。
+    /// 読取り成功は形式/AEAD未検査。全体の未完了を部分成功として返さない。
+    /// 各fileは個別読取り時点の観測であり、集合全体の内容snapshotではない。
+    pub fn recovery_inventory(&mut self) -> Result<KeyRecoveryInventory> {
+        self.recovery_inventory_with(&mut || Ok(()))
+    }
+    fn recovery_inventory_with(
+        &mut self,
+        hook: &mut impl FnMut() -> Result<()>,
+    ) -> Result<KeyRecoveryInventory> {
+        self.secure()?;
+        let before = fingerprint(&io(self.dir.metadata())?);
+        let entries = io(std::fs::read_dir(format!(
+            "/proc/self/fd/{}",
+            self.dir.as_raw_fd()
+        )))?;
+        let mut result = KeyRecoveryInventory {
+            entries: Vec::new(),
+            unrecognized_entries: 0,
+        };
+        for (i, entry) in entries.enumerate() {
+            if i >= SCAN_LIMIT {
+                return Err(KeyFileError::ScanLimit);
+            }
+            let entry = io(entry)?;
+            let n = entry.file_name();
+            if !n.as_encoded_bytes().starts_with(PREFIX.as_bytes()) {
+                continue;
+            }
+            if let Some(n) = n.to_str().filter(|n| recovery_name(n)) {
+                result.entries.push(KeyRecoveryEntry {
+                    name: n.into(),
+                    read_error: self.read(n).err(),
+                });
+            } else {
+                result.unrecognized_entries += 1;
+            }
+        }
+        hook()?;
+        self.secure()?;
+        if before != fingerprint(&io(self.dir.metadata())?) {
+            return Err(KeyFileError::RecoveryChanged);
+        }
+        result.entries.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(result)
+    }
+    /// 指定した生成形式の残存名だけを認証復号し、公開鍵だけを返す。
+    /// 元の操作/対象名/新旧/保存確定・採用/削除資格は推測しない。
+    pub fn check_recovery_file(&mut self, n: &str, passphrase: &str) -> Result<[u8; 32]> {
+        self.check_recovery_file_with(n, passphrase, &mut || Ok(()))
+    }
+    fn check_recovery_file_with(
+        &mut self,
+        n: &str,
+        passphrase: &str,
+        hook: &mut impl FnMut() -> Result<()>,
+    ) -> Result<[u8; 32]> {
+        if !recovery_name(n) {
+            return Err(KeyFileError::UnsafePath);
+        }
+        let input = self.read(n)?;
+        let key = unlock(&input, passphrase)?;
+        hook()?;
+        if self.read(n).map_err(|_| KeyFileError::RecoveryChanged)? != input {
+            return Err(KeyFileError::RecoveryChanged);
+        }
+        Ok(key.public_key())
     }
     fn pending(&self) -> Result<()> {
         self.secure()?;
