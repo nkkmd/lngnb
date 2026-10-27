@@ -39,7 +39,7 @@ def decode_key(path, password):
     ident = b"ky1_" + base64.b32encode(hashlib.sha256(b"lngnb:key:ed25519:1\x00" + public).digest()).lower().rstrip(b"=")
     return seed, obj, ident
 
-def invoke(directory, action, payloads, expected=0, cancel=None, closed_output=False):
+def invoke(directory, action, payloads, expected=0, cancel=None, closed_output=False, residue=None):
     master, slave = pty.openpty()
     before = termios.tcgetattr(slave)
     before[3] |= termios.ECHO | termios.ECHONL | termios.ICANON | termios.ISIG
@@ -49,7 +49,8 @@ def invoke(directory, action, payloads, expected=0, cancel=None, closed_output=F
         os.setsid()
         fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
     sink = open("/dev/full", "wb") if closed_output else subprocess.PIPE
-    child = subprocess.Popen([BINARY, "key", action, "--key-dir", str(directory), "--name", "publisher"],
+    selection = ["--residue", residue] if residue is not None else ["--name", "publisher"]
+    child = subprocess.Popen([BINARY, "key", action, "--key-dir", str(directory)] + selection,
                              stdin=subprocess.DEVNULL, stdout=sink, stderr=subprocess.PIPE,
                              pass_fds=(slave,), preexec_fn=setup)
     captured = bytearray()
@@ -126,6 +127,43 @@ with tempfile.TemporaryDirectory(prefix="lngnb-cli-public-test-") as root:
     invoke(directory, "change-passphrase", [NEW, OLD, OLD], 1)
     invoke(directory, "check", [NEW])
     assert residue.read_bytes() == b"public residue fixture" and path.read_bytes() == updated
+    # 一覧は制御端末なしで実行可能。形式/認証未検査と復旧未完了を明示する。
+    recovery = directory / (".lngnb-key-" + "ab" * 32)
+    recovery.write_bytes(original)
+    os.chmod(recovery, 0o600)
+    unsafe_residue = directory / (".lngnb-key-" + "cd" * 32)
+    unsafe_residue.symlink_to("publisher")
+    incomplete = directory / (".lngnb-key-" + "ef" * 32)
+    incomplete.write_bytes(b"public incomplete keyfile")
+    os.chmod(incomplete, 0o600)
+    def recovery_status(sink=None):
+        return subprocess.run([BINARY, "key", "recovery-status", "--key-dir", str(directory)],
+                              stdin=subprocess.DEVNULL, stdout=sink or subprocess.PIPE, stderr=subprocess.PIPE,
+                              start_new_session=True, timeout=10)
+    status = recovery_status()
+    assert status.returncode == 0 and not status.stderr
+    assert b"pending_recovery: true" in status.stdout and b"unrecognized_entries: 1" in status.stdout
+    assert recovery.name.encode() in status.stdout and residue.name.encode() not in status.stdout
+    assert b"bounded_read_complete_unauthenticated" in status.stdout and b"key_id:" not in status.stdout
+    assert b"status: unsafe_key_path" in status.stdout
+    assert "復旧完了ではありません".encode() in status.stdout
+    out, _ = invoke(directory, "check-residue", [OLD], residue=recovery.name)
+    assert ident in out and "元の対象名・新旧・更新確定・削除可否は未確認".encode() in out
+    invoke(directory, "check-residue", [NEW], 1, residue=recovery.name)
+    invoke(directory, "check-residue", [OLD], 1, residue=unsafe_residue.name)
+    invoke(directory, "check-residue", [OLD], 1, residue=incomplete.name)
+    invoke(directory, "check-residue", [], 130, cancel=signal.SIGTERM, residue=recovery.name)
+    invoke(directory, "check-residue", [OLD], 1, closed_output=True, residue=recovery.name)
+    with open("/dev/full", "wb") as sink:
+        failed_status = recovery_status(sink)
+        assert failed_status.returncode == 1
+    # 診断や認証成功後も現在鍵/残存暗号文・変更停止を保持する。
+    assert recovery.read_bytes() == original and path.read_bytes() == updated
+    assert unsafe_residue.is_symlink() and incomplete.read_bytes() == b"public incomplete keyfile"
+    invoke(directory, "change-passphrase", [NEW, OLD, OLD], 1)
+    recovery.unlink()  # 製品操作でなく、試験所有のfixtureだけを明示破棄。
+    unsafe_residue.unlink()
+    incomplete.unlink()
     residue.unlink()  # 試験所有のfixtureだけを明示破棄。
     _, err = invoke(directory, "change-passphrase", [NEW, OLD, OLD], 1, closed_output=True)
     assert "鍵ファイル操作は完了".encode() in err

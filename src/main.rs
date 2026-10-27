@@ -16,12 +16,17 @@ const HELP: &str = "lngnb — 分散図書館・知識基盤（開発初期段�
   lngnb key create --key-dir PATH --name NAME
   lngnb key check --key-dir PATH --name NAME
   lngnb key change-passphrase --key-dir PATH --name NAME
+  lngnb key recovery-status --key-dir PATH
+  lngnb key check-residue --key-dir PATH --residue NAME
 
 key は既存の所有者専用0700ディレクトリを使います（自動作成・権限変更なし）。
 NAMEは1〜128 bytesのASCII英数字/._-（dot/dotdot・予約prefixを除く）。
 パスフレーズは前面の制御端末から非表示入力します。
 暗号化鍵とパスフレーズを別々に保全してください。紛失は管理トークンで回復できません。
 鍵共用時は漏洩の影響が複数資料に及びます。同一Knowledgeの鍵交代は未対応です。
+recovery-status は残存名と上限付き読取りだけを診断します（端末不要）。
+check-residue は一覧中の生成形式名を明示し、端末入力で認証復号します。
+どちらも書換え・採用・削除、元の対象名・新旧・過去の更新結果の確定は行いません。
 
 config show は設定候補の表示だけを行います。
 データ領域の初期化・設定の保存・既存設定の読込み・接続は行いません。

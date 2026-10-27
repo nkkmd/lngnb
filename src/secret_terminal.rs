@@ -1,4 +1,4 @@
-//! A11/R34: 制御端末だけから読む秘密入力。製品CLI・鍵ファイル操作への接続は後続。
+//! A11/R34: 制御端末だけから読む秘密入力。鍵操作の判断は呼出し側で行う。
 use rustix::{
     fs::{self, CWD, Mode, OFlags},
     termios::{self, LocalModes, OptionalActions, QueueSelector, Termios},
@@ -150,6 +150,9 @@ impl SecretTerminal {
     }
     pub fn current_passphrase(&mut self) -> Result<Passphrase> {
         self.read("現在のパスフレーズ: ")
+    }
+    pub fn recovery_passphrase(&mut self) -> Result<Passphrase> {
+        self.read("指定した残存暗号文のパスフレーズ: ")
     }
     pub fn new_passphrase(&mut self) -> Result<Passphrase> {
         let first = self.read("新しいパスフレーズ: ")?;

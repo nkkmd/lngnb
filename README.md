@@ -40,9 +40,13 @@ cargo build --locked --offline --release
 ./target/release/lngnb key create --key-dir /path/to/private-keys --name publisher
 ./target/release/lngnb key check --key-dir /path/to/private-keys --name publisher
 ./target/release/lngnb key change-passphrase --key-dir /path/to/private-keys --name publisher
+./target/release/lngnb key recovery-status --key-dir /path/to/private-keys
+./target/release/lngnb key check-residue --key-dir /path/to/private-keys --residue NAME_FROM_RECOVERY_STATUS
 ```
 
 暗号化鍵ファイルを安全な別の場所にも保管し、パスフレーズは鍵とは別に保全してください。紛失は管理トークンで回復できません。複数資料で鍵を共用すると漏洩時の影響が広がります。鍵の紛失・漏洩・計画交代では新鍵と新Knowledgeへ移行し、同じKnowledgeの発行鍵は変更できません。`check`は現在名の復号・公開鍵一致の確認だけで、残存ファイルの復旧や過去の更新結果の確定ではありません。
+
+残存物は、端末不要の`recovery-status`で名前と上限付き読取り結果を診断できます。読取り完了は形式・認証の成功ではなく、生成形式に合わない予約名は件数だけを示します。`check-residue`には一覧に出た生成形式名を明示し、その暗号文のパスフレーズを端末入力します。認証復号できた鍵IDだけを表示し、元の対象名・新旧・更新確定・削除可否は推測しません。どちらも書換え・採用・削除をせず、終了0は診断処理の終了だけです。
 
 鍵操作の終了コードは成功0、引数不正2、入力取消し130、保存未確定3、新鍵の永続化確認済みで旧暗号文の整理が不確実な場合4、その他の失敗1です。3/4や残存ファイルの通知では現在名・回復用暗号文を保全し、変更を繰り返さず確認してください。残存ファイルは自動採用・削除せず、明示復旧CLIは未実装です。結果出力の失敗は保存の失敗と同じではなく、鍵操作完了後の出力失敗は診断で区別します。SIGKILL/SIGSTOP・端末消失等の復元は保証しません。端末復元失敗時は入力を続けず別の正常な端末を使用し、必要なら元端末で`stty sane`を使います（元設定の完全復元ではありません）。
 
