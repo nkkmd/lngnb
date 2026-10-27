@@ -3,6 +3,7 @@ import fcntl
 import os
 import pty
 import select
+import signal
 import subprocess
 import sys
 import termios
@@ -23,6 +24,17 @@ CASES = {
     "overflow": [b"x" * 1025 + b"\npublic leftover input\n"],
     "hangup": [],
     "background": [],
+    "signal-hup": [],
+    "signal-int": [],
+    "signal-quit": [],
+    "signal-term": [],
+    "signal-tstp": [],
+    "signal-confirm": [b"public confirmation test\n"],
+    "signal-idle": [],
+    "signal-idle-after": [b"public completed input\n"],
+    "signal-empty": [],
+    "interruptible-unicode": [" public e\u0301 é あ \n".encode()],
+    "interruptible-confirm": [b"public confirmation test\n", b"public confirmation test\n"],
 }
 
 def run_case(case, payloads):
@@ -71,7 +83,10 @@ def run_case(case, payloads):
             if child.poll() is not None:
                 raise AssertionError("PTY child ended before prompt: " + case)
         attrs = termios.tcgetattr(slave)
-        assert not attrs[3] & (termios.ECHO | termios.ECHONL | termios.ICANON | termios.ISIG), case
+        if case == "signal-idle" or (case == "signal-idle-after" and number == 2):
+            assert attrs == before, case
+        else:
+            assert not attrs[3] & (termios.ECHO | termios.ECHONL | termios.ICANON | termios.ISIG), case
 
     try:
         if case != "background":
@@ -84,8 +99,19 @@ def run_case(case, payloads):
                 if n > 1:
                     wait_prompt(n)
                 os.write(master, payload)
+            if case.startswith("signal-"):
+                if case in ("signal-confirm", "signal-idle-after"):
+                    wait_prompt(2)
+                if case not in ("signal-idle", "signal-idle-after", "signal-empty"):
+                    os.write(master, b"public discarded input")
+                sig = {"signal-hup": signal.SIGHUP, "signal-int": signal.SIGINT,
+                       "signal-quit": signal.SIGQUIT, "signal-tstp": signal.SIGTSTP}.get(case, signal.SIGTERM)
+                os.kill(child.pid, sig)
         out, err = child.communicate(timeout=15)
-        assert child.returncode == 0 and b"TERMINAL_CHECK_OK" in out, "PTY result: " + case
+        if case in ("signal-idle", "signal-idle-after"):
+            assert child.returncode == -signal.SIGTERM, "idle signal default lost: " + case
+        else:
+            assert child.returncode == 0 and b"TERMINAL_CHECK_OK" in out, "PTY result: " + case
         if case != "hangup":
             assert termios.tcgetattr(slave) == before, "TTY settings not restored: " + case
             while select.select([master], [], [], 0)[0]:
@@ -94,7 +120,7 @@ def run_case(case, payloads):
             assert not select.select([slave], [], [], 0)[0], "pending terminal input: " + case
         visible = bytes(captured) + out + err
         for marker in [b"public discarded input", b"public confirmation test", b"public wrong confirmation",
-                       b"public leftover input", " public e\u0301 é あ ".encode(), b"x" * 64]:
+                       b"public leftover input", b"public completed input", " public e\u0301 é あ ".encode(), b"x" * 64]:
             assert marker not in visible, "secret echoed or logged: " + case
     finally:
         if child.poll() is None:
@@ -111,10 +137,11 @@ if len(sys.argv) > 2:
 for name, lines in CASES.items():
     run_case(name, lines)
 # stdinに値があっても、制御端末のない新規sessionでは代替入力しない。
-no_tty = subprocess.run([BINARY, "--exact", FILTER, "--nocapture"],
-                        input=b"public stdin must not be used\n", capture_output=True, timeout=15,
-                        start_new_session=True,
-                        env=dict(os.environ, LNGNB_PUBLIC_TERMINAL_CASE="no-terminal"))
-assert no_tty.returncode == 0 and b"TERMINAL_CHECK_OK" in no_tty.stdout
-assert b"public stdin must not be used" not in no_tty.stdout + no_tty.stderr
-print("PTY_CASES_OK=13")
+for mode in ("no-terminal", "signal-no-terminal"):
+    no_tty = subprocess.run([BINARY, "--exact", FILTER, "--nocapture"],
+                            input=b"public stdin must not be used\n", capture_output=True, timeout=15,
+                            start_new_session=True,
+                            env=dict(os.environ, LNGNB_PUBLIC_TERMINAL_CASE=mode))
+    assert no_tty.returncode == 0 and b"TERMINAL_CHECK_OK" in no_tty.stdout
+    assert b"public stdin must not be used" not in no_tty.stdout + no_tty.stderr
+print("PTY_CASES_OK=25")

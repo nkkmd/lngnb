@@ -6,11 +6,15 @@ use rustix::{
 use std::{
     fs::File,
     io::{Read, Write},
-    sync::{Mutex, MutexGuard},
+    sync::{
+        Arc, Mutex, MutexGuard, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use zeroize::Zeroizing;
 const MAX_BYTES: usize = 1024;
 static TERMINAL: Mutex<()> = Mutex::new(());
+static SIGNALS: OnceLock<Result<SignalState>> = OnceLock::new();
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecretInputError {
     NoTerminal,
@@ -21,6 +25,7 @@ pub enum SecretInputError {
     InvalidInput,
     ConfirmationMismatch,
     RestoreFailed,
+    SignalSetupFailed,
 }
 impl std::fmt::Display for SecretInputError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -33,6 +38,7 @@ impl std::fmt::Display for SecretInputError {
             Self::InvalidInput => "invalid_passphrase_input",
             Self::ConfirmationMismatch => "passphrase_confirmation_mismatch",
             Self::RestoreFailed => "secret_terminal_restore_failed",
+            Self::SignalSetupFailed => "secret_terminal_signal_setup_failed",
         })
     }
 }
@@ -46,26 +52,101 @@ impl Passphrase {
     }
 }
 
+struct SignalState {
+    idle: Arc<AtomicBool>,
+    cancelled: Arc<AtomicBool>,
+}
+/// 実行ファイルの起動時、他のハンドラー/workerを導入する前に明示導入する。
+/// プロセス全体に作用し、他のシグナル制御と併用するためのAPIではない。
+/// 既存ハンドラーとの調停は行わない。登録は永続し、Dropで解除しない。
+/// 入力外は既定動作、入力中のHUP/INT/QUIT/TERM/TSTPは取消しとする。
+/// 一度の取消しは同プロセスで解除せず、呼出し元は操作を失敗終了させる。
+#[derive(Clone, Copy)]
+pub struct TerminalSignals(&'static SignalState);
+impl TerminalSignals {
+    pub fn install() -> Result<Self> {
+        let _lock = TERMINAL.try_lock().map_err(|_| SecretInputError::Busy)?;
+        let state = SIGNALS.get_or_init(|| {
+            use signal_hook::{consts::signal::*, flag};
+            let state = SignalState {
+                idle: Arc::new(AtomicBool::new(true)),
+                cancelled: Arc::new(AtomicBool::new(false)),
+            };
+            // raw化より前に全登録を完了する。途中失敗時もidleの既定動作を残す。
+            for signal in [SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGTSTP] {
+                flag::register_conditional_default(signal, Arc::clone(&state.idle))
+                    .map_err(|_| SecretInputError::SignalSetupFailed)?;
+                flag::register(signal, Arc::clone(&state.cancelled))
+                    .map_err(|_| SecretInputError::SignalSetupFailed)?;
+            }
+            Ok(state)
+        });
+        match state {
+            Ok(state) => Ok(Self(state)),
+            Err(e) => Err(*e),
+        }
+    }
+    pub fn check_cancelled(&self) -> Result<()> {
+        if self.0.cancelled.load(Ordering::SeqCst) {
+            Err(SecretInputError::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+    fn begin(self) -> Result<SignalInput> {
+        self.check_cancelled()?;
+        self.0.idle.store(false, Ordering::SeqCst);
+        Ok(SignalInput(self))
+    }
+}
+struct SignalInput(TerminalSignals);
+impl Drop for SignalInput {
+    fn drop(&mut self) {
+        self.0.0.idle.store(true, Ordering::SeqCst);
+    }
+}
+
 /// stdin/環境変数/CLI引数から代替入力せず、同一プロセスの端末操作を直列化する。
-/// SIGKILL等のプロセス外からの終了ではDropを保証できない。
+/// open_interruptibleだけが明示登録済みの外部シグナル取消しを利用する。
+/// SIGKILL/SIGSTOP・致命的障害・端末消失等では復元を保証できない。
 pub struct SecretTerminal {
     tty: File,
     _lock: MutexGuard<'static, ()>,
+    signals: Option<TerminalSignals>,
 }
 impl SecretTerminal {
     pub fn open() -> Result<Self> {
+        Self::open_with(None)
+    }
+    pub fn open_interruptible(signals: TerminalSignals) -> Result<Self> {
+        signals.check_cancelled()?;
+        Self::open_with(Some(signals))
+    }
+    fn open_with(signals: Option<TerminalSignals>) -> Result<Self> {
         let lock = TERMINAL.try_lock().map_err(|_| SecretInputError::Busy)?;
         let fd = fs::openat(
             CWD,
             "/dev/tty",
-            OFlags::RDWR | OFlags::NOFOLLOW | OFlags::NOCTTY | OFlags::CLOEXEC,
+            OFlags::RDWR
+                | OFlags::NOFOLLOW
+                | OFlags::NOCTTY
+                | OFlags::CLOEXEC
+                | if signals.is_some() {
+                    OFlags::NONBLOCK
+                } else {
+                    OFlags::empty()
+                },
             Mode::empty(),
         )
         .map_err(|_| SecretInputError::NoTerminal)?;
         let tty = File::from(fd);
         termios::tcgetattr(&tty).map_err(|_| SecretInputError::NoTerminal)?;
         foreground(&tty)?;
-        Ok(Self { tty, _lock: lock })
+        Ok(Self {
+            tty,
+            _lock: lock,
+            signals,
+        })
     }
     pub fn current_passphrase(&mut self) -> Result<Passphrase> {
         self.read("現在のパスフレーズ: ")
@@ -79,13 +160,22 @@ impl SecretTerminal {
         Ok(first)
     }
     fn read(&mut self, prompt: &'static str) -> Result<Passphrase> {
+        // Drop順により、復元の最善再試行まで入力中のシグナル処理を保持する。
+        let signal_input = self.signals.map(TerminalSignals::begin).transpose()?;
         let mut guard = RawTerminal::enter(&self.tty)?;
         let result = (|| {
             let mut tty = &self.tty;
             tty.write_all(prompt.as_bytes())
                 .and_then(|()| tty.flush())
                 .map_err(|_| SecretInputError::Io)?;
-            let result = read_line(&mut tty);
+            let result = if let Some(signals) = self.signals {
+                read_line(&mut InterruptibleReader {
+                    tty: &self.tty,
+                    signals,
+                })
+            } else {
+                read_line(&mut tty)
+            };
             tty.write_all(b"\r\n")
                 .and_then(|()| tty.flush())
                 .map_err(|_| SecretInputError::Io)?;
@@ -93,7 +183,46 @@ impl SecretTerminal {
         })();
         // 復元と残存入力破棄の成功を確認するまでは秘密を呼出し元へ返さない。
         guard.restore()?;
+        drop(signal_input);
+        if let Some(signals) = self.signals {
+            signals.check_cancelled()?;
+        }
         result.map(Passphrase)
+    }
+}
+struct InterruptibleReader<'a> {
+    tty: &'a File,
+    signals: TerminalSignals,
+}
+impl Read for InterruptibleReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        use rustix::event::{self, PollFd, PollFlags};
+        loop {
+            if self.signals.check_cancelled().is_err() {
+                return Err(std::io::Error::other("secret_input_cancelled"));
+            }
+            let mut fds = [PollFd::new(self.tty, PollFlags::IN)];
+            match event::poll(&mut fds, 100) {
+                Ok(0) | Err(rustix::io::Errno::INTR) => continue,
+                Err(_) => return Err(std::io::Error::other("secret_terminal_poll_failed")),
+                Ok(_) => {}
+            }
+            // pollとreadの間の通知も確認。NONBLOCKで他者が入力を消費しても待ち込まない。
+            if self.signals.check_cancelled().is_err() {
+                continue;
+            }
+            match self.tty.read(buf) {
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    continue;
+                }
+                result => return result,
+            }
+        }
     }
 }
 fn foreground(tty: &File) -> Result<()> {
