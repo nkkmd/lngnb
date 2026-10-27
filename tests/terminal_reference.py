@@ -35,6 +35,7 @@ CASES = {
     "signal-empty": [],
     "interruptible-unicode": [" public e\u0301 é あ \n".encode()],
     "interruptible-confirm": [b"public confirmation test\n", b"public confirmation test\n"],
+    "interruptible-hangup": [],
 }
 
 def run_case(case, payloads):
@@ -91,7 +92,7 @@ def run_case(case, payloads):
     try:
         if case != "background":
             wait_prompt(1)
-        if case == "hangup":
+        if case in ("hangup", "interruptible-hangup"):
             os.close(master)
             master = None
         else:
@@ -110,9 +111,12 @@ def run_case(case, payloads):
         out, err = child.communicate(timeout=15)
         if case in ("signal-idle", "signal-idle-after"):
             assert child.returncode == -signal.SIGTERM, "idle signal default lost: " + case
+        elif case == "interruptible-hangup" and child.returncode == -signal.SIGHUP:
+            # 端末消失時は復元不能。通知の時機によるHUP終了も成功入力とは扱わない。
+            assert b"TERMINAL_CHECK_OK" not in out, "hangup falsely completed input"
         else:
-            assert child.returncode == 0 and b"TERMINAL_CHECK_OK" in out, "PTY result: " + case
-        if case != "hangup":
+            assert child.returncode == 0 and b"TERMINAL_CHECK_OK" in out, "PTY result: " + case + " exit=" + str(child.returncode)
+        if case not in ("hangup", "interruptible-hangup"):
             assert termios.tcgetattr(slave) == before, "TTY settings not restored: " + case
             while select.select([master], [], [], 0)[0]:
                 captured.extend(os.read(master, 4096))
@@ -144,4 +148,4 @@ for mode in ("no-terminal", "signal-no-terminal"):
                             env=dict(os.environ, LNGNB_PUBLIC_TERMINAL_CASE=mode))
     assert no_tty.returncode == 0 and b"TERMINAL_CHECK_OK" in no_tty.stdout
     assert b"public stdin must not be used" not in no_tty.stdout + no_tty.stderr
-print("PTY_CASES_OK=25")
+print("PTY_CASES_OK=26")

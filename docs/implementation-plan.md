@@ -846,7 +846,7 @@ TerminalSignalsは実行ファイル起動時、他のhandler/workerを導入す
 
 直接依存[signal-hook 0.3.18](https://docs.rs/signal-hook/0.3.18/signal_hook/)（MIT/Apache-2.0、既定feature無効）と推移依存signal-hook-registry 1.4.8（MIT OR Apache-2.0）をCargo.lockで固定し、既存rustix 0.38.44のevent機能を有効化した。登録解除だけでは元の動作へ戻らないという上流の注意を確認し、解除方式を採用しない。製品のunsafeコードや独自のsignal handler本体は追加しない。既存依存版・一次Record・署名対象・鍵file・DB/schema・手動待ちは無変更。
 
-既存Rust結合1件内の独立Python検査を13条件から25条件へ拡張する。追加12条件は5種signalの途中入力、未入力TERM、確認入力中TERM、入力前/後のTERM既定終了、通知なしのUnicode/確認入力、通知対応APIの制御端末なし拒否。全termios復元・入力残存なし・秘密非出力と、取消しの保持を照合する。§5.30のflush失敗1条件も継続し、Rust通常件数は314件のまま増算しない。専用ext4 ignored2件は既存保存基盤の回帰として別確認する。最終headのfmt/clippy/全suite/release/既存CLI、レビュー/CI、統合後tree/CIの実結果は対応PRに記録する。
+既存Rust結合1件内の独立Python検査を13条件から26条件へ拡張する。追加13条件は5種signalの途中入力、未入力TERM、確認入力中TERM、入力前/後のTERM既定終了、通知なしのUnicode/確認入力、通知対応APIの制御端末なし拒否、通知対応APIでの端末切断/復元失敗。切断ではRestoreFailedの返却またはHUPによるプロセス終了を区別し、秘密入力の成功・秘密出力を認めない。最初にRestoreFailedの返却だけを期待した試験は実測HUP終了で失敗したため、保証外の端末消失でもエラー返却が必ずできるという期待を修正した。元の失敗と最終検証はPRへ記録する。全termios復元・入力残存なし・秘密非出力と、取消しの保持を照合する。§5.30のflush失敗1条件も継続し、Rust通常件数は314件のまま増算しない。専用ext4 ignored2件は既存保存基盤の回帰として別確認する。最終headのfmt/clippy/全suite/release/既存CLI、レビュー/CI、統合後tree/CIの実結果は対応PRに記録する。
 
 工程⑤は継続中。鍵保全/更新失敗確認と復旧案内を含む鍵CLI、資料作成/改訂/派生、管理CLI/UID認証IPCと既存保存/起動/明示再開の結合は未完了。工程⑤完了・G1〜G5全体・実デバイス/電源断相当・正式性能・初期版完成とは判定しない。
 

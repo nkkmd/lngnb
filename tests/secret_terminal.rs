@@ -38,14 +38,18 @@ fn controlling_terminal_input_is_private_and_restored() {
         };
         assert!(matches!(TerminalSignals::install(), Err(E::Busy)));
         if mode.starts_with("interruptible-") {
-            if mode == "interruptible-confirm" {
+            if mode == "interruptible-hangup" {
+                error(terminal.current_passphrase(), E::RestoreFailed);
+            } else if mode == "interruptible-confirm" {
                 assert!(terminal.new_passphrase().unwrap().as_str() == "public confirmation test");
             } else {
                 assert!(
                     terminal.current_passphrase().unwrap().as_str() == " public e\u{301} é あ "
                 );
             }
-            assert_eq!(signals.unwrap().check_cancelled(), Ok(()));
+            if mode != "interruptible-hangup" {
+                assert_eq!(signals.unwrap().check_cancelled(), Ok(()));
+            }
             println!("TERMINAL_CHECK_OK");
             return;
         }
@@ -124,6 +128,6 @@ fn controlling_terminal_input_is_private_and_restored() {
     );
     assert_eq!(
         String::from_utf8(output.stdout).unwrap().trim(),
-        "PTY_CASES_OK=25"
+        "PTY_CASES_OK=26"
     );
 }
