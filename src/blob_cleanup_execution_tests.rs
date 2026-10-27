@@ -947,9 +947,28 @@ fn split_reevaluation_after_cleanup_and_reupload_updates_descendants_and_keeps_e
     assert_eq!(count(&w.store, "known_invalid"), 1);
     // 再投稿・古い整理予定の再利用では既知不正や根拠を消さない。
     w.insert(&root).unwrap();
+    // setupは待機せず未来のexpires_atで整理している。実時計へ戻すと、
+    // 高速な環境では正当な時刻逆行拒否になるため、同じfixture時刻を使う。
+    let generation = w.store.generation().unwrap();
     assert!(matches!(
-        w.plan_blob_cleanup(p.blob_id, CleanupBudget::default())
-            .unwrap(),
+        w.plan_at(
+            p.blob_id,
+            CleanupBudget::default(),
+            p.planned_at - 1,
+            |_, _| Ok(())
+        ),
+        Err(StorageError::BudgetExceeded)
+    ));
+    assert_eq!(w.store.generation().unwrap(), generation);
+    assert_eq!(count(&w.store, "known_invalid"), 1);
+    assert!(matches!(
+        w.plan_at(
+            p.blob_id,
+            CleanupBudget::default(),
+            p.planned_at,
+            |_, _| Ok(())
+        )
+        .unwrap(),
         CleanupDecision::Protected
     ));
     assert_eq!(count(&w.store, "known_invalid"), 1);
