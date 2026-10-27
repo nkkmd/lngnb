@@ -111,9 +111,13 @@ def run_case(case, payloads):
         out, err = child.communicate(timeout=15)
         if case in ("signal-idle", "signal-idle-after"):
             assert child.returncode == -signal.SIGTERM, "idle signal default lost: " + case
-        elif case == "interruptible-hangup" and child.returncode == -signal.SIGHUP:
-            # 端末消失時は復元不能。通知の時機によるHUP終了も成功入力とは扱わない。
+        elif case == "interruptible-hangup":
+            # RestoreFailed確認後でもDrop/終了前にHUPを受け得る。秘密入力成功とは別のmarker。
             assert b"TERMINAL_CHECK_OK" not in out, "hangup falsely completed input"
+            if child.returncode == 0:
+                assert b"TERMINAL_HANGUP_RESTORE_FAILED" in out, "hangup missing RestoreFailed assertion"
+            else:
+                assert child.returncode == -signal.SIGHUP, "unexpected hangup exit=" + str(child.returncode)
         else:
             assert child.returncode == 0 and b"TERMINAL_CHECK_OK" in out, "PTY result: " + case + " exit=" + str(child.returncode)
         if case not in ("hangup", "interruptible-hangup"):

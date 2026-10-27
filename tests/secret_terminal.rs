@@ -40,6 +40,8 @@ fn controlling_terminal_input_is_private_and_restored() {
         if mode.starts_with("interruptible-") {
             if mode == "interruptible-hangup" {
                 error(terminal.current_passphrase(), E::RestoreFailed);
+                println!("TERMINAL_HANGUP_RESTORE_FAILED");
+                return;
             } else if mode == "interruptible-confirm" {
                 assert!(terminal.new_passphrase().unwrap().as_str() == "public confirmation test");
             } else {

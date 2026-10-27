@@ -25,6 +25,10 @@ pub enum KeyFileError {
     RecoveryChanged,
     /// 保全先の永続化確認済みだが、最後の保全元照合等が未完了/不一致。
     PreservationReviewRequired,
+    /// 復元先の永続化確認済みだが、残存元の最終照合等が未完了/不一致。
+    RestorationReviewRequired,
+    /// 呼出し元が明示した公開鍵と認証復号した鍵が一致しない。
+    UnexpectedPublicKey,
     /// 交換/配置済みだがdirectory fsync成功を確認できない。成功/rollbackを断定しない。
     CommitUncertain,
     /// 新鍵の永続化確認済み。旧暗号文の整理だけが未完了/不確実。
@@ -48,6 +52,8 @@ impl std::fmt::Display for KeyFileError {
             Self::ScanLimit => "key_directory_scan_limit",
             Self::RecoveryChanged => "key_recovery_input_changed",
             Self::PreservationReviewRequired => "key_preservation_committed_review_required",
+            Self::RestorationReviewRequired => "key_restoration_committed_review_required",
+            Self::UnexpectedPublicKey => "key_unexpected_public_key",
             Self::CommitUncertain => "key_commit_uncertain",
             Self::CleanupUncertain => "key_committed_cleanup_uncertain",
             Self::Key(e) => return e.fmt(f),
@@ -145,6 +151,12 @@ enum Stage {
     DirectorySynced,
     BeforeCleanup,
     Removed,
+}
+// 復元は既存targetとの交換を許さず、配置直前に同じ領域の残存元を再照合する。
+enum InstallInput<'a> {
+    New,
+    Replace(&'a [u8]),
+    Recovery { name: &'a str, bytes: &'a [u8] },
 }
 impl KeyDirectory {
     pub fn open(path: &Path) -> Result<Self> {
@@ -335,6 +347,71 @@ impl KeyDirectory {
         }
         Ok(public)
     }
+    /// 選択した残存暗号文を、同じ領域の存在しない通常名へ明示復元する。
+    /// 認証した公開鍵と呼出し元が別途指定した期待公開鍵の一致を必須とする。
+    /// 元名/新旧/過去の更新結果は推測しない。全残存物を保持し、PendingRecoveryも解除しない。
+    /// CLIへの接続・既存鍵の置換・残存物の整理はこのAPIの範囲外。
+    pub fn restore_recovery_file(
+        &mut self,
+        residue: &str,
+        passphrase: &str,
+        target: &str,
+        expected_public_key: &[u8; 32],
+    ) -> Result<[u8; 32]> {
+        self.restore_recovery_file_with(
+            residue,
+            passphrase,
+            target,
+            expected_public_key,
+            &mut |_| Ok(()),
+        )
+    }
+    fn restore_recovery_file_with(
+        &mut self,
+        residue: &str,
+        passphrase: &str,
+        target: &str,
+        expected_public_key: &[u8; 32],
+        hook: &mut impl FnMut(Stage) -> Result<()>,
+    ) -> Result<[u8; 32]> {
+        if !recovery_name(residue) {
+            return Err(KeyFileError::UnsafePath);
+        }
+        name(target)?;
+        self.secure()?;
+        match fs::statat(&self.dir, target, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(_) => return Err(KeyFileError::Exists),
+            Err(rustix::io::Errno::NOENT) => (),
+            Err(_) => return Err(KeyFileError::Io),
+        }
+        let input = self.read(residue)?;
+        let public = unlock(&input, passphrase)?.public_key();
+        if &public != expected_public_key {
+            return Err(KeyFileError::UnexpectedPublicKey);
+        }
+        let restored = self
+            .install_input(
+                target,
+                &input,
+                passphrase,
+                InstallInput::Recovery {
+                    name: residue,
+                    bytes: &input,
+                },
+                hook,
+            )
+            .map_err(|e| {
+                if e == KeyFileError::CleanupUncertain {
+                    KeyFileError::RestorationReviewRequired
+                } else {
+                    e
+                }
+            })?;
+        if restored != public || self.read(residue).ok().as_deref() != Some(input.as_slice()) {
+            return Err(KeyFileError::RestorationReviewRequired);
+        }
+        Ok(public)
+    }
     fn pending(&self) -> Result<()> {
         self.secure()?;
         // /proc経路はNOFOLLOWで開いたdirectory fdへ固定し、利用者パスを再解決しない。
@@ -400,6 +477,25 @@ impl KeyDirectory {
         original: Option<&[u8]>,
         hook: &mut impl FnMut(Stage) -> Result<()>,
     ) -> Result<[u8; 32]> {
+        self.install_input(
+            n,
+            encrypted,
+            p,
+            match original {
+                Some(bytes) => InstallInput::Replace(bytes),
+                None => InstallInput::New,
+            },
+            hook,
+        )
+    }
+    fn install_input(
+        &mut self,
+        n: &str,
+        encrypted: &[u8],
+        p: &str,
+        input: InstallInput<'_>,
+        hook: &mut impl FnMut(Stage) -> Result<()>,
+    ) -> Result<[u8; 32]> {
         let mut random = [0; 32];
         super::random(&mut random)?;
         let temp = format!("{PREFIX}{}", data_encoding::HEXLOWER.encode(&random));
@@ -425,12 +521,17 @@ impl KeyDirectory {
         hook(Stage::Validated)?;
         hook(Stage::BeforeInstall)?;
         self.secure()?;
-        if let Some(old) = original {
+        if let InstallInput::Recovery { name, bytes } = input {
+            if self.read(name).map_err(|_| KeyFileError::RecoveryChanged)? != bytes {
+                return Err(KeyFileError::RecoveryChanged);
+            }
+        }
+        if let InstallInput::Replace(old) = input {
             if self.read(n)? != old {
                 return Err(KeyFileError::UnsafePath);
             }
         }
-        let flag = if original.is_some() {
+        let flag = if matches!(input, InstallInput::Replace(_)) {
             RenameFlags::EXCHANGE
         } else {
             RenameFlags::NOREPLACE
@@ -449,7 +550,7 @@ impl KeyDirectory {
         }
         io(self.dir.sync_all()).map_err(|_| KeyFileError::CommitUncertain)?;
         hook(Stage::DirectorySynced).map_err(|_| KeyFileError::CleanupUncertain)?;
-        if let Some(old) = original {
+        if let InstallInput::Replace(old) = input {
             hook(Stage::BeforeCleanup).map_err(|_| KeyFileError::CleanupUncertain)?;
             if self
                 .read(&temp)
