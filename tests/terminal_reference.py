@@ -22,6 +22,7 @@ CASES = {
     "invalid-utf8": [b"\xff\n"],
     "overflow": [b"x" * 1025 + b"\npublic leftover input\n"],
     "hangup": [],
+    "background": [],
 }
 
 def run_case(case, payloads):
@@ -35,6 +36,19 @@ def run_case(case, payloads):
     def controlling_terminal():
         os.setsid()
         fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+        if case == "background":
+            import signal
+            helper = os.fork()
+            if helper == 0:
+                os.setpgid(0, 0)
+                os.kill(os.getpid(), signal.SIGSTOP)
+                os._exit(0)
+            try:
+                os.waitpid(helper, os.WUNTRACED)
+                os.tcsetpgrp(slave, helper)
+            finally:
+                os.kill(helper, signal.SIGKILL)
+                os.waitpid(helper, 0)
         # hangupをread/restoreのI/Oエラーとして観測する（通常終了の保証にしない）。
         if case == "hangup":
             import signal
@@ -60,7 +74,8 @@ def run_case(case, payloads):
         assert not attrs[3] & (termios.ECHO | termios.ECHONL | termios.ICANON | termios.ISIG), case
 
     try:
-        wait_prompt(1)
+        if case != "background":
+            wait_prompt(1)
         if case == "hangup":
             os.close(master)
             master = None
@@ -98,4 +113,4 @@ no_tty = subprocess.run([BINARY, "--exact", FILTER, "--nocapture"],
                         env=dict(os.environ, LNGNB_PUBLIC_TERMINAL_CASE="no-terminal"))
 assert no_tty.returncode == 0 and b"TERMINAL_CHECK_OK" in no_tty.stdout
 assert b"public stdin must not be used" not in no_tty.stdout + no_tty.stderr
-print("PTY_CASES_OK=12")
+print("PTY_CASES_OK=13")

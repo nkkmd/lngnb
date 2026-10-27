@@ -17,6 +17,11 @@ fn controlling_terminal_input_is_private_and_restored() {
             println!("TERMINAL_CHECK_OK");
             return;
         }
+        if mode == "background" {
+            assert!(matches!(SecretTerminal::open(), Err(E::NotForeground)));
+            println!("TERMINAL_CHECK_OK");
+            return;
+        }
         let mut terminal = SecretTerminal::open().unwrap();
         assert!(matches!(SecretTerminal::open(), Err(E::Busy)));
         match mode.as_str() {
@@ -57,6 +62,6 @@ fn controlling_terminal_input_is_private_and_restored() {
     );
     assert_eq!(
         String::from_utf8(output.stdout).unwrap().trim(),
-        "PTY_CASES_OK=12"
+        "PTY_CASES_OK=13"
     );
 }

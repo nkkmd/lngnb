@@ -815,12 +815,12 @@ main `b7e809891bb5e9979d87fe6a07f304197d8f62e5`、未統合PRなし、ローカ�
 
 | 対応 | 実装・対象試験 | 境界 |
 |---|---|---|
-| R34、A11 | `/dev/tty`をNOFOLLOW/CLOEXEC/NOCTTYで開き、制御端末がなければ拒否。stdin・CLI引数・環境変数を代替入力にしない。同一プロセス内は非待機Mutexと可変借用で直列化 | 他プロセスとの端末共有・設定変更への排他保証はない。プロンプトは固定値で、入力をstdout/stderrへ返さない |
+| R34、A11 | `/dev/tty`をNOFOLLOW/CLOEXEC/NOCTTYで開き、制御端末がなければ拒否。open時と各入力開始前に前面process groupとの一致を確認し、背景実行では端末設定を変える前に拒否。stdin・CLI引数・環境変数を代替入力にしない。同一プロセス内は非待機Mutexと可変借用で直列化 | 他プロセスとの端末共有・設定変更への排他保証はない。プロンプトは固定値で、入力をstdout/stderrへ返さない |
 | R34、A11 | raw入力でECHO/ECHONL/ICANON/ISIGが無効になったことを読戻し確認してからプロンプトを出す。非空UTF-8・1,024 bytesまで。確定用CR/LFは含めず、空白・Unicodeを正規化しない。Backspaceは一Unicode scalar分、Ctrl-Uは全入力を消去する | 一行の端末入力。Ctrl-C/D/Z、Ctrl＋バックスラッシュは入力bytesとして中断する。貼付け余剰・超過入力と前のtypeaheadは破棄し、次プロンプト/シェルへ流用しない |
 | R34、A11 | 新規パスフレーズは二度入力して一致を要求。不一致・不正UTF-8・上限超過・EOF/I/Oエラーでは返さない。入力Vecは最大長を先行確保し、編集削除部分も消去。返却PassphraseはZeroizing所有でDebug/Display/Clone/Derefを提供しない | 呼出し元が明示的にas_strから作るコピーやOS全体の秘密消去までは保証しない。鍵のファイル生成・更新をこの入力成功だけで実行しない |
 | R34の復元 | 入力の残りをflushし、元のtermiosを設定・読戻し照合してから秘密を返す。通常中断/入力エラーでも復元し、失敗はRestoreFailedとして秘密を返さない。Dropも復元を最善で再試行する | SIGKILL・外部signal等でDropを実行できない終了や端末自体の消失では復元を保証できない。外部終了の扱いと`stty sane`等の復旧案内は製品CLI接続時に整える。正常中断との混同を避ける |
 
-追加はRust単体2件・PTY結合1件で、通常対象313件（既存310件＋3件）。PTYの12条件は一つの結合試験の内訳であり12件を別加算しない。Python標準のpty/termios/fcntlで新規sessionへ制御端末を割当て、stdinはDEVNULLのまま製品APIを呼ぶ。通常/Unicode・編集・1,024 byte一致・二度入力・不一致・Ctrl-C/D・空・不正UTF-8・超過・切断を確認し、別の制御端末なしsessionではstdin値を利用しない。ECHO/ECHONLを元からONにした端末で非表示を確認し、通常/中断/入力エラーではPythonが全termiosと未処理入力なしを照合する。12条件は11 PTY条件と制御端末なし1条件である。
+追加はRust単体2件・PTY結合1件で、通常対象313件（既存310件＋3件）。PTYの13条件は一つの結合試験の内訳であり13件を別加算しない。Python標準のpty/termios/fcntlで新規sessionへ制御端末を割当て、stdinはDEVNULLのまま製品APIを呼ぶ。通常/Unicode・編集・1,024 byte一致・二度入力・不一致・Ctrl-C/D・空・不正UTF-8・超過・切断を確認し、別の制御端末なしsessionではstdin値を利用しない。ECHO/ECHONLを元からONにした端末で非表示を確認し、通常/中断/入力エラーではPythonが全termiosと未処理入力なしを照合する。13条件は12 PTY条件（背景実行の拒否を含む）と制御端末なし1条件である。
 
 切断条件では試験子だけSIGHUPを無視してread/復元の実I/Oエラーを観測し、RestoreFailedと秘密非出力を確認する。一般の端末切断で正常終了する保証ではない。すべて公開試験入力を使い、実運用パスフレーズや鍵を試験・ログへ含めない。専用ext4 ignored2件は既存保存基盤の回帰として別に実行し、端末機能の試験数や新たな耐久性保証へ加算しない。
 

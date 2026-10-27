@@ -14,6 +14,7 @@ static TERMINAL: Mutex<()> = Mutex::new(());
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecretInputError {
     NoTerminal,
+    NotForeground,
     Busy,
     Io,
     Cancelled,
@@ -25,6 +26,7 @@ impl std::fmt::Display for SecretInputError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::NoTerminal => "secret_input_requires_controlling_terminal",
+            Self::NotForeground => "secret_input_requires_foreground_terminal",
             Self::Busy => "secret_terminal_busy",
             Self::Io => "secret_terminal_io_failed",
             Self::Cancelled => "secret_input_cancelled",
@@ -62,6 +64,7 @@ impl SecretTerminal {
         .map_err(|_| SecretInputError::NoTerminal)?;
         let tty = File::from(fd);
         termios::tcgetattr(&tty).map_err(|_| SecretInputError::NoTerminal)?;
+        foreground(&tty)?;
         Ok(Self { tty, _lock: lock })
     }
     pub fn current_passphrase(&mut self) -> Result<Passphrase> {
@@ -93,6 +96,13 @@ impl SecretTerminal {
         result.map(Passphrase)
     }
 }
+fn foreground(tty: &File) -> Result<()> {
+    let group = termios::tcgetpgrp(tty).map_err(|_| SecretInputError::NoTerminal)?;
+    if group != rustix::process::getpgrp() {
+        return Err(SecretInputError::NotForeground);
+    }
+    Ok(())
+}
 struct RawTerminal<'a> {
     tty: &'a File,
     original: Termios,
@@ -100,6 +110,7 @@ struct RawTerminal<'a> {
 }
 impl<'a> RawTerminal<'a> {
     fn enter(tty: &'a File) -> Result<Self> {
+        foreground(tty)?;
         let original = termios::tcgetattr(tty).map_err(|_| SecretInputError::Io)?;
         let mut raw = original.clone();
         raw.make_raw();
