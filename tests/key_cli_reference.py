@@ -193,6 +193,41 @@ with tempfile.TemporaryDirectory(prefix="lngnb-cli-public-test-") as root:
     assert not (backup_dir / "blocked").exists()
     assert recovery.read_bytes() == original and path.read_bytes() == updated
     assert b"pending_recovery: true" in recovery_status().stdout
+    # 元領域は保持したまま、別領域で保全済み鍵の通常操作へ進む。
+    working = Path(root) / "working"
+    working.mkdir(mode=0o700)
+    source_entries = set(directory.iterdir())
+    invoke(directory, "preserve-residue", [OLD], residue=recovery.name, backup=(working, "publisher"))
+    working_key = working / "publisher"
+    assert working_key.read_bytes() == original
+    out, _ = invoke(working, "check", [OLD])
+    assert ident in out  # 実手順では控え等の期待IDと利用者が照合する。
+    invoke(working, "change-passphrase", [NEW], 1)
+    invoke(working, "change-passphrase", [OLD], 130, cancel=signal.SIGTERM)
+    assert working_key.read_bytes() == original and set(working.iterdir()) == {working_key}
+    out, _ = invoke(working, "change-passphrase", [OLD, NEW, NEW])
+    working_seed, working_header, working_ident = decode_key(working_key, NEW)
+    assert working_seed == seed and working_ident == ident and ident in out
+    assert working_header["kdf"]["salt"] != first["kdf"]["salt"]
+    assert working_header["cipher"]["nonce"] != first["cipher"]["nonce"]
+    assert working_key.stat().st_mode & 0o7777 == 0o600
+    invoke(working, "check", [OLD], 1)
+    out, _ = invoke(working, "check", [NEW])
+    assert ident in out
+    assert set(directory.iterdir()) == source_entries
+    assert recovery.read_bytes() == original and path.read_bytes() == updated
+    assert residue.read_bytes() == b"public residue fixture" and incomplete.read_bytes() == b"public incomplete keyfile"
+    assert unsafe_residue.is_symlink() and b"pending_recovery: true" in recovery_status().stdout
+    invoke(directory, "change-passphrase", [NEW, OLD, OLD], 1)
+    # 新しいパスフレーズは元の残存暗号文を失効させない。
+    out, _ = invoke(directory, "check-residue", [OLD], residue=recovery.name)
+    assert ident in out
+    pending_work = working / ".lngnb-key-public-pending"
+    pending_work.write_bytes(b"public working recovery fixture")
+    os.chmod(pending_work, 0o600)
+    working_updated = working_key.read_bytes()
+    invoke(working, "change-passphrase", [NEW, OLD, OLD], 1)
+    assert working_key.read_bytes() == working_updated
     # 残存元/復元先/期待鍵IDを明示し、全残存物を維持したまま空き名へ復元する。
     entries_before = set(directory.iterdir())
     wrong_ident = b"ky1_" + base64.b32encode(hashlib.sha256(b"public wrong key identity").digest()).lower().rstrip(b"=")
