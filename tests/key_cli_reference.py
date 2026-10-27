@@ -39,7 +39,7 @@ def decode_key(path, password):
     ident = b"ky1_" + base64.b32encode(hashlib.sha256(b"lngnb:key:ed25519:1\x00" + public).digest()).lower().rstrip(b"=")
     return seed, obj, ident
 
-def invoke(directory, action, payloads, expected=0, cancel=None, closed_output=False, residue=None, backup=None):
+def invoke(directory, action, payloads, expected=0, cancel=None, closed_output=False, residue=None, backup=None, restoration=None):
     master, slave = pty.openpty()
     before = termios.tcgetattr(slave)
     before[3] |= termios.ECHO | termios.ECHONL | termios.ICANON | termios.ISIG
@@ -52,6 +52,8 @@ def invoke(directory, action, payloads, expected=0, cancel=None, closed_output=F
     selection = ["--residue", residue] if residue is not None else ["--name", "publisher"]
     if backup is not None:
         selection += ["--backup-dir", str(backup[0]), "--backup-name", backup[1]]
+    if restoration is not None:
+        selection += ["--restore-name", restoration[0], "--expect-key-id", restoration[1]]
     child = subprocess.Popen([BINARY, "key", action, "--key-dir", str(directory)] + selection,
                              stdin=subprocess.DEVNULL, stdout=sink, stderr=subprocess.PIPE,
                              pass_fds=(slave,), preexec_fn=setup)
@@ -191,6 +193,41 @@ with tempfile.TemporaryDirectory(prefix="lngnb-cli-public-test-") as root:
     assert not (backup_dir / "blocked").exists()
     assert recovery.read_bytes() == original and path.read_bytes() == updated
     assert b"pending_recovery: true" in recovery_status().stdout
+    # 残存元/復元先/期待鍵IDを明示し、全残存物を維持したまま空き名へ復元する。
+    entries_before = set(directory.iterdir())
+    wrong_ident = b"ky1_" + base64.b32encode(hashlib.sha256(b"public wrong key identity").digest()).lower().rstrip(b"=")
+    invoke(directory, "restore-residue", [OLD], 1, residue=recovery.name, restoration=("restored", wrong_ident.decode()))
+    invoke(directory, "restore-residue", [NEW], 1, residue=recovery.name, restoration=("restored", ident.decode()))
+    for sig in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM, signal.SIGTSTP):
+        invoke(directory, "restore-residue", [], 130, cancel=sig, residue=recovery.name, restoration=("restored", ident.decode()))
+    for source in (unsafe_residue, incomplete):
+        invoke(directory, "restore-residue", [OLD], 1, residue=source.name, restoration=("restored", ident.decode()))
+    assert set(directory.iterdir()) == entries_before
+    out, _ = invoke(directory, "restore-residue", [OLD], residue=recovery.name, restoration=("restored", ident.decode()))
+    restored = directory / "restored"
+    assert ident in out and "変更停止も解除していません".encode() in out
+    assert restored.read_bytes() == original and restored.stat().st_mode & 0o7777 == 0o600
+    restored_seed, _, restored_ident = decode_key(restored, OLD)
+    assert restored_seed == seed and restored_ident == ident
+    # 別のパスフレーズを使う現在鍵や、既存通常名/危険linkを置換しない。
+    for target in ("restored", "publisher"):
+        invoke(directory, "restore-residue", [OLD], 1, residue=recovery.name, restoration=(target, ident.decode()))
+    dangling = directory / "dangling"
+    dangling.symlink_to("absent")
+    invoke(directory, "restore-residue", [OLD], 1, residue=recovery.name, restoration=("dangling", ident.decode()))
+    assert dangling.is_symlink()
+    _, err = invoke(directory, "restore-residue", [OLD], 1, closed_output=True, residue=recovery.name, restoration=("restored-output", ident.decode()))
+    assert "復元先への暗号文保存は完了".encode() in err
+    assert decode_key(directory / "restored-output", OLD)[0] == seed
+    no_tty_restore = subprocess.run([BINARY, "key", "restore-residue", "--key-dir", str(directory), "--residue", recovery.name,
+                                    "--restore-name", "no-terminal", "--expect-key-id", ident.decode()],
+                                   input=OLD + b"\n", capture_output=True, start_new_session=True, timeout=10)
+    assert no_tty_restore.returncode == 1 and not no_tty_restore.stdout and OLD not in no_tty_restore.stderr
+    assert not (directory / "no-terminal").exists()
+    assert recovery.read_bytes() == original and path.read_bytes() == updated
+    assert residue.read_bytes() == b"public residue fixture" and incomplete.read_bytes() == b"public incomplete keyfile"
+    assert unsafe_residue.is_symlink() and b"pending_recovery: true" in recovery_status().stdout
+    invoke(directory, "change-passphrase", [NEW, OLD, OLD], 1)
     recovery.unlink()  # 製品操作でなく、試験所有のfixtureだけを明示破棄。
     unsafe_residue.unlink()
     incomplete.unlink()
