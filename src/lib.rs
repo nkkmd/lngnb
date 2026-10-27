@@ -1,5 +1,7 @@
 //! 初期プロファイルの局所検査と開発中の保存・依存評価基盤。pin・公開の判定は未実装。
 pub mod authoring;
+#[cfg(target_os = "linux")]
+pub mod authoring_input;
 pub mod cbor;
 pub mod id;
 pub mod keyfile;

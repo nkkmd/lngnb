@@ -64,7 +64,7 @@ fn bytes(b: &[u8]) -> Value {
     Value::Bytes(b.to_vec())
 }
 
-const MAX_METADATA_BYTES: usize = 262_144;
+pub(crate) const MAX_METADATA_BYTES: usize = 262_144;
 // 符号化/文字列複製の前に、encoded sizeの下限を割当てなしで走査する。
 // 実際のCBOR長/重複key/規範は、後段の共通encoderとRecord検査で引き続き確認する。
 fn metadata_preflight(value: &Value, depth: usize, remaining: &mut usize) -> Result<()> {
