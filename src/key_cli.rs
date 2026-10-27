@@ -1,7 +1,7 @@
 //! R34/A11: 実行ファイル専用の鍵操作。DB/HTTP/IPCには接続しない。
 use super::AppError;
 use lngnb::{
-    id::key_id,
+    id::{Id, Kind, key_id},
     keyfile::{KeyDirectory, KeyFileError, KeyRecoveryInventory},
     secret_terminal::{SecretInputError, SecretTerminal, TerminalSignals},
 };
@@ -15,6 +15,7 @@ pub enum Action {
     RecoveryStatus,
     CheckResidue,
     PreserveResidue,
+    RestoreResidue,
 }
 #[derive(Debug, PartialEq, Eq)]
 pub struct Command {
@@ -22,6 +23,7 @@ pub struct Command {
     directory: PathBuf,
     name: Option<String>,
     backup: Option<(PathBuf, String)>,
+    restoration: Option<(String, Id)>,
 }
 
 fn regular_name(s: &str) -> bool {
@@ -46,18 +48,36 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
         Some("recovery-status") => Action::RecoveryStatus,
         Some("check-residue") => Action::CheckResidue,
         Some("preserve-residue") => Action::PreserveResidue,
+        Some("restore-residue") => Action::RestoreResidue,
         _ => return Err(usage()),
     };
     let mut directory = None;
     let mut name = None;
     let mut backup_dir = None;
     let mut backup_name = None;
+    let mut restore_name = None;
+    let mut expected_id = None;
     for pair in rest.chunks(2) {
         let [option, value] = pair else {
             return Err(usage());
         };
         if option == "--key-dir" && directory.is_none() && !value.is_empty() {
             directory = Some(PathBuf::from(value));
+        } else if option == "--restore-name"
+            && action == Action::RestoreResidue
+            && restore_name.is_none()
+        {
+            let s = value.to_str().ok_or_else(usage)?;
+            if !regular_name(s) {
+                return Err(usage());
+            }
+            restore_name = Some(s.to_owned());
+        } else if option == "--expect-key-id"
+            && action == Action::RestoreResidue
+            && expected_id.is_none()
+        {
+            expected_id =
+                Some(Id::parse(Kind::Key, value.to_str().ok_or_else(usage)?).map_err(|_| usage())?);
         } else if option == "--backup-dir"
             && action == Action::PreserveResidue
             && backup_dir.is_none()
@@ -74,10 +94,16 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
             }
             backup_name = Some(s.to_owned());
         } else if ((option == "--name"
-            && !matches!(action, Action::CheckResidue | Action::PreserveResidue)
+            && !matches!(
+                action,
+                Action::CheckResidue | Action::PreserveResidue | Action::RestoreResidue
+            )
             && action != Action::RecoveryStatus)
             || (option == "--residue"
-                && matches!(action, Action::CheckResidue | Action::PreserveResidue)))
+                && matches!(
+                    action,
+                    Action::CheckResidue | Action::PreserveResidue | Action::RestoreResidue
+                )))
             && name.is_none()
         {
             let s = value.to_str().ok_or_else(usage)?;
@@ -87,7 +113,10 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
                         .bytes()
                         .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
             });
-            if matches!(action, Action::CheckResidue | Action::PreserveResidue) {
+            if matches!(
+                action,
+                Action::CheckResidue | Action::PreserveResidue | Action::RestoreResidue
+            ) {
                 if !valid_residue {
                     return Err(usage());
                 }
@@ -114,6 +143,14 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
         } else {
             None
         },
+        restoration: if action == Action::RestoreResidue {
+            Some((
+                restore_name.ok_or_else(usage)?,
+                expected_id.ok_or_else(usage)?,
+            ))
+        } else {
+            None
+        },
         action,
     })
 }
@@ -124,6 +161,8 @@ pub enum Error {
     File(KeyFileError),
     Preserve(KeyFileError),
     PreservationOutput,
+    Restore(KeyFileError),
+    RestorationOutput,
     Output { changed: bool },
 }
 impl From<SecretInputError> for Error {
@@ -141,11 +180,14 @@ impl Error {
         match self {
             Self::Input(SecretInputError::Cancelled) => 130,
             Self::File(KeyFileError::CommitUncertain)
-            | Self::Preserve(KeyFileError::CommitUncertain) => 3,
+            | Self::Preserve(KeyFileError::CommitUncertain)
+            | Self::Restore(KeyFileError::CommitUncertain) => 3,
             Self::File(KeyFileError::CleanupUncertain)
             | Self::Preserve(KeyFileError::CleanupUncertain) => 4,
             Self::File(KeyFileError::PreservationReviewRequired)
             | Self::Preserve(KeyFileError::PreservationReviewRequired) => 5,
+            Self::File(KeyFileError::RestorationReviewRequired)
+            | Self::Restore(KeyFileError::RestorationReviewRequired) => 6,
             _ => 1,
         }
     }
@@ -165,9 +207,11 @@ impl fmt::Display for Error {
                 f.write_str(match e {
                     KeyFileError::CommitUncertain => "保存結果は未確定です。現在名と残存ファイルを保全し、再作成・再更新・削除をせず確認してください。成功や元鍵への復帰を断定できません。",
                     KeyFileError::CleanupUncertain => "新しい鍵ファイルの永続化は確認済みですが、旧暗号文の整理は未完了または不確実です。残存ファイルを保全し、旧パスフレーズが使えると仮定しないでください。",
-                    KeyFileError::PendingRecovery => "残存する回復用ファイルがあるため変更を停止しました。自動採用・削除はしません。現在名は key check で読込み確認できますが、過去の更新完了や残存ファイルの安全性は確認しません。明示復旧CLIは未実装です。",
+                    KeyFileError::PendingRecovery => "残存する回復用ファイルがあるため変更を停止しました。自動採用・削除はしません。現在名は key check で読込み確認できますが、過去の更新完了や残存ファイルの安全性は確認しません。指定残存物の非上書き復元は key restore-residue を使えますが、既存鍵の置換・残存物の整理は未実装です。",
                     KeyFileError::RecoveryChanged => "診断中の入力変化を検出しました。結果は確定せず、全ファイルを保全したまま再診断してください。",
                     KeyFileError::PreservationReviewRequired => "保全先の永続化は確認済みですが、保全元の最終照合等は未完了または不一致です。両領域の全ファイルを保持し、再実行・削除をせず確認してください。",
+                    KeyFileError::RestorationReviewRequired => "復元先の永続化は確認済みですが、残存元の最終照合等は未完了または不一致です。全残存物と復元先を保持し、再実行・削除をせず確認してください。",
+                    KeyFileError::UnexpectedPublicKey => "期待する鍵IDと一致しないため復元していません。残存物の選択と期待する鍵IDを確認してください。",
                     KeyFileError::Exists => "既存ファイルを上書きしていません。対象を確認してください。",
                     KeyFileError::UnsafePath => "所有者専用0700ディレクトリ・0600通常ファイルと安全な経路を確認してください。自動で権限変更しません。",
                     _ => "成功は確認できません。現在名と残存ファイルを保全し、変更を繰り返さず確認してください。",
@@ -178,6 +222,12 @@ impl fmt::Display for Error {
                 Self::File(*e).fmt(f)?;
                 f.write_str(" 保全元への書換え・削除は行っていません。保全先の未確定ファイルも保持し、元の更新結果や削除可否を推測しないでください。")
             }
+            Self::Restore(e) => {
+                f.write_str("残存鍵の復元処理: ")?;
+                Self::File(*e).fmt(f)?;
+                f.write_str(" 残存元への書換え・削除は行っていません。全残存物と復元先の未確定ファイルも保持してください。過去の更新結果・新旧・整理可否は確定せず、変更停止も解除しません。")
+            }
+            Self::RestorationOutput => f.write_str("復元先への暗号文保存は完了しましたが、結果出力に失敗しました。全残存物と復元先を保持し、再実行せず復元先を key check で確認してください。過去の更新確定・残存物の整理許可ではなく、変更停止も解除しません。"),
             Self::PreservationOutput => f.write_str("保全先への暗号文保存は完了しましたが、結果出力に失敗しました。保全元・保全先を保持し、再実行せず保全先を key check で確認してください。過去の更新確定や残存物の削除許可ではありません。"),
             Self::Output { changed: true } => f.write_str("鍵ファイル操作は完了しましたが、結果の出力に失敗しました。再実行せず key check で現在名を確認してください。"),
             Self::Output { changed: false } => f.write_str("案内または確認結果の出力に失敗しました。"),
@@ -238,6 +288,25 @@ pub fn run(command: Command, output: &mut impl Write) -> Result<(), Error> {
             signals.check_cancelled()?;
             directory.check_recovery_file(name, p.as_str())?
         }
+        Action::RestoreResidue => {
+            let (target, expected) = command
+                .restoration
+                .as_ref()
+                .ok_or(Error::Restore(KeyFileError::UnsafePath))?;
+            let p = terminal.recovery_passphrase()?;
+            signals.check_cancelled()?;
+            let public = directory
+                .check_recovery_file(name, p.as_str())
+                .map_err(Error::Restore)?;
+            if key_id(&public) != *expected {
+                return Err(Error::Restore(KeyFileError::UnexpectedPublicKey));
+            }
+            // 認証照合中の取消しも保存開始前に確認。APIが再認証/配置前照合を担う。
+            signals.check_cancelled()?;
+            directory
+                .restore_recovery_file(name, p.as_str(), target, &public)
+                .map_err(Error::Restore)?
+        }
         Action::RecoveryStatus => unreachable!("inventory returns before terminal input"),
         Action::PreserveResidue => unreachable!("preservation uses both directory locks above"),
     };
@@ -256,6 +325,9 @@ fn report(action: &Action, public: &[u8; 32], output: &mut impl Write) -> Result
         Action::CheckResidue => {
             "指定した残存暗号文を認証復号し公開鍵の一致を確認しました。元の対象名・新旧・更新確定・削除可否は未確認です。書換え・採用・削除は行っていません"
         }
+        Action::RestoreResidue => {
+            "指定した残存暗号文を期待する鍵IDと照合し、明示した空いている復元先名へ同じbytesを保存しました。全残存物を保持し、変更停止も解除していません。過去の更新確定・元名の推測・新旧判定・残存物の整理許可ではありません"
+        }
         Action::RecoveryStatus => unreachable!("inventory has a separate report"),
         Action::PreserveResidue => {
             "指定した残存暗号文を認証し、明示した保全先の新しい名前へ同じbytesを保存しました。保全元の現在名・残存物は書換え・削除していません。過去の更新確定・新旧判定・残存物の整理許可ではありません"
@@ -269,7 +341,9 @@ fn report(action: &Action, public: &[u8; 32], output: &mut impl Write) -> Result
         .write_all(text.as_bytes())
         .and_then(|()| output.flush())
         .map_err(|_| {
-            if *action == Action::PreserveResidue {
+            if *action == Action::RestoreResidue {
+                Error::RestorationOutput
+            } else if *action == Action::PreserveResidue {
                 Error::PreservationOutput
             } else {
                 Error::Output {
@@ -305,6 +379,139 @@ fn report_inventory(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn restoration_requires_explicit_selection_target_and_canonical_key_id() {
+        let residue = format!(".lngnb-key-{}", "a".repeat(64));
+        let ident = key_id(&[0; 32]).to_string();
+        let args = [
+            "restore-residue",
+            "--key-dir",
+            "/keys",
+            "--residue",
+            &residue,
+            "--restore-name",
+            "restored",
+            "--expect-key-id",
+            &ident,
+        ];
+        let valid: Vec<OsString> = args.iter().map(OsString::from).collect();
+        let parsed = parse(&valid).unwrap();
+        assert_eq!(parsed.name, Some(residue.clone()));
+        assert_eq!(
+            parsed.restoration,
+            Some(("restored".into(), key_id(&[0; 32])))
+        );
+        for start in [1, 3, 5, 7] {
+            let mut bad = valid.clone();
+            bad.drain(start..start + 2);
+            assert!(parse(&bad).is_err());
+        }
+        for (index, value) in [
+            (4, "publisher"),
+            (6, "../escape"),
+            (6, ".lngnb-key-reserved"),
+            (8, "ky1_invalid"),
+            (8, "public-secret-argument"),
+        ] {
+            let mut bad = valid.clone();
+            bad[index] = value.into();
+            let error = parse(&bad).unwrap_err();
+            assert_eq!(error.exit_code(), 2);
+            assert!(!error.to_string().contains(value));
+        }
+        for invalid_id in [
+            ident.to_uppercase(),
+            ident.replacen("ky1_", "rc1_", 1),
+            format!(" {ident}"),
+        ] {
+            let mut bad = valid.clone();
+            bad[8] = invalid_id.into();
+            assert!(parse(&bad).is_err());
+        }
+        for option in [
+            "--restore-name",
+            "--expect-key-id",
+            "--residue",
+            "--key-dir",
+        ] {
+            let mut bad = valid.clone();
+            bad.extend([option.into(), "duplicate".into()]);
+            assert!(parse(&bad).is_err());
+        }
+        for other in [
+            "create",
+            "check",
+            "change-passphrase",
+            "preserve-residue",
+            "check-residue",
+            "recovery-status",
+        ] {
+            let mut bad = valid.clone();
+            bad[0] = other.into();
+            assert!(parse(&bad).is_err());
+        }
+        let mut bad = valid;
+        bad.extend(["--backup-dir".into(), "/backup".into()]);
+        assert!(parse(&bad).is_err());
+    }
+    #[test]
+    fn restoration_errors_and_output_failures_never_report_overall_recovery_success() {
+        for (error, code, marker) in [
+            (
+                KeyFileError::UnexpectedPublicKey,
+                1,
+                "期待する鍵IDと一致しない",
+            ),
+            (
+                KeyFileError::Key(lngnb::keyfile::KeyError::AuthenticationFailed),
+                1,
+                "key_authentication_failed",
+            ),
+            (KeyFileError::Exists, 1, "上書きしていません"),
+            (KeyFileError::Io, 1, "成功は確認できません"),
+            (KeyFileError::RecoveryChanged, 1, "入力変化"),
+            (KeyFileError::CommitUncertain, 3, "保存結果は未確定"),
+            (
+                KeyFileError::RestorationReviewRequired,
+                6,
+                "復元先の永続化は確認済み",
+            ),
+        ] {
+            let e = Error::Restore(error);
+            assert_eq!(e.exit_code(), code);
+            let text = e.to_string();
+            assert!(text.contains(marker) && text.contains("変更停止も解除しません"));
+            assert!(text.contains("全残存物") && text.contains("書換え・削除は行っていません"));
+        }
+        struct Broken {
+            flush: bool,
+        }
+        impl Write for Broken {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.flush {
+                    Ok(bytes.len())
+                } else {
+                    Err(std::io::Error::other("public write failure"))
+                }
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::other("public flush failure"))
+            }
+        }
+        for flush in [false, true] {
+            let e = report(&Action::RestoreResidue, &[0; 32], &mut Broken { flush }).unwrap_err();
+            assert!(matches!(e, Error::RestorationOutput));
+            assert_eq!(e.exit_code(), 1);
+            assert!(e.to_string().contains("保存は完了") && e.to_string().contains("再実行せず"));
+        }
+        let mut output = Vec::new();
+        report(&Action::RestoreResidue, &[0; 32], &mut output).unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert!(
+            text.contains("変更停止も解除していません") && text.contains("整理許可ではありません")
+        );
+        assert!(text.contains(&key_id(&[0; 32]).to_string()));
+    }
     #[test]
     fn preservation_requires_both_explicit_targets_and_distinguishes_committed_review() {
         let residue = format!(".lngnb-key-{}", "a".repeat(64));
