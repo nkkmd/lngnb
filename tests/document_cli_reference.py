@@ -37,6 +37,15 @@ def snapshot(name):
 def count_state(name):
     with db(name) as c:
         return c.execute("SELECT state FROM storage_state").fetchone()[0], c.execute("SELECT count(*) FROM records").fetchone()[0], c.execute("SELECT count(*) FROM blobs").fetchone()[0]
+def assert_preserved_after_retry(name):
+    protected={"records","blobs","blob_objects","manual_blob_holds","known_invalid","temporary_blob_holds","blob_cleanup_plans","blob_cleanup_runs"}
+    old=dict(snapshot(name));files={p.name:p.read_bytes() for p in (ROOT/name/"blobs").iterdir()}
+    invoke(name,expected=3)
+    new=dict(snapshot(name))
+    for table in protected:assert new[table]==old[table],"protected data changed"
+    assert new["history"][:len(old["history"])]==old["history"],"past history changed"
+    assert count_state(name)[0]=="running"
+    assert {p.name:p.read_bytes() for p in (ROOT/name/"blobs").iterdir()}==files
 def args(name, extra=(), key_id=KEY_ID, payload=None, metadata=None):
     return [BINARY,"document","create","--data-dir",str(ROOT/name),"--key-dir",str(ROOT/"keys"),"--name","publisher","--expect-key-id",key_id,"--payload",str(payload or ROOT/"body"),"--metadata",str(metadata or ROOT/"metadata")]+list(extra)
 def invoke(name, password=PASS, expected=0, cancel=None, full=False, extra=(), key_id=KEY_ID, payload=None, metadata=None, before_password=None, after_password=None, no_prompt=False):
@@ -136,7 +145,7 @@ with db("genesis-sql") as c:c.executescript("CREATE TRIGGER fail_genesis BEFORE 
 invoke("genesis-sql",expected=3);assert count_state("genesis-sql")==("running",0,1)
 with db("sql") as c:c.executescript("CREATE TRIGGER fail_revision BEFORE INSERT ON records WHEN (SELECT count(*) FROM records)=1 BEGIN SELECT RAISE(ABORT,'test'); END;")
 invoke("sql",expected=3);assert count_state("sql")==("running",1,1)
-old=snapshot("sql");invoke("sql",expected=3);assert snapshot("sql")==old
+assert_preserved_after_retry("sql")
 with db("finish") as c:c.executescript("CREATE TRIGGER fail_finish BEFORE UPDATE OF state ON storage_state WHEN NEW.state='clean' BEGIN SELECT RAISE(ABORT,'test'); END;")
 invoke("finish",expected=3);assert count_state("finish")==("running",2,1)
 out,err=invoke("output",expected=1,full=True);assert "保存と正常終了は完了" in err.decode();assert count_state("output")==("clean",2,1)
@@ -150,7 +159,7 @@ def kill_after_genesis(child):
     raise AssertionError("kill point not reached")
 invoke("kill",expected=-signal.SIGKILL,after_password=kill_after_genesis)
 assert count_state("kill")==("running",1,1)
-old=snapshot("kill");invoke("kill",expected=3);assert snapshot("kill")==old
+assert_preserved_after_retry("kill")
 assert (ROOT/"keys/publisher").read_bytes()==original_key
 assert (ROOT/"body").read_bytes()==BODY and cbor2.loads((ROOT/"metadata").read_bytes())==META
 print("DOCUMENT_CLI_CASES_OK")
