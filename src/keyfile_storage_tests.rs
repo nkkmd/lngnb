@@ -899,3 +899,275 @@ fn cleanup_never_unlinks_a_changed_recovery_file() {
     );
     assert_eq!(stdfs::read(a.0.join("key")).unwrap(), b);
 }
+
+#[test]
+fn restoration_requires_explicit_identity_and_keeps_every_residue_and_change_stop() {
+    let a = Area::new();
+    let (bytes, p) = fixture();
+    let residue = residue_name(1);
+    a.put(&residue, &bytes);
+    a.put(".lngnb-key-unknown", b"public unknown residue");
+    a.put("existing", b"public unrelated file");
+    let before = fingerprint(&stdfs::metadata(a.0.join(&residue)).unwrap());
+    let public = unlock(&bytes, &p).unwrap().public_key();
+    let mut d = KeyDirectory::open(&a.0).unwrap();
+    assert_eq!(
+        d.restore_recovery_file(&residue, &p, "restored", &public)
+            .unwrap(),
+        public
+    );
+    assert_eq!(stdfs::read(a.0.join("restored")).unwrap(), bytes);
+    assert_eq!(
+        stdfs::metadata(a.0.join("restored")).unwrap().mode() & 0o7777,
+        0o600
+    );
+    assert_eq!(d.load("restored", &p).unwrap().public_key(), public);
+    assert_eq!(
+        before,
+        fingerprint(&stdfs::metadata(a.0.join(&residue)).unwrap())
+    );
+    assert_eq!(
+        stdfs::read(a.0.join(".lngnb-key-unknown")).unwrap(),
+        b"public unknown residue"
+    );
+    assert_eq!(
+        stdfs::read(a.0.join("existing")).unwrap(),
+        b"public unrelated file"
+    );
+    assert_eq!(d.recovery_inventory().unwrap().entries.len(), 1);
+    e(d.create("new", &p), KeyFileError::PendingRecovery);
+    e(
+        d.change_passphrase("restored", &p, &p),
+        KeyFileError::PendingRecovery,
+    );
+    e(
+        d.restore_recovery_file(&residue, &p, "restored", &public),
+        KeyFileError::Exists,
+    );
+}
+
+#[test]
+fn restoration_rejects_wrong_identity_authentication_unsafe_sources_and_existing_targets() {
+    let a = Area::new();
+    let (bytes, p) = fixture();
+    let residue = residue_name(1);
+    a.put(&residue, &bytes);
+    let public = unlock(&bytes, &p).unwrap().public_key();
+    let mut wrong = public;
+    wrong[0] ^= 1;
+    let mut d = KeyDirectory::open(&a.0).unwrap();
+    e(
+        d.restore_recovery_file(&residue, &p, "restored", &wrong),
+        KeyFileError::UnexpectedPublicKey,
+    );
+    e(
+        d.restore_recovery_file(&residue, "public wrong password", "restored", &public),
+        KeyError::AuthenticationFailed.into(),
+    );
+    for (r, n) in [
+        ("ordinary", "restored"),
+        (&residue, "../escape"),
+        (&residue, ".lngnb-key-reserved"),
+    ] {
+        e(
+            d.restore_recovery_file(r, &p, n, &public),
+            KeyFileError::UnsafePath,
+        );
+    }
+    a.put(&residue_name(2), b"public incomplete ciphertext");
+    e(
+        d.restore_recovery_file(&residue_name(2), &p, "restored", &public),
+        KeyError::InvalidFormat.into(),
+    );
+    symlink(&residue, a.0.join(residue_name(3))).unwrap();
+    e(
+        d.restore_recovery_file(&residue_name(3), &p, "restored", &public),
+        KeyFileError::UnsafePath,
+    );
+    a.put("existing", b"public existing target");
+    symlink("absent", a.0.join("dangling")).unwrap();
+    stdfs::create_dir(a.0.join("directory")).unwrap();
+    for n in ["existing", "dangling", "directory"] {
+        e(
+            d.restore_recovery_file(&residue, &p, n, &public),
+            KeyFileError::Exists,
+        );
+    }
+    assert!(!a.0.join("restored").exists());
+    assert_eq!(a.pending().len(), 3); // 拒否で新しい一時暗号文を作らない。
+    assert_eq!(
+        stdfs::read(a.0.join("existing")).unwrap(),
+        b"public existing target"
+    );
+    assert_eq!(stdfs::read(a.0.join(&residue)).unwrap(), bytes);
+}
+
+#[test]
+fn restoration_failure_stages_preserve_inputs_and_distinguish_durability() {
+    let (bytes, p) = fixture();
+    let public = unlock(&bytes, &p).unwrap().public_key();
+    for stage in [
+        Stage::TempCreated,
+        Stage::Written,
+        Stage::FileSynced,
+        Stage::Validated,
+        Stage::BeforeInstall,
+        Stage::Installed,
+        Stage::DirectorySynced,
+    ] {
+        let a = Area::new();
+        let residue = residue_name(1);
+        a.put(&residue, &bytes);
+        let mut d = KeyDirectory::open(&a.0).unwrap();
+        e(
+            d.restore_recovery_file_with(&residue, &p, "restored", &public, &mut |at| {
+                if at == stage {
+                    Err(KeyFileError::Io)
+                } else {
+                    Ok(())
+                }
+            }),
+            match stage {
+                Stage::Installed => KeyFileError::CommitUncertain,
+                Stage::DirectorySynced => KeyFileError::RestorationReviewRequired,
+                _ => KeyFileError::Io,
+            },
+        );
+        assert_eq!(stdfs::read(a.0.join(&residue)).unwrap(), bytes);
+        if matches!(stage, Stage::Installed | Stage::DirectorySynced) {
+            assert_eq!(stdfs::read(a.0.join("restored")).unwrap(), bytes);
+            assert_eq!(a.pending().len(), 1);
+        } else {
+            assert!(!a.0.join("restored").exists());
+            assert_eq!(a.pending().len(), 2);
+        }
+        e(d.create("new", &p), KeyFileError::PendingRecovery);
+    }
+}
+
+#[test]
+fn restoration_detects_source_changes_and_target_race_without_rollback_or_overwrite() {
+    let (bytes, p) = fixture();
+    let public = unlock(&bytes, &p).unwrap().public_key();
+    for (stage, target_race) in [
+        (Stage::BeforeInstall, false),
+        (Stage::DirectorySynced, false),
+        (Stage::BeforeInstall, true),
+    ] {
+        let a = Area::new();
+        let residue = residue_name(1);
+        a.put(&residue, &bytes);
+        let mut d = KeyDirectory::open(&a.0).unwrap();
+        e(
+            d.restore_recovery_file_with(&residue, &p, "restored", &public, &mut |at| {
+                if at == stage {
+                    if target_race {
+                        a.put("restored", b"public racing target");
+                    } else {
+                        stdfs::write(a.0.join(&residue), b"public changed source").unwrap();
+                    }
+                }
+                Ok(())
+            }),
+            if target_race {
+                KeyFileError::Exists
+            } else if stage == Stage::BeforeInstall {
+                KeyFileError::RecoveryChanged
+            } else {
+                KeyFileError::RestorationReviewRequired
+            },
+        );
+        if target_race {
+            assert_eq!(
+                stdfs::read(a.0.join("restored")).unwrap(),
+                b"public racing target"
+            );
+            assert_eq!(stdfs::read(a.0.join(&residue)).unwrap(), bytes);
+        } else {
+            assert_eq!(
+                stdfs::read(a.0.join(&residue)).unwrap(),
+                b"public changed source"
+            );
+            if stage == Stage::DirectorySynced {
+                assert_eq!(stdfs::read(a.0.join("restored")).unwrap(), bytes);
+            } else {
+                assert!(!a.0.join("restored").exists());
+            }
+        }
+    }
+}
+
+#[test]
+fn restoration_process_kill_keeps_residue_and_releases_lock() {
+    let (bytes, p) = fixture();
+    let public = unlock(&bytes, &p).unwrap().public_key();
+    if let Ok(path) = std::env::var("LNGNB_PUBLIC_RESTORATION_KILL_AREA") {
+        let path = PathBuf::from(path);
+        assert!(path.starts_with(std::env::temp_dir()));
+        assert!(
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("lngnb-keytest-")
+        );
+        assert_eq!(
+            stdfs::read(path.join("fixture-marker")).unwrap(),
+            b"public restoration fixture"
+        );
+        let stage = std::env::var("LNGNB_PUBLIC_RESTORATION_KILL_STAGE").unwrap();
+        let mut d = KeyDirectory::open(&path).unwrap();
+        let _ =
+            d.restore_recovery_file_with(&residue_name(1), &p, "restored", &public, &mut |at| {
+                if format!("{at:?}") == stage {
+                    println!("READY");
+                    std::io::stdout().flush().unwrap();
+                    loop {
+                        std::thread::park();
+                    }
+                }
+                Ok(())
+            });
+        panic!("restoration kill point not reached");
+    }
+    for stage in ["FileSynced", "Installed", "DirectorySynced"] {
+        let a = Area::new();
+        a.put(&residue_name(1), &bytes);
+        a.put("fixture-marker", b"public restoration fixture");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "keyfile::files::tests::restoration_process_kill_keeps_residue_and_releases_lock",
+                "--nocapture",
+            ])
+            .env("LNGNB_PUBLIC_RESTORATION_KILL_AREA", &a.0)
+            .env("LNGNB_PUBLIC_RESTORATION_KILL_STAGE", stage)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        loop {
+            line.clear();
+            assert!(stdout.read_line(&mut line).unwrap() > 0);
+            if line.trim() == "READY" {
+                break;
+            }
+        }
+        child.kill().unwrap();
+        assert!(!child.wait().unwrap().success());
+        let mut d = KeyDirectory::open(&a.0).unwrap();
+        assert_eq!(stdfs::read(a.0.join(residue_name(1))).unwrap(), bytes);
+        if stage == "FileSynced" {
+            assert!(!a.0.join("restored").exists());
+            assert_eq!(a.pending().len(), 2);
+        } else {
+            assert_eq!(stdfs::read(a.0.join("restored")).unwrap(), bytes);
+            assert_eq!(d.load("restored", &p).unwrap().public_key(), public);
+            assert_eq!(a.pending().len(), 1);
+        }
+        e(
+            d.change_passphrase("restored", &p, &p),
+            KeyFileError::PendingRecovery,
+        );
+    }
+}
