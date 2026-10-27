@@ -9,7 +9,7 @@ import termios
 import time
 
 BINARY = sys.argv[1]
-FILTER = "controlling_terminal_input_is_private_and_restored"
+FILTER = sys.argv[2] if len(sys.argv) > 2 else "controlling_terminal_input_is_private_and_restored"
 CASES = {
     "unicode": [" public e\u0301 é あ \n".encode()],
     "editing": [b"remove\x15e\xcc\x81\x7fx\n"],
@@ -104,6 +104,10 @@ def run_case(case, payloads):
             os.close(master)
         os.close(slave)
 
+if len(sys.argv) > 2:
+    run_case("flush-failure", [b"public discarded input\npublic leftover input\n"])
+    print("PTY_CASES_OK=1")
+    sys.exit(0)
 for name, lines in CASES.items():
     run_case(name, lines)
 # stdinに値があっても、制御端末のない新規sessionでは代替入力しない。

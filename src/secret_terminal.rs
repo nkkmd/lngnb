@@ -141,16 +141,21 @@ impl<'a> RawTerminal<'a> {
         Ok(guard)
     }
     fn restore(&mut self) -> Result<()> {
+        let tty = self.tty;
+        self.restore_with_flush(|| termios::tcflush(tty, QueueSelector::IFlush).is_ok())
+    }
+    fn restore_with_flush(&mut self, flush: impl FnOnce() -> bool) -> Result<()> {
         if !self.active {
             return Ok(());
         }
         // 貼付け余剰や超過入力を、echoを戻した後のシェル等へ渡さない。
-        termios::tcflush(self.tty, QueueSelector::IFlush)
-            .map_err(|_| SecretInputError::RestoreFailed)?;
-        termios::tcsetattr(self.tty, OptionalActions::Now, &self.original)
-            .map_err(|_| SecretInputError::RestoreFailed)?;
-        let t = termios::tcgetattr(self.tty).map_err(|_| SecretInputError::RestoreFailed)?;
-        if !same_settings(&t, &self.original) {
+        // 破棄に失敗しても元設定の復元・読戻しを独立して試みる。
+        let flushed = flush();
+        let restored = termios::tcsetattr(self.tty, OptionalActions::Now, &self.original).is_ok();
+        let checked = termios::tcgetattr(self.tty)
+            .map(|t| same_settings(&t, &self.original))
+            .unwrap_or(false);
+        if !flushed || !restored || !checked {
             return Err(SecretInputError::RestoreFailed);
         }
         self.active = false;
@@ -244,6 +249,46 @@ fn erase_last(input: &mut Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn flush_failure_still_restores_terminal_and_retains_retry() {
+        if std::env::var("LNGNB_PUBLIC_TERMINAL_CASE").as_deref() == Ok("flush-failure") {
+            let terminal = SecretTerminal::open().unwrap();
+            let mut guard = RawTerminal::enter(&terminal.tty).unwrap();
+            (&terminal.tty).write_all(b"Public test prompt: ").unwrap();
+            // 公開試験値だけを入力。失敗時の結果は秘密を持たない固定エラー。
+            let input = read_line(&mut &terminal.tty).unwrap();
+            assert!(input.as_str() == "public discarded input");
+            assert_eq!(
+                guard.restore_with_flush(|| false),
+                Err(SecretInputError::RestoreFailed)
+            );
+            assert!(same_settings(
+                &termios::tcgetattr(&terminal.tty).unwrap(),
+                &guard.original
+            ));
+            assert!(guard.active); // 失敗を完了扱いせず、明示/Drop再試行を維持。
+            guard.restore().unwrap();
+            assert!(!guard.active);
+            drop(input);
+            println!("TERMINAL_CHECK_OK");
+            return;
+        }
+        let output = std::process::Command::new("python3")
+            .arg("tests/terminal_reference.py")
+            .arg(std::env::current_exe().unwrap())
+            .arg("secret_terminal::tests::flush_failure_still_restores_terminal_and_retains_retry")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "PTY restore checker failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            "PTY_CASES_OK=1"
+        );
+    }
     #[test]
     fn byte_limits_utf8_and_editing_do_not_normalize_input() {
         for text in [
