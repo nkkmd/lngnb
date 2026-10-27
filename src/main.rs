@@ -5,6 +5,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 #[cfg(target_os = "linux")]
+mod document_cli;
+#[cfg(target_os = "linux")]
 mod key_cli;
 
 const HELP: &str = "lngnb — 分散図書館・知識基盤（開発初期段階）
@@ -13,6 +15,7 @@ const HELP: &str = "lngnb — 分散図書館・知識基盤（開発初期段�
   lngnb --help
   lngnb --version
   lngnb config show [--data-dir PATH]
+  lngnb document create --data-dir PATH --key-dir PATH --name NAME --expect-key-id KEY_ID --payload PATH --metadata PATH [--media-type TYPE] [--max-payload-bytes N]
   lngnb key create --key-dir PATH --name NAME
   lngnb key check --key-dir PATH --name NAME
   lngnb key change-passphrase --key-dir PATH --name NAME
@@ -36,7 +39,10 @@ restore-residue は期待鍵IDと照合し、同じ領域の空いている通�
 
 config show は設定候補の表示だけを行います。
 データ領域の初期化・設定の保存・既存設定の読込み・接続は行いません。
-資料の作成・公開・リレー起動などの製品操作は未実装です。
+document create は初期化済みの正常なデータ領域へ新規資料を保存します。
+metadataは決定的CBOR map。本文予算は既定16 MiB、指定上限は64 MiB未満です。
+保存失敗時は一部保存の可能性があるため、再作成せず領域を保全してください。
+初期化・改訂・派生・pin・公開・リレー起動は未実装です。
 ";
 
 // 工程②は候補表示だけ。永続設定やリレー起動は対応工程で実装する。
@@ -69,6 +75,8 @@ enum Command {
     Config(Config),
     #[cfg(target_os = "linux")]
     Key(key_cli::Command),
+    #[cfg(target_os = "linux")]
+    Document(document_cli::Command),
 }
 
 #[derive(Debug)]
@@ -77,6 +85,8 @@ enum AppError {
     Output(io::Error),
     #[cfg(target_os = "linux")]
     Key(key_cli::Error),
+    #[cfg(target_os = "linux")]
+    Document(document_cli::Error),
 }
 
 impl AppError {
@@ -86,6 +96,8 @@ impl AppError {
             Self::Output(_) => 1,
             #[cfg(target_os = "linux")]
             Self::Key(e) => e.exit_code(),
+            #[cfg(target_os = "linux")]
+            Self::Document(e) => e.exit_code(),
         }
     }
 }
@@ -97,6 +109,8 @@ impl fmt::Display for AppError {
             Self::Output(_) => f.write_str("標準出力への書込みに失敗しました"),
             #[cfg(target_os = "linux")]
             Self::Key(e) => e.fmt(f),
+            #[cfg(target_os = "linux")]
+            Self::Document(e) => e.fmt(f),
         }
     }
 }
@@ -108,6 +122,8 @@ impl std::error::Error for AppError {
             Self::Usage(_) => None,
             #[cfg(target_os = "linux")]
             Self::Key(_) => None,
+            #[cfg(target_os = "linux")]
+            Self::Document(_) => None,
         }
     }
 }
@@ -119,6 +135,10 @@ fn parse(args: &[OsString]) -> Result<Command, AppError> {
         [arg] if arg == "--version" || arg == "-V" => Ok(Command::Version),
         #[cfg(target_os = "linux")]
         [group, rest @ ..] if group == "key" => key_cli::parse(rest).map(Command::Key),
+        #[cfg(target_os = "linux")]
+        [group, rest @ ..] if group == "document" => {
+            document_cli::parse(rest).map(Command::Document)
+        }
         [group, action, rest @ ..] if group == "config" && action == "show" => {
             let config = match rest {
                 [] => Config::default(),
@@ -146,6 +166,10 @@ fn run(args: &[OsString], output: &mut impl Write) -> Result<(), AppError> {
         Command::Config(config) => config.describe(),
         #[cfg(target_os = "linux")]
         Command::Key(command) => return key_cli::run(command, output).map_err(AppError::Key),
+        #[cfg(target_os = "linux")]
+        Command::Document(command) => {
+            return document_cli::run(command, output).map_err(AppError::Document);
+        }
     };
     output
         .write_all(text.as_bytes())
