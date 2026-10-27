@@ -4,12 +4,24 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+#[cfg(target_os = "linux")]
+mod key_cli;
+
 const HELP: &str = "lngnb — 分散図書館・知識基盤（開発初期段階）
 
 使い方:
   lngnb --help
   lngnb --version
   lngnb config show [--data-dir PATH]
+  lngnb key create --key-dir PATH --name NAME
+  lngnb key check --key-dir PATH --name NAME
+  lngnb key change-passphrase --key-dir PATH --name NAME
+
+key は既存の所有者専用0700ディレクトリを使います（自動作成・権限変更なし）。
+NAMEは1〜128 bytesのASCII英数字/._-（dot/dotdot・予約prefixを除く）。
+パスフレーズは前面の制御端末から非表示入力します。
+暗号化鍵とパスフレーズを別々に保全してください。紛失は管理トークンで回復できません。
+鍵共用時は漏洩の影響が複数資料に及びます。同一Knowledgeの鍵交代は未対応です。
 
 config show は設定候補の表示だけを行います。
 データ領域の初期化・設定の保存・既存設定の読込み・接続は行いません。
@@ -44,12 +56,16 @@ enum Command {
     Help,
     Version,
     Config(Config),
+    #[cfg(target_os = "linux")]
+    Key(key_cli::Command),
 }
 
 #[derive(Debug)]
 enum AppError {
     Usage(&'static str),
     Output(io::Error),
+    #[cfg(target_os = "linux")]
+    Key(key_cli::Error),
 }
 
 impl AppError {
@@ -57,6 +73,8 @@ impl AppError {
         match self {
             Self::Usage(_) => 2,
             Self::Output(_) => 1,
+            #[cfg(target_os = "linux")]
+            Self::Key(e) => e.exit_code(),
         }
     }
 }
@@ -66,6 +84,8 @@ impl fmt::Display for AppError {
         match self {
             Self::Usage(message) => write!(f, "{message}（使い方: lngnb --help）"),
             Self::Output(_) => f.write_str("標準出力への書込みに失敗しました"),
+            #[cfg(target_os = "linux")]
+            Self::Key(e) => e.fmt(f),
         }
     }
 }
@@ -75,6 +95,8 @@ impl std::error::Error for AppError {
         match self {
             Self::Output(error) => Some(error),
             Self::Usage(_) => None,
+            #[cfg(target_os = "linux")]
+            Self::Key(_) => None,
         }
     }
 }
@@ -84,6 +106,8 @@ fn parse(args: &[OsString]) -> Result<Command, AppError> {
         [] => Err(AppError::Usage("操作を指定してください")),
         [arg] if arg == "--help" || arg == "-h" => Ok(Command::Help),
         [arg] if arg == "--version" || arg == "-V" => Ok(Command::Version),
+        #[cfg(target_os = "linux")]
+        [group, rest @ ..] if group == "key" => key_cli::parse(rest).map(Command::Key),
         [group, action, rest @ ..] if group == "config" && action == "show" => {
             let config = match rest {
                 [] => Config::default(),
@@ -109,6 +133,8 @@ fn run(args: &[OsString], output: &mut impl Write) -> Result<(), AppError> {
             env!("CARGO_PKG_VERSION")
         ),
         Command::Config(config) => config.describe(),
+        #[cfg(target_os = "linux")]
+        Command::Key(command) => return key_cli::run(command, output).map_err(AppError::Key),
     };
     output
         .write_all(text.as_bytes())
