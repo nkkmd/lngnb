@@ -1,9 +1,6 @@
 //! R01/R24/R30/R34: 作成CLIと実保存・独立Python照合。公開試験鍵のみ。
 #![cfg(target_os = "linux")]
-use lngnb::{
-    id::Id,
-    storage::{Limits, RecordStore},
-};
+use lngnb::id::Id;
 use std::{
     fs,
     os::unix::fs::{DirBuilderExt, PermissionsExt},
@@ -75,7 +72,15 @@ fn creation_cli_preserves_inputs_and_storage_across_failure_cancellation_and_res
         "cancel3",
         "cancel4",
     ] {
-        drop(RecordStore::initialize(&root.join(name), Limits::default()).unwrap());
+        let initialized = Command::new(env!("CARGO_BIN_EXE_lngnb"))
+            .args(["data", "init", "--data-dir"])
+            .arg(root.join(name))
+            .output()
+            .unwrap();
+        assert!(
+            initialized.status.success(),
+            "CLI fixture initialization failed"
+        );
     }
     let out = Command::new(
         std::env::var_os("LNGNB_REFERENCE_PYTHON").expect("independent checker required"),
