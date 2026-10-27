@@ -64,13 +64,56 @@ fn bytes(b: &[u8]) -> Value {
     Value::Bytes(b.to_vec())
 }
 
+const MAX_METADATA_BYTES: usize = 262_144;
+// 符号化/文字列複製の前に、encoded sizeの下限を割当てなしで走査する。
+// 実際のCBOR長/重複key/規範は、後段の共通encoderとRecord検査で引き続き確認する。
+fn metadata_preflight(value: &Value, depth: usize, remaining: &mut usize) -> Result<()> {
+    fn charge(remaining: &mut usize, bytes: usize) -> Result<()> {
+        *remaining = remaining
+            .checked_sub(bytes)
+            .ok_or(CreationError::InvalidInput)?;
+        Ok(())
+    }
+    let depth = depth + usize::from(matches!(value, Value::Map(_) | Value::Array(_)));
+    if depth > 16 {
+        return Err(CreationError::InvalidInput);
+    }
+    charge(remaining, 1)?; // 全valueは少なくとも一byteのheadを必要とする。
+    match value {
+        Value::Text(s) => charge(remaining, s.len())?,
+        Value::Bytes(b) => charge(remaining, b.len())?,
+        Value::Map(fields) => {
+            if fields.len() > 1024 {
+                return Err(CreationError::InvalidInput);
+            }
+            for (key, child) in fields {
+                charge(remaining, 1)?;
+                charge(remaining, key.len())?;
+                metadata_preflight(child, depth, remaining)?;
+            }
+        }
+        Value::Array(values) => {
+            if values.len() > 4096 {
+                return Err(CreationError::InvalidInput);
+            }
+            for child in values {
+                metadata_preflight(child, depth, remaining)?;
+            }
+        }
+        _ => (),
+    }
+    Ok(())
+}
+
 /// 新規入力だけを署名前に整える。署名済みRecordの書換えには使わない。
 fn metadata(mut input: Value) -> Result<Value> {
+    let mut remaining = MAX_METADATA_BYTES;
+    metadata_preflight(&input, 0, &mut remaining)?;
     // 重複key・深さ・文字列等の上限を、変換/既定値挿入の前にも検査する。
     if cbor::encode(&input)
         .map_err(|_| CreationError::InvalidInput)?
         .len()
-        > 262_144
+        > MAX_METADATA_BYTES
     {
         return Err(CreationError::InvalidInput);
     }
@@ -153,6 +196,10 @@ fn create_with(
     if payload.len() > budget.max_payload_bytes {
         return Err(CreationError::PayloadLimit);
     }
+    let media_type = media_type.unwrap_or("");
+    if media_type.len() > 255 {
+        return Err(CreationError::InvalidInput);
+    }
     let length = i64::try_from(payload.len()).map_err(|_| CreationError::PayloadLimit)?;
     let metadata = metadata(metadata_input)?;
     let knowledge = knowledge()?;
@@ -179,7 +226,7 @@ fn create_with(
                 map(vec![
                     ("blob_id", bytes(&id::blob_id(payload).bytes)),
                     ("byte_length", Value::Int(length)),
-                    ("media_type", text(media_type.unwrap_or(""))),
+                    ("media_type", text(media_type)),
                 ]),
             ),
             ("metadata", metadata),
@@ -242,6 +289,81 @@ mod tests {
     }
     fn contains(v: &Value, name: &str) -> bool {
         matches!(v, Value::Map(m) if m.iter().any(|(k,_)| k == name))
+    }
+    #[test]
+    fn preflight_rejects_oversize_inputs_before_randomness_and_preserves_boundaries() {
+        let key = key();
+        let media = format!("a/{}", "b".repeat(253));
+        let records = create_initial(
+            &key,
+            b"",
+            Value::Map(vec![]),
+            Some(&media),
+            CreationBudget::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            get(get(records.revision().body(), "payload"), "media_type"),
+            &text(&media)
+        );
+        let longer = format!("{media}b");
+        assert_eq!(
+            create_with(
+                &key,
+                b"",
+                Value::Map(vec![]),
+                Some(&longer),
+                CreationBudget::default(),
+                || panic!("oversize media must fail before randomness")
+            )
+            .unwrap_err(),
+            CreationError::InvalidInput
+        );
+        let keys = map(vec![
+            (&"x".repeat(131_073), Value::Null),
+            (&"y".repeat(131_073), Value::Null),
+        ]);
+        assert_eq!(
+            create_with(&key, b"", keys, None, CreationBudget::default(), || panic!(
+                "oversize metadata must fail before randomness"
+            ))
+            .unwrap_err(),
+            CreationError::InvalidInput
+        );
+        // 下限検査だけで正規のCBOR長検査を代替しない。
+        let small = map(vec![("x", text("abc"))]);
+        let exact = cbor::encode(&small).unwrap().len();
+        let mut remaining = exact;
+        metadata_preflight(&small, 0, &mut remaining).unwrap();
+        assert_eq!(remaining, 0);
+        assert_eq!(
+            metadata_preflight(&small, 0, &mut (exact - 1)).unwrap_err(),
+            CreationError::InvalidInput
+        );
+        let mut remaining = MAX_METADATA_BYTES;
+        assert_eq!(
+            metadata_preflight(&Value::Array(vec![Value::Null; 4097]), 0, &mut remaining)
+                .unwrap_err(),
+            CreationError::InvalidInput
+        );
+        let mut fields: Vec<_> = (0..1024).map(|i| (i.to_string(), Value::Null)).collect();
+        let mut remaining = MAX_METADATA_BYTES;
+        metadata_preflight(&Value::Map(fields.clone()), 0, &mut remaining).unwrap();
+        fields.push(("one more".into(), Value::Null));
+        let mut remaining = MAX_METADATA_BYTES;
+        assert_eq!(
+            metadata_preflight(&Value::Map(fields), 0, &mut remaining).unwrap_err(),
+            CreationError::InvalidInput
+        );
+        let mut deep = Value::Null;
+        for _ in 0..17 {
+            deep = Value::Array(vec![deep]);
+        }
+        let mut remaining = MAX_METADATA_BYTES;
+        assert_eq!(
+            metadata_preflight(&deep, 0, &mut remaining).unwrap_err(),
+            CreationError::InvalidInput
+        );
     }
     #[test]
     fn fixed_initial_records_match_a13_exactly() {
