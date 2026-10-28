@@ -1,6 +1,9 @@
 //! ローカルCLIと認証済みIPCの完成署名Record保存を共通化する。
 //! 局所検査・保存確定は、親評価/本文保持/pin/公開/正常停止とは別。
-use super::{RecordWriter, Result};
+use super::{
+    Capacity, EvaluationLimits, PayloadStatus, RecordStore, RecordWriter, Result, StartupState,
+    Validation,
+};
 use crate::{id::Id, record::LocalRecord};
 
 /// 内部IPCの要求は完成したRecordの生bytes一つだけ。秘密鍵・パスフレーズは受けない。
@@ -38,6 +41,67 @@ pub fn store_record(writer: &mut RecordWriter, record: &LocalRecord) -> Result<R
         record_id: record.id(),
         inserted: writer.insert(record)?,
     })
+}
+
+/// 排他中のローカル診断。全件の管理用評価に成功した場合だけ返す。
+/// 公開可否・永続評価・復旧確認を表さず、保持実体の件数はopen時の照合結果。
+#[derive(Debug)]
+pub struct Diagnostic {
+    pub generation: i64,
+    pub startup_state: StartupState,
+    pub records: usize,
+    pub valid: usize,
+    pub pending: usize,
+    pub invalid: usize,
+    pub payload_verified: usize,
+    pub payload_missing: usize,
+    pub payload_unavailable: usize,
+    pub incomplete_staging: usize,
+    pub orphaned_blobs: usize,
+    pub missing_retained_blobs: usize,
+    pub corrupt_retained_blobs: usize,
+    pub capacity: Capacity,
+}
+
+impl RecordStore {
+    /// 既存の同じ排他を使い、writer取得・評価確定・finish・手動待ち解除を行わない。
+    /// 予算超過や検査失敗では部分集計を返さない。容量は試料で保存成功保証ではない。
+    pub fn diagnose(&self, limits: EvaluationLimits) -> Result<Diagnostic> {
+        let snapshot = self.evaluate(limits)?;
+        let state = self.startup_state()?;
+        let capacity = self.capacity()?;
+        let recovery = self.blob_recovery();
+        let mut diagnostic = Diagnostic {
+            generation: snapshot.generation,
+            startup_state: state,
+            records: snapshot.records.len(),
+            valid: 0,
+            pending: 0,
+            invalid: 0,
+            payload_verified: 0,
+            payload_missing: 0,
+            payload_unavailable: 0,
+            incomplete_staging: recovery.incomplete_staging.len(),
+            orphaned_blobs: recovery.orphaned.len(),
+            missing_retained_blobs: recovery.missing.len(),
+            corrupt_retained_blobs: recovery.corrupt.len(),
+            capacity,
+        };
+        for record in &snapshot.records {
+            match record.validation {
+                Validation::Valid => diagnostic.valid += 1,
+                Validation::Pending => diagnostic.pending += 1,
+                Validation::Invalid => diagnostic.invalid += 1,
+            }
+            match record.payload_status {
+                Some(PayloadStatus::Verified) => diagnostic.payload_verified += 1,
+                Some(PayloadStatus::Missing) => diagnostic.payload_missing += 1,
+                Some(PayloadStatus::Unavailable) => diagnostic.payload_unavailable += 1,
+                None => (),
+            }
+        }
+        Ok(diagnostic)
+    }
 }
 
 #[cfg(test)]

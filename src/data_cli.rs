@@ -1,8 +1,6 @@
 //! R01/R24/R28/R30: 保存領域の明示初期化とローカル診断。公開/復旧/IPCではない。
 use super::AppError;
-use lngnb::storage::{
-    EvaluationLimits, Limits, PayloadStatus, RecordStore, StartupState, StorageError, Validation,
-};
+use lngnb::storage::{EvaluationLimits, Limits, RecordStore, StartupState, StorageError};
 use std::{ffi::OsString, fmt, io::Write, path::PathBuf};
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -79,41 +77,28 @@ pub fn run(command: Command, output: &mut impl Write) -> Result<(), Error> {
 fn status(path: &std::path::Path) -> Result<String, StorageError> {
     // 同じ排他を最後の照合まで保持。起動検査cursorの進行・writer取得・正常停止は行わない。
     let store = RecordStore::open(path, Limits::default())?;
-    let snapshot = store.evaluate(EvaluationLimits::default())?;
-    let state = store.startup_state()?;
-    let capacity = store.capacity()?;
-    let recovery = store.blob_recovery();
-    let mut valid = 0;
-    let mut pending = 0;
-    let mut invalid = 0;
-    let mut verified = 0;
-    let mut missing = 0;
-    let mut unavailable = 0;
-    for record in &snapshot.records {
-        match record.validation {
-            Validation::Valid => valid += 1,
-            Validation::Pending => pending += 1,
-            Validation::Invalid => invalid += 1,
-        }
-        match record.payload_status {
-            Some(PayloadStatus::Verified) => verified += 1,
-            Some(PayloadStatus::Missing) => missing += 1,
-            Some(PayloadStatus::Unavailable) => unavailable += 1,
-            None => (),
-        }
-    }
+    let diagnostic = store.diagnose(EvaluationLimits::default())?;
+    let state = diagnostic.startup_state;
+    let capacity = diagnostic.capacity;
+    let valid = diagnostic.valid;
+    let pending = diagnostic.pending;
+    let invalid = diagnostic.invalid;
+    let verified = diagnostic.payload_verified;
+    let missing = diagnostic.payload_missing;
+    let unavailable = diagnostic.payload_unavailable;
     let state = match state {
         StartupState::Clean => "clean",
         StartupState::NeedsReview => "manual_review_required",
         StartupState::InspectionPending => "inspection_pending",
     };
     Ok(format!(
-        "保存領域の管理用診断（公開可否・復旧完了の判定ではありません）。\nstartup_state: {state}\nrecords: {}\ndiagnostic_valid: {valid}\ndiagnostic_pending: {pending}\ndiagnostic_invalid: {invalid}\npayload_verified: {verified}\npayload_missing: {missing}\npayload_unavailable: {unavailable}\nincomplete_staging: {}\norphaned_blobs: {}\nmissing_retained_blobs: {}\ncorrupt_retained_blobs: {}\navailable_bytes: {}\nreserved_floor_bytes: {}\ncapacity_warning: {}\nこの診断結果は保存済み評価へ反映していません。手動確認待ちは解除しません。pin・公開・同期の状態表示は未実装です。\n",
-        snapshot.records.len(),
-        recovery.incomplete_staging.len(),
-        recovery.orphaned.len(),
-        recovery.missing.len(),
-        recovery.corrupt.len(),
+        "保存領域の管理用診断（公開可否・復旧完了の判定ではありません）。\nstartup_state: {state}\ndiagnostic_generation: {}\nrecords: {}\ndiagnostic_valid: {valid}\ndiagnostic_pending: {pending}\ndiagnostic_invalid: {invalid}\npayload_verified: {verified}\npayload_missing: {missing}\npayload_unavailable: {unavailable}\nincomplete_staging: {}\norphaned_blobs: {}\nmissing_retained_blobs: {}\ncorrupt_retained_blobs: {}\navailable_bytes: {}\nreserved_floor_bytes: {}\ncapacity_warning: {}\nこの診断結果は保存済み評価へ反映していません。手動確認待ちは解除しません。pin・公開・同期の状態表示は未実装です。\n",
+        diagnostic.generation,
+        diagnostic.records,
+        diagnostic.incomplete_staging,
+        diagnostic.orphaned_blobs,
+        diagnostic.missing_retained_blobs,
+        diagnostic.corrupt_retained_blobs,
         capacity.available,
         capacity.reserved_floor,
         capacity.warning

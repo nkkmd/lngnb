@@ -126,6 +126,7 @@ fn explicit_initialization_and_status_do_not_overwrite_or_change_healthy_state()
     let text = success(cli("status", &t.data()));
     for field in [
         "startup_state: clean\n",
+        "diagnostic_generation: 0\n",
         "records: 0\n",
         "diagnostic_valid: 0\n",
         "payload_missing: 0\n",

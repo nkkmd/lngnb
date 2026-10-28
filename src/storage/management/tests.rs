@@ -127,3 +127,93 @@ fn failed_or_policy_rejected_writer_cannot_become_a_fresh_clean_listener() {
         assert_eq!(store.startup_state().unwrap(), StartupState::NeedsReview);
     }
 }
+
+#[test]
+fn common_diagnostic_rechecks_dependencies_without_committing_or_releasing_lock() {
+    let temp = Temp::new();
+    let mut writer = temp.store().begin().unwrap();
+    store_record(&mut writer, &fixture("revision")).unwrap();
+    let before = logical_snapshot(&writer.store.conn);
+    let first = writer.store.diagnose(EvaluationLimits::default()).unwrap();
+    assert_eq!(
+        (first.records, first.valid, first.pending, first.invalid),
+        (1, 0, 1, 0)
+    );
+    assert_eq!(
+        (
+            first.payload_verified,
+            first.payload_missing,
+            first.payload_unavailable
+        ),
+        (0, 1, 0)
+    );
+    assert_eq!(first.startup_state, StartupState::NeedsReview);
+    assert_eq!(logical_snapshot(&writer.store.conn), before);
+    assert!(
+        crate::storage::RecordStore::open(&temp.data(), crate::storage::Limits::default()).is_err()
+    );
+    store_record(&mut writer, &fixture("genesis")).unwrap();
+    let before = logical_snapshot(&writer.store.conn);
+    let second = writer.store.diagnose(EvaluationLimits::default()).unwrap();
+    assert_eq!(
+        (second.records, second.valid, second.pending, second.invalid),
+        (2, 2, 0, 0)
+    );
+    assert_eq!(second.payload_missing, 1);
+    assert!(second.generation > first.generation);
+    assert_eq!(logical_snapshot(&writer.store.conn), before);
+    drop(writer);
+    let store =
+        crate::storage::RecordStore::open(&temp.data(), crate::storage::Limits::default()).unwrap();
+    let before = logical_snapshot(&store.conn);
+    let diagnostic = store.diagnose(EvaluationLimits::default()).unwrap();
+    assert_eq!(diagnostic.startup_state, StartupState::NeedsReview);
+    assert_eq!(logical_snapshot(&store.conn), before);
+    assert!(matches!(store.begin(), Err(StorageError::NeedsReview)));
+}
+
+#[test]
+fn diagnostic_budget_returns_no_partial_result_and_cannot_clear_save_failure() {
+    let temp = Temp::new();
+    let mut writer = temp.store().begin().unwrap();
+    store_record(&mut writer, &fixture("genesis")).unwrap();
+    store_record(&mut writer, &fixture("revision")).unwrap();
+    for limits in [
+        EvaluationLimits {
+            records: 1,
+            ..EvaluationLimits::default()
+        },
+        EvaluationLimits {
+            record_bytes: 1,
+            ..EvaluationLimits::default()
+        },
+        EvaluationLimits {
+            elapsed: std::time::Duration::ZERO,
+            ..EvaluationLimits::default()
+        },
+    ] {
+        let before = logical_snapshot(&writer.store.conn);
+        assert!(matches!(
+            writer.store.diagnose(limits),
+            Err(StorageError::BudgetExceeded)
+        ));
+        assert_eq!(logical_snapshot(&writer.store.conn), before);
+    }
+    // 保存障害後の診断成功でもwriter.failedを解除せずfinishを拒否する。
+    writer.store.conn.execute_batch("CREATE TRIGGER deny_blob BEFORE INSERT ON blobs BEGIN SELECT RAISE(ABORT,'test'); END;").unwrap();
+    let bytes = b"public diagnostic failure fixture";
+    assert!(
+        writer
+            .put_blob(crate::id::blob_id(bytes), std::io::Cursor::new(bytes))
+            .is_err()
+    );
+    assert!(writer.failed);
+    let before = logical_snapshot(&writer.store.conn);
+    writer.store.diagnose(EvaluationLimits::default()).unwrap();
+    assert_eq!(logical_snapshot(&writer.store.conn), before);
+    assert!(writer.failed);
+    assert!(matches!(
+        writer.finish(),
+        Err(StorageError::UnresolvedFailure)
+    ));
+}
