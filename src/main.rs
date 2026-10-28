@@ -26,7 +26,7 @@ const HELP: &str = "lngnb — 分散図書館・知識基盤（開発初期段�
   lngnb data init --data-dir PATH
   lngnb data status --data-dir PATH
   lngnb admin probe --data-dir PATH
-  lngnb admin serve --data-dir PATH
+  lngnb admin serve --data-dir PATH [--request-timeout-ms N] [--max-new-records N]
   lngnb record submit --data-dir PATH --record PATH
   lngnb document create --data-dir PATH --key-dir PATH --name NAME --expect-key-id KEY_ID --payload PATH --metadata PATH [--media-type TYPE] [--max-payload-bytes N]
   lngnb key create --key-dir PATH --name NAME
@@ -63,8 +63,10 @@ record submit は検査済みの完成署名Record一件だけを、認証した
 入力は2 MiB以下の通常file。保存応答不明は終了3で保全し、自動再送・直接保存へ切り替えません。
 admin probe は保存要求なしでsocket接続先の権限・UIDだけを照合します。受理準備や保存状態は判定しません。
 admin serve は前面で管理受理側だけを起動します。SIGINT/SIGTERMで受付停止と進行処理の終結を要求します。
+受信/応答の各期限は1〜30000 ms、新規Record上限は1〜10000件で、既定は各上限です。
+適用値を起動時に表示し、この起動だけに適用します（設定保存・起動検査予算の変更なし）。
 不正通信・保存障害・応答喪失では正常停止にせず、領域とsocketを保持します。
-製品リレー起動・IPC状態診断/設定CLIは未実装です。
+製品リレー起動・IPC状態診断/設定永続化CLIは未実装です。
 改訂・派生・pin・公開・リレー起動・復旧確認CLIは未実装です。
 ";
 

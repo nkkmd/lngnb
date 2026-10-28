@@ -14,6 +14,39 @@ use std::{
     time::Duration,
 };
 
+/// この起動だけに適用する受理側予算。既定上限を超える設定は受けない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Config {
+    timeout_ms: u64,
+    max_new_records: u64,
+}
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            timeout_ms: 30_000,
+            max_new_records: 10_000,
+        }
+    }
+}
+impl Config {
+    pub fn checked(timeout_ms: Option<u64>, max_new_records: Option<u64>) -> Option<Self> {
+        let defaults = Self::default();
+        let timeout_ms = timeout_ms.unwrap_or(defaults.timeout_ms);
+        let max_new_records = max_new_records.unwrap_or(defaults.max_new_records);
+        if timeout_ms == 0
+            || timeout_ms > defaults.timeout_ms
+            || max_new_records == 0
+            || max_new_records > defaults.max_new_records
+        {
+            return None;
+        }
+        Some(Self {
+            timeout_ms,
+            max_new_records,
+        })
+    }
+}
+
 #[derive(Debug)]
 pub enum Error {
     Signal,
@@ -64,13 +97,21 @@ impl Drop for Signals {
         }
     }
 }
-pub fn run(path: &Path, output: &mut impl Write) -> Result<(), Error> {
+pub fn run(path: &Path, config: Config, output: &mut impl Write) -> Result<(), Error> {
     let signals = Signals::install()?;
-    serve(path, &signals.stop, output)
+    serve(path, config, &signals.stop, output)
 }
-fn serve(path: &Path, stop: &AtomicBool, output: &mut impl Write) -> Result<(), Error> {
-    let mut startup =
-        LocalStartup::open(path, Limits::default()).map_err(|_| Error::Unconfirmed)?;
+fn serve(
+    path: &Path,
+    config: Config,
+    stop: &AtomicBool,
+    output: &mut impl Write,
+) -> Result<(), Error> {
+    let limits = Limits {
+        session_records: config.max_new_records,
+        ..Limits::default()
+    };
+    let mut startup = LocalStartup::open(path, limits).map_err(|_| Error::Unconfirmed)?;
     if startup.needs_review() {
         return Err(Error::Unconfirmed);
     }
@@ -87,11 +128,18 @@ fn serve(path: &Path, stop: &AtomicBool, output: &mut impl Write) -> Result<(), 
         }
     }
     let writer = startup.into_writer().map_err(|_| Error::Unconfirmed)?;
-    let mut listener =
-        Listener::bind_writer(writer, lngnb::cbor::MAX_RECORD, Duration::from_secs(30))
-            .map_err(|_| Error::Unconfirmed)?;
+    let mut listener = Listener::bind_writer(
+        writer,
+        lngnb::cbor::MAX_RECORD,
+        Duration::from_millis(config.timeout_ms),
+    )
+    .map_err(|_| Error::Unconfirmed)?;
+    let ready = format!(
+        "管理受理側のローカル起動検査を完了し、管理socketを開きました。公開・復旧完了の判定ではありません。\nrequest_timeout_ms: {}\nmax_new_records: {}\n設定はこの起動だけに適用し、保存していません。\n",
+        config.timeout_ms, config.max_new_records
+    );
     output
-        .write_all("管理受理側のローカル起動検査を完了し、管理socketを開きました。公開・復旧完了の判定ではありません。\n".as_bytes())
+        .write_all(ready.as_bytes())
         .and_then(|()| output.flush())
         .map_err(|_| Error::Unconfirmed)?;
     while !stop.load(Ordering::SeqCst) {
@@ -137,5 +185,26 @@ mod tests {
                 .contains("正常停止・復旧完了とは扱いません")
         );
         assert!(Error::StoppedOutput.to_string().contains("正常終了後"));
+    }
+
+    #[test]
+    fn runtime_config_only_tightens_existing_defaults() {
+        assert_eq!(Config::checked(None, None), Some(Config::default()));
+        assert_eq!(
+            Config::default().max_new_records,
+            Limits::default().session_records
+        );
+        assert_eq!(Config::default().timeout_ms, 30_000);
+        assert!(Config::checked(Some(1), Some(1)).is_some());
+        assert!(Config::checked(Some(30_000), Some(10_000)).is_some());
+        for (timeout, records) in [
+            (0, 1),
+            (30_001, 1),
+            (1, 0),
+            (1, 10_001),
+            (u64::MAX, u64::MAX),
+        ] {
+            assert!(Config::checked(Some(timeout), Some(records)).is_none());
+        }
     }
 }
