@@ -16,8 +16,11 @@ enum Action {
     Serve(Config),
 }
 pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
-    let usage =
-        || AppError::Usage("admin probe/status/evaluate/serve の操作・明示領域・設定値を確認してください");
+    let usage = || {
+        AppError::Usage(
+            "admin probe/status/evaluate/serve の操作・明示領域・設定値を確認してください",
+        )
+    };
     let [action, rest @ ..] = args else {
         return Err(usage());
     };
@@ -107,7 +110,8 @@ pub fn run(command: Command, output: &mut impl Write) -> Result<(), Error> {
         return super::admin_server::run(&command.data, config, output).map_err(Error::Server);
     }
     if command.action == Action::Evaluate {
-        let diagnostic = client::evaluate(&command.data, Duration::from_secs(30)).map_err(|_| Error::Evaluation)?;
+        let diagnostic = client::evaluate(&command.data, Duration::from_secs(30))
+            .map_err(|_| Error::Evaluation)?;
         return evaluation_report(diagnostic, output);
     }
     if command.action == Action::Status {
@@ -147,9 +151,25 @@ fn status_report(
         .map_err(|_| Error::StatusOutput)
 }
 
-fn evaluation_report(status: lngnb::storage::admin_transport::EvaluationStatus, output: &mut impl Write) -> Result<(), Error> {
-    let text = format!("管理受理側の保存・評価診断（公開・正常停止・復旧完了の判定ではありません）。\ndiagnostic_generation: {}\nrecords: {}\ndiagnostic_valid: {}\ndiagnostic_pending: {}\ndiagnostic_invalid: {}\npayload_verified: {}\npayload_missing: {}\npayload_unavailable: {}\n診断は保存済み評価へ反映していません。保存要求は送らず、手動確認待ちは解除しません。pin・公開・同期・重要履歴全体の診断は未実装です。\n", status.generation, status.records, status.valid, status.pending, status.invalid, status.payload_verified, status.payload_missing, status.payload_unavailable);
-    output.write_all(text.as_bytes()).and_then(|()| output.flush()).map_err(|_| Error::EvaluationOutput)
+fn evaluation_report(
+    status: lngnb::storage::admin_transport::EvaluationStatus,
+    output: &mut impl Write,
+) -> Result<(), Error> {
+    let text = format!(
+        "管理受理側の保存・評価診断（公開・正常停止・復旧完了の判定ではありません）。\ndiagnostic_generation: {}\nrecords: {}\ndiagnostic_valid: {}\ndiagnostic_pending: {}\ndiagnostic_invalid: {}\npayload_verified: {}\npayload_missing: {}\npayload_unavailable: {}\n診断は保存済み評価へ反映していません。保存要求は送らず、手動確認待ちは解除しません。pin・公開・同期・重要履歴全体の診断は未実装です。\n",
+        status.generation,
+        status.records,
+        status.valid,
+        status.pending,
+        status.invalid,
+        status.payload_verified,
+        status.payload_missing,
+        status.payload_unavailable
+    );
+    output
+        .write_all(text.as_bytes())
+        .and_then(|()| output.flush())
+        .map_err(|_| Error::EvaluationOutput)
 }
 
 #[cfg(test)]
@@ -311,18 +331,51 @@ mod evaluation_tests {
     use super::*;
     #[test]
     fn evaluation_is_explicit_and_output_failure_does_not_claim_storage_uncertainty() {
-        assert_eq!(parse(&["evaluate".into(),"--data-dir".into(),"data".into()]).unwrap().action, Action::Evaluate);
-        for args in [vec!["evaluate"], vec!["evaluate","--data-dir",""],
-            vec!["evaluate","--data-dir","data","--request-timeout-ms","1"],
-            vec!["evaluate","--data-dir","data","--max-new-records","1"]] {
+        assert_eq!(
+            parse(&["evaluate".into(), "--data-dir".into(), "data".into()])
+                .unwrap()
+                .action,
+            Action::Evaluate
+        );
+        for args in [
+            vec!["evaluate"],
+            vec!["evaluate", "--data-dir", ""],
+            vec![
+                "evaluate",
+                "--data-dir",
+                "data",
+                "--request-timeout-ms",
+                "1",
+            ],
+            vec!["evaluate", "--data-dir", "data", "--max-new-records", "1"],
+        ] {
             let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
-            assert_eq!(parse(&args).unwrap_err().exit_code(),2);
+            assert_eq!(parse(&args).unwrap_err().exit_code(), 2);
         }
-        let snapshot = lngnb::storage::admin_transport::EvaluationStatus {generation:1,records:1,valid:0,pending:1,invalid:0,payload_verified:0,payload_missing:1,payload_unavailable:0};
-        let mut output = Vec::new(); evaluation_report(snapshot,&mut output).unwrap();
-        assert!(String::from_utf8(output).unwrap().contains("保存済み評価へ反映していません"));
-        let mut closed = std::io::Cursor::new(&mut [0u8;0][..]);
-        assert_eq!(evaluation_report(snapshot,&mut closed).unwrap_err().exit_code(),1);
-        assert_eq!(Error::Evaluation.exit_code(),1);
+        let snapshot = lngnb::storage::admin_transport::EvaluationStatus {
+            generation: 1,
+            records: 1,
+            valid: 0,
+            pending: 1,
+            invalid: 0,
+            payload_verified: 0,
+            payload_missing: 1,
+            payload_unavailable: 0,
+        };
+        let mut output = Vec::new();
+        evaluation_report(snapshot, &mut output).unwrap();
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("保存済み評価へ反映していません")
+        );
+        let mut closed = std::io::Cursor::new(&mut [0u8; 0][..]);
+        assert_eq!(
+            evaluation_report(snapshot, &mut closed)
+                .unwrap_err()
+                .exit_code(),
+            1
+        );
+        assert_eq!(Error::Evaluation.exit_code(), 1);
     }
 }

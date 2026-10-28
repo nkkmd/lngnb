@@ -128,7 +128,8 @@ impl Endpoint {
     pub(super) fn close(self, store: &RecordStore, owner: u32) -> Result<()> {
         self.check(store, owner)?;
         drop(self.socket);
-        rustix::fs::unlinkat(&store.dir, self.name, rustix::fs::AtFlags::empty()).map_err(|_| Error::Io)
+        rustix::fs::unlinkat(&store.dir, self.name, rustix::fs::AtFlags::empty())
+            .map_err(|_| Error::Io)
     }
 }
 impl Listener {

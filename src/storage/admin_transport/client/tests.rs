@@ -358,27 +358,49 @@ fn status_rejects_unknown_oversized_truncated_and_idle_replies_without_sending_b
 fn evaluation_rejects_bad_or_missing_endpoint_and_malformed_reply_without_requests() {
     use super::super::evaluation::{MAGIC as EVAL_MAGIC, NAME as EVAL_NAME};
     let temp = Temp::new();
-    let mut server = Listener::bind_writer(temp.store().begin().unwrap(), crate::cbor::MAX_RECORD, Duration::from_millis(20)).unwrap();
-    assert_eq!(evaluate(&temp.data(), Duration::from_secs(1)), Err(Error::Endpoint));
+    let mut server = Listener::bind_writer(
+        temp.store().begin().unwrap(),
+        crate::cbor::MAX_RECORD,
+        Duration::from_millis(20),
+    )
+    .unwrap();
+    assert_eq!(
+        evaluate(&temp.data(), Duration::from_secs(1)),
+        Err(Error::Endpoint)
+    );
     assert!(matches!(server.accept(), Err(super::super::Error::Timeout)));
-    std::fs::hard_link(temp.data().join("admin.sock"),temp.data().join(EVAL_NAME)).unwrap();
-    assert_eq!(evaluate(&temp.data(),Duration::from_secs(1)),Err(Error::Endpoint));
+    std::fs::hard_link(temp.data().join("admin.sock"), temp.data().join(EVAL_NAME)).unwrap();
+    assert_eq!(
+        evaluate(&temp.data(), Duration::from_secs(1)),
+        Err(Error::Endpoint)
+    );
     std::fs::remove_file(temp.data().join(EVAL_NAME)).unwrap();
     assert!(matches!(server.accept(), Err(super::super::Error::Timeout)));
-    for reply in [vec![b'L',b'N',b'E',2,0,0,0,65], vec![b'L',b'N',b'E',1,255,255,255,255],
-        [EVAL_MAGIC.as_slice(), &[0,0,0,65], &[2,0]].concat(), vec![]] {
+    for reply in [
+        vec![b'L', b'N', b'E', 2, 0, 0, 0, 65],
+        vec![b'L', b'N', b'E', 1, 255, 255, 255, 255],
+        [EVAL_MAGIC.as_slice(), &[0, 0, 0, 65], &[2, 0]].concat(),
+        vec![],
+    ] {
         let dir = crate::storage::directory(&temp.data()).unwrap();
         let path = crate::storage::anchored(&dir, EVAL_NAME);
         let socket = std::os::unix::net::UnixListener::bind(path).unwrap();
-        std::fs::set_permissions(temp.data().join(EVAL_NAME), std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(
+            temp.data().join(EVAL_NAME),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
         let worker = thread::spawn(move || {
-            use std::io::{Read,Write};
+            use std::io::{Read, Write};
             let (mut stream, _) = socket.accept().unwrap();
             stream.write_all(&reply).unwrap();
             let mut byte = [0];
             assert_eq!(stream.read(&mut byte).unwrap(), 0);
         });
-        assert_eq!(evaluate(&temp.data(), Duration::from_millis(30)), Err(Error::StatusUnavailable));
+        assert_eq!(
+            evaluate(&temp.data(), Duration::from_millis(30)),
+            Err(Error::StatusUnavailable)
+        );
         worker.join().unwrap();
         std::fs::remove_file(temp.data().join(EVAL_NAME)).unwrap();
     }

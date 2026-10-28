@@ -804,56 +804,117 @@ fn malformed_status_reply_is_diagnostic_failure_and_sends_no_request() {
 }
 
 fn evaluate_cli(data: &Path) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_lngnb")).args(["admin","evaluate","--data-dir"]).arg(data).output().unwrap()
+    Command::new(env!("CARGO_BIN_EXE_lngnb"))
+        .args(["admin", "evaluate", "--data-dir"])
+        .arg(data)
+        .output()
+        .unwrap()
 }
 #[test]
 fn live_evaluation_matches_stopped_diagnostic_and_preserves_dependencies() {
-    let temp = Temp::new(); drop(RecordStore::initialize(&temp.data(), Limits::default()).unwrap());
+    let temp = Temp::new();
+    drop(RecordStore::initialize(&temp.data(), Limits::default()).unwrap());
     let mut server = Server::start(&temp);
-    let empty = evaluate_cli(&temp.data()); assert!(empty.status.success(), "{:?}", empty.stderr);
-    assert_eq!(diagnostic_field(&empty,"records"),0);
-    fs::write(temp.input(),named_fixture("revision").bytes()).unwrap();
+    let empty = evaluate_cli(&temp.data());
+    assert!(empty.status.success(), "{:?}", empty.stderr);
+    assert_eq!(diagnostic_field(&empty, "records"), 0);
+    fs::write(temp.input(), named_fixture("revision").bytes()).unwrap();
     assert!(cli(&temp.data(), &temp.input()).status.success());
-    let pending = evaluate_cli(&temp.data()); assert!(pending.status.success());
-    assert_eq!(diagnostic_field(&pending,"diagnostic_pending"),1);
-    assert_eq!(diagnostic_field(&pending,"payload_missing"),1);
-    fs::write(temp.input(),fixture().bytes()).unwrap(); assert!(cli(&temp.data(), &temp.input()).status.success());
-    let valid = evaluate_cli(&temp.data()); assert!(valid.status.success());
-    assert_eq!(diagnostic_field(&valid,"diagnostic_valid"),2);
-    assert_eq!(diagnostic_field(&valid,"payload_missing"),1);
-    let again = evaluate_cli(&temp.data()); assert!(again.status.success());
-    assert_eq!(diagnostic_field(&valid,"diagnostic_generation"),diagnostic_field(&again,"diagnostic_generation"));
-    server.signal("-TERM"); assert!(server.wait().success());
+    let pending = evaluate_cli(&temp.data());
+    assert!(pending.status.success());
+    assert_eq!(diagnostic_field(&pending, "diagnostic_pending"), 1);
+    assert_eq!(diagnostic_field(&pending, "payload_missing"), 1);
+    fs::write(temp.input(), fixture().bytes()).unwrap();
+    assert!(cli(&temp.data(), &temp.input()).status.success());
+    let valid = evaluate_cli(&temp.data());
+    assert!(valid.status.success());
+    assert_eq!(diagnostic_field(&valid, "diagnostic_valid"), 2);
+    assert_eq!(diagnostic_field(&valid, "payload_missing"), 1);
+    let again = evaluate_cli(&temp.data());
+    assert!(again.status.success());
+    assert_eq!(
+        diagnostic_field(&valid, "diagnostic_generation"),
+        diagnostic_field(&again, "diagnostic_generation")
+    );
+    server.signal("-TERM");
+    assert!(server.wait().success());
     assert!(!temp.data().join("admin-evaluate.sock").exists());
-    let stopped = Command::new(env!("CARGO_BIN_EXE_lngnb")).args(["data","status","--data-dir"]).arg(temp.data()).output().unwrap();
+    let stopped = Command::new(env!("CARGO_BIN_EXE_lngnb"))
+        .args(["data", "status", "--data-dir"])
+        .arg(temp.data())
+        .output()
+        .unwrap();
     assert!(stopped.status.success());
-    for name in ["records","diagnostic_valid","diagnostic_pending","diagnostic_invalid","payload_missing"] {
-        assert_eq!(diagnostic_field(&valid,name),diagnostic_field(&stopped,name));
+    for name in [
+        "records",
+        "diagnostic_valid",
+        "diagnostic_pending",
+        "diagnostic_invalid",
+        "payload_missing",
+    ] {
+        assert_eq!(
+            diagnostic_field(&valid, name),
+            diagnostic_field(&stopped, name)
+        );
     }
 }
 #[test]
 fn live_evaluation_detects_new_retained_loss_and_prevents_clean_shutdown() {
     let temp = Temp::new();
-    let mut writer = RecordStore::initialize(&temp.data(), Limits::default()).unwrap().begin().unwrap();
-    let body = b"public live retained fixture"; let id = lngnb::id::blob_id(body);
-    writer.put_blob(id,std::io::Cursor::new(body)).unwrap(); writer.finish().unwrap();
+    let mut writer = RecordStore::initialize(&temp.data(), Limits::default())
+        .unwrap()
+        .begin()
+        .unwrap();
+    let body = b"public live retained fixture";
+    let id = lngnb::id::blob_id(body);
+    writer.put_blob(id, std::io::Cursor::new(body)).unwrap();
+    writer.finish().unwrap();
     let mut server = Server::start(&temp);
-    fs::remove_file(temp.data().join("blobs").join(data_encoding::HEXLOWER.encode(&id.bytes))).unwrap();
-    let out = evaluate_cli(&temp.data()); assert_eq!(out.status.code(),Some(1)); assert!(out.stdout.is_empty());
-    assert_eq!(server.wait().code(),Some(3));
+    fs::remove_file(
+        temp.data()
+            .join("blobs")
+            .join(data_encoding::HEXLOWER.encode(&id.bytes)),
+    )
+    .unwrap();
+    let out = evaluate_cli(&temp.data());
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty());
+    assert_eq!(server.wait().code(), Some(3));
     assert!(temp.data().join("admin-evaluate.sock").exists());
-    assert_eq!(RecordStore::open(&temp.data(),Limits::default()).unwrap().startup_state().unwrap(),lngnb::storage::StartupState::NeedsReview);
+    assert_eq!(
+        RecordStore::open(&temp.data(), Limits::default())
+            .unwrap()
+            .startup_state()
+            .unwrap(),
+        lngnb::storage::StartupState::NeedsReview
+    );
 }
 #[test]
 fn evaluation_requires_its_own_safe_endpoint_and_preserves_existing_name() {
-    let temp = Temp::new(); assert_eq!(evaluate_cli(&temp.data()).status.code(),Some(1)); assert!(!temp.data().exists());
-    let store = RecordStore::initialize(&temp.data(),Limits::default()).unwrap();
-    let mut listener = Listener::bind_writer(store.begin().unwrap(),lngnb::cbor::MAX_RECORD,Duration::from_millis(20)).unwrap();
+    let temp = Temp::new();
+    assert_eq!(evaluate_cli(&temp.data()).status.code(), Some(1));
+    assert!(!temp.data().exists());
+    let store = RecordStore::initialize(&temp.data(), Limits::default()).unwrap();
+    let mut listener = Listener::bind_writer(
+        store.begin().unwrap(),
+        lngnb::cbor::MAX_RECORD,
+        Duration::from_millis(20),
+    )
+    .unwrap();
     listener.enable_status().unwrap();
-    assert_eq!(evaluate_cli(&temp.data()).status.code(),Some(1));
-    assert!(matches!(listener.accept(),Err(lngnb::storage::admin_transport::Error::Timeout)));
+    assert_eq!(evaluate_cli(&temp.data()).status.code(), Some(1));
+    assert!(matches!(
+        listener.accept(),
+        Err(lngnb::storage::admin_transport::Error::Timeout)
+    ));
     listener.close_writer().unwrap().finish().unwrap();
-    let path = temp.data().join("admin-evaluate.sock"); fs::write(&path,b"preserve").unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_lngnb")).args(["admin","serve","--data-dir"]).arg(temp.data()).output().unwrap();
-    assert_eq!(out.status.code(),Some(3)); assert_eq!(fs::read(path).unwrap(),b"preserve");
+    let path = temp.data().join("admin-evaluate.sock");
+    fs::write(&path, b"preserve").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_lngnb"))
+        .args(["admin", "serve", "--data-dir"])
+        .arg(temp.data())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3));
+    assert_eq!(fs::read(path).unwrap(), b"preserve");
 }

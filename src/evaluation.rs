@@ -186,7 +186,10 @@ impl RecordStore {
     pub fn evaluate(&self, limits: EvaluationLimits) -> Result<EvaluationSnapshot> {
         Ok(self.compute_evaluation(limits)?.snapshot)
     }
-    pub(super) fn diagnostic_evaluation(&self, limits: EvaluationLimits) -> Result<(EvaluationSnapshot, bool)> {
+    pub(super) fn diagnostic_evaluation(
+        &self,
+        limits: EvaluationLimits,
+    ) -> Result<(EvaluationSnapshot, bool)> {
         let computed = self.compute_evaluation(limits)?;
         Ok((computed.snapshot, computed.storage_fault))
     }

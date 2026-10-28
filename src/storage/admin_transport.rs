@@ -24,8 +24,8 @@ const MAX_FRAME: usize = crate::cbor::MAX_RECORD;
 const MAX_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub mod client;
-mod status;
 mod evaluation;
+mod status;
 pub use evaluation::Snapshot as EvaluationStatus;
 pub use status::Snapshot as RuntimeStatus;
 
