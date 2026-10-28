@@ -78,7 +78,9 @@ impl Listener {
     }
     /// このendpointの全件評価予算を固定する。既定上限の引下げだけを許し、稼働中に変更しない。
     pub fn enable_evaluation_with_record_limit(&mut self, records: u64) -> Result<()> {
-        if records == 0 || records > 10_000 { return Err(Error::Policy); }
+        if records == 0 || records > 10_000 {
+            return Err(Error::Policy);
+        }
         self.check_endpoint()?;
         match &self.access {
             Access::Write(writer) if writer.failed => return Err(Error::SessionFailed),
@@ -356,32 +358,52 @@ mod failure_tests {
 #[cfg(test)]
 mod record_limit_tests {
     use super::*;
-    use crate::storage::{Limits, StartupState, tests::{Temp, fixture_data, logical_snapshot, unhex}};
+    use crate::storage::{
+        Limits, StartupState,
+        tests::{Temp, fixture_data, logical_snapshot, unhex},
+    };
     #[test]
     fn explicit_diagnostic_record_limit_is_bounded_fixed_and_cannot_promote_partial_results() {
         let temp = Temp::new();
         let mut writer = temp.store().begin().unwrap();
         for kind in ["genesis", "revision"] {
             let f = fixture_data();
-            let record = crate::record::LocalRecord::check(&unhex(f[kind]["envelope_cbor_hex"].as_str().unwrap()), None).unwrap();
+            let record = crate::record::LocalRecord::check(
+                &unhex(f[kind]["envelope_cbor_hex"].as_str().unwrap()),
+                None,
+            )
+            .unwrap();
             writer.insert(&record).unwrap();
         }
-        let mut listener = Listener::bind_writer(writer, MAX_FRAME, Duration::from_secs(1)).unwrap();
-        for limit in [0,10_001,u64::MAX] {
-            assert_eq!(listener.enable_evaluation_with_record_limit(limit),Err(Error::Policy));
+        let mut listener =
+            Listener::bind_writer(writer, MAX_FRAME, Duration::from_secs(1)).unwrap();
+        for limit in [0, 10_001, u64::MAX] {
+            assert_eq!(
+                listener.enable_evaluation_with_record_limit(limit),
+                Err(Error::Policy)
+            );
             assert!(!temp.data().join(NAME).exists());
         }
         listener.enable_evaluation_with_record_limit(1).unwrap();
-        assert_eq!(listener.enable_evaluation_with_record_limit(2),Err(Error::EndpointExists));
-        assert_eq!(listener.evaluation_records,1);
+        assert_eq!(
+            listener.enable_evaluation_with_record_limit(2),
+            Err(Error::EndpointExists)
+        );
+        assert_eq!(listener.evaluation_records, 1);
         let dir = super::super::super::directory(&temp.data()).unwrap();
-        let _stream = UnixStream::connect(anchored(&dir,NAME)).unwrap();
+        let _stream = UnixStream::connect(anchored(&dir, NAME)).unwrap();
         let before = logical_snapshot(&listener.access.store().conn);
         assert!(listener.serve_evaluation_if_pending().is_err());
-        assert_eq!(logical_snapshot(&listener.access.store().conn),before);
-        assert!(matches!(listener.close_writer().unwrap().finish(),Err(StorageError::UnresolvedFailure)));
-        let store = RecordStore::open(&temp.data(),Limits::default()).unwrap();
-        assert_eq!(store.startup_state().unwrap(),StartupState::NeedsReview);
-        assert_eq!(store.diagnose(EvaluationLimits::default()).unwrap().records,2);
+        assert_eq!(logical_snapshot(&listener.access.store().conn), before);
+        assert!(matches!(
+            listener.close_writer().unwrap().finish(),
+            Err(StorageError::UnresolvedFailure)
+        ));
+        let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
+        assert_eq!(store.startup_state().unwrap(), StartupState::NeedsReview);
+        assert_eq!(
+            store.diagnose(EvaluationLimits::default()).unwrap().records,
+            2
+        );
     }
 }

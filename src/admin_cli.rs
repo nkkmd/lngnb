@@ -46,7 +46,9 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
             Some("--max-new-records") if action == "serve" && records.is_none() => {
                 records = Some(number(value).ok_or_else(usage)?);
             }
-            Some("--max-diagnostic-records") if action == "serve" && diagnostic_records.is_none() => {
+            Some("--max-diagnostic-records")
+                if action == "serve" && diagnostic_records.is_none() =>
+            {
                 diagnostic_records = Some(number(value).ok_or_else(usage)?);
             }
             _ => return Err(usage()),
@@ -59,7 +61,11 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
     } else if action == "status" {
         Action::Status
     } else {
-        Action::Serve(Config::checked(timeout, records).and_then(|c| c.with_diagnostic_records(diagnostic_records)).ok_or_else(usage)?)
+        Action::Serve(
+            Config::checked(timeout, records)
+                .and_then(|c| c.with_diagnostic_records(diagnostic_records))
+                .ok_or_else(usage)?,
+        )
     };
     Ok(Command {
         data: data.ok_or_else(usage)?,
@@ -257,7 +263,12 @@ mod tests {
         assert_eq!(command.data, PathBuf::from("資料 space"));
         assert_eq!(
             command.action,
-            Action::Serve(Config::checked(Some(500), Some(1)).unwrap().with_diagnostic_records(Some(7)).unwrap())
+            Action::Serve(
+                Config::checked(Some(500), Some(1))
+                    .unwrap()
+                    .with_diagnostic_records(Some(7))
+                    .unwrap()
+            )
         );
         for (option, max) in [
             ("--request-timeout-ms", "30001"),
@@ -301,7 +312,11 @@ mod tests {
                 .action,
             Action::Status
         );
-        for option in ["--request-timeout-ms", "--max-new-records", "--max-diagnostic-records"] {
+        for option in [
+            "--request-timeout-ms",
+            "--max-new-records",
+            "--max-diagnostic-records",
+        ] {
             let args: Vec<OsString> = ["status", "--data-dir", "data", option, "1"]
                 .map(Into::into)
                 .to_vec();
@@ -355,7 +370,13 @@ mod evaluation_tests {
                 "1",
             ],
             vec!["evaluate", "--data-dir", "data", "--max-new-records", "1"],
-            vec!["evaluate", "--data-dir", "data", "--max-diagnostic-records", "1"],
+            vec![
+                "evaluate",
+                "--data-dir",
+                "data",
+                "--max-diagnostic-records",
+                "1",
+            ],
         ] {
             let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
             assert_eq!(parse(&args).unwrap_err().exit_code(), 2);

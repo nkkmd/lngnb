@@ -50,11 +50,12 @@ impl Config {
     }
     pub fn with_diagnostic_records(mut self, value: Option<u64>) -> Option<Self> {
         let value = value.unwrap_or(self.max_diagnostic_records);
-        if value == 0 || value > 10_000 { return None; }
+        if value == 0 || value > 10_000 {
+            return None;
+        }
         self.max_diagnostic_records = value;
         Some(self)
     }
-
 }
 
 #[derive(Debug)]
@@ -222,9 +223,26 @@ mod tests {
         );
         assert_eq!(Config::default().timeout_ms, 30_000);
         assert_eq!(Config::default().max_diagnostic_records, 10_000);
-        assert_eq!(Config::default().with_diagnostic_records(None), Some(Config::default()));
-        for value in [1, 10_000] { assert_eq!(Config::default().with_diagnostic_records(Some(value)).unwrap().max_diagnostic_records, value); }
-        for value in [0, 10_001, u64::MAX] { assert!(Config::default().with_diagnostic_records(Some(value)).is_none()); }
+        assert_eq!(
+            Config::default().with_diagnostic_records(None),
+            Some(Config::default())
+        );
+        for value in [1, 10_000] {
+            assert_eq!(
+                Config::default()
+                    .with_diagnostic_records(Some(value))
+                    .unwrap()
+                    .max_diagnostic_records,
+                value
+            );
+        }
+        for value in [0, 10_001, u64::MAX] {
+            assert!(
+                Config::default()
+                    .with_diagnostic_records(Some(value))
+                    .is_none()
+            );
+        }
 
         assert!(Config::checked(Some(1), Some(1)).is_some());
         assert!(Config::checked(Some(30_000), Some(10_000)).is_some());

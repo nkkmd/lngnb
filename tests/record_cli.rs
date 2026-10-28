@@ -562,7 +562,12 @@ fn invalid_runtime_options_fail_before_creating_or_changing_data() {
             vec!["--max-diagnostic-records", "0"],
             vec!["--max-diagnostic-records", "10001"],
             vec!["--max-diagnostic-records", "private"],
-            vec!["--max-diagnostic-records", "1", "--max-diagnostic-records", "2"],
+            vec![
+                "--max-diagnostic-records",
+                "1",
+                "--max-diagnostic-records",
+                "2",
+            ],
             vec!["--max-new-records", "private"],
             vec!["--max-new-records", "1", "--max-new-records", "2"],
         ] {
@@ -926,38 +931,72 @@ fn evaluation_requires_its_own_safe_endpoint_and_preserves_existing_name() {
 #[test]
 fn explicit_diagnostic_limit_does_not_change_storage_and_resets_on_clean_restart() {
     let temp = Temp::new();
-    drop(RecordStore::initialize(&temp.data(),Limits::default()).unwrap());
-    let mut server = Server::configured(&temp,&["--max-diagnostic-records","1"]);
-    fs::write(temp.input(),fixture().bytes()).unwrap();
-    assert!(cli(&temp.data(),&temp.input()).status.success());
-    let diagnostic = evaluate_cli(&temp.data()); assert!(diagnostic.status.success());
-    assert_eq!(diagnostic_field(&diagnostic,"records"),1);
-    let runtime = status_cli(&temp.data()); assert!(runtime.status.success());
-    assert_eq!(diagnostic_field(&runtime,"max_new_records"),10_000);
-    server.signal("-TERM"); assert!(server.wait().success());
-    assert!(fs::read_to_string(&server.log).unwrap().contains("max_diagnostic_records: 1\n"));
+    drop(RecordStore::initialize(&temp.data(), Limits::default()).unwrap());
+    let mut server = Server::configured(&temp, &["--max-diagnostic-records", "1"]);
+    fs::write(temp.input(), fixture().bytes()).unwrap();
+    assert!(cli(&temp.data(), &temp.input()).status.success());
+    let diagnostic = evaluate_cli(&temp.data());
+    assert!(diagnostic.status.success());
+    assert_eq!(diagnostic_field(&diagnostic, "records"), 1);
+    let runtime = status_cli(&temp.data());
+    assert!(runtime.status.success());
+    assert_eq!(diagnostic_field(&runtime, "max_new_records"), 10_000);
+    server.signal("-TERM");
+    assert!(server.wait().success());
+    assert!(
+        fs::read_to_string(&server.log)
+            .unwrap()
+            .contains("max_diagnostic_records: 1\n")
+    );
     let mut restarted = Server::start(&temp);
-    fs::write(temp.input(),named_fixture("revision").bytes()).unwrap();
-    assert!(cli(&temp.data(),&temp.input()).status.success());
-    let diagnostic = evaluate_cli(&temp.data()); assert!(diagnostic.status.success());
-    assert_eq!(diagnostic_field(&diagnostic,"records"),2);
-    restarted.signal("-TERM"); assert!(restarted.wait().success());
-    assert!(fs::read_to_string(&restarted.log).unwrap().contains("max_diagnostic_records: 10000\n"));
+    fs::write(temp.input(), named_fixture("revision").bytes()).unwrap();
+    assert!(cli(&temp.data(), &temp.input()).status.success());
+    let diagnostic = evaluate_cli(&temp.data());
+    assert!(diagnostic.status.success());
+    assert_eq!(diagnostic_field(&diagnostic, "records"), 2);
+    restarted.signal("-TERM");
+    assert!(restarted.wait().success());
+    assert!(
+        fs::read_to_string(&restarted.log)
+            .unwrap()
+            .contains("max_diagnostic_records: 10000\n")
+    );
 }
 
 #[test]
 fn diagnostic_limit_does_not_reduce_startup_inspection_or_clear_review_after_failure() {
     let temp = Temp::new();
-    let mut writer = RecordStore::initialize(&temp.data(),Limits::default()).unwrap().begin().unwrap();
-    writer.insert(&fixture()).unwrap(); writer.insert(&named_fixture("revision")).unwrap(); writer.finish().unwrap();
-    let mut server = Server::configured(&temp,&["--max-diagnostic-records","1"]);
-    let out = evaluate_cli(&temp.data()); assert_eq!(out.status.code(),Some(1)); assert!(out.stdout.is_empty());
-    assert_eq!(server.wait().code(),Some(3));
-    let store = RecordStore::open(&temp.data(),Limits::default()).unwrap();
-    assert_eq!(store.startup_state().unwrap(),lngnb::storage::StartupState::NeedsReview);
+    let mut writer = RecordStore::initialize(&temp.data(), Limits::default())
+        .unwrap()
+        .begin()
+        .unwrap();
+    writer.insert(&fixture()).unwrap();
+    writer.insert(&named_fixture("revision")).unwrap();
+    writer.finish().unwrap();
+    let mut server = Server::configured(&temp, &["--max-diagnostic-records", "1"]);
+    let out = evaluate_cli(&temp.data());
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty());
+    assert_eq!(server.wait().code(), Some(3));
+    let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
+    assert_eq!(
+        store.startup_state().unwrap(),
+        lngnb::storage::StartupState::NeedsReview
+    );
     assert!(store.record(fixture().id()).unwrap().is_some());
-    assert!(store.record(named_fixture("revision").id()).unwrap().is_some()); drop(store);
-    let retry = Command::new(env!("CARGO_BIN_EXE_lngnb")).args(["admin","serve","--data-dir"]).arg(temp.data()).output().unwrap();
-    assert_eq!(retry.status.code(),Some(3)); assert!(retry.stdout.is_empty());
+    assert!(
+        store
+            .record(named_fixture("revision").id())
+            .unwrap()
+            .is_some()
+    );
+    drop(store);
+    let retry = Command::new(env!("CARGO_BIN_EXE_lngnb"))
+        .args(["admin", "serve", "--data-dir"])
+        .arg(temp.data())
+        .output()
+        .unwrap();
+    assert_eq!(retry.status.code(), Some(3));
+    assert!(retry.stdout.is_empty());
     assert!(temp.data().join("admin-evaluate.sock").exists());
 }
