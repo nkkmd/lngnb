@@ -72,11 +72,12 @@ impl Snapshot {
 pub(super) struct Endpoint {
     socket: UnixListener,
     identity: (u64, u64),
+    name: &'static str,
 }
 impl Endpoint {
-    fn bind(store: &RecordStore, owner: u32) -> Result<Self> {
+    pub(super) fn bind(store: &RecordStore, owner: u32, name: &'static str) -> Result<Self> {
         check_area(&store.dir).map_err(|_| Error::UnsafeEndpoint)?;
-        let path = anchored(&store.dir, NAME);
+        let path = anchored(&store.dir, name);
         match std::fs::symlink_metadata(&path) {
             Ok(_) => return Err(Error::EndpointExists),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
@@ -96,14 +97,22 @@ impl Endpoint {
         let endpoint = Self {
             socket,
             identity: (meta.dev(), meta.ino()),
+            name,
         };
         endpoint.check(store, owner)?;
         Ok(endpoint)
     }
+    pub(super) fn accept(&self) -> Result<Option<UnixStream>> {
+        match self.socket.accept() {
+            Ok((stream, _)) => Ok(Some(stream)),
+            Err(e) if retry(&e) => Ok(None),
+            Err(_) => Err(Error::Io),
+        }
+    }
     pub(super) fn check(&self, store: &RecordStore, owner: u32) -> Result<()> {
         check_area(&store.dir).map_err(|_| Error::UnsafeEndpoint)?;
         let parent = std::fs::metadata(anchored(&store.dir, ".")).map_err(|_| Error::Io)?;
-        let meta = std::fs::symlink_metadata(anchored(&store.dir, NAME))
+        let meta = std::fs::symlink_metadata(anchored(&store.dir, self.name))
             .map_err(|_| Error::UnsafeEndpoint)?;
         if parent.uid() != owner
             || meta.uid() != owner
@@ -119,7 +128,7 @@ impl Endpoint {
     pub(super) fn close(self, store: &RecordStore, owner: u32) -> Result<()> {
         self.check(store, owner)?;
         drop(self.socket);
-        rustix::fs::unlinkat(&store.dir, NAME, rustix::fs::AtFlags::empty()).map_err(|_| Error::Io)
+        rustix::fs::unlinkat(&store.dir, self.name, rustix::fs::AtFlags::empty()).map_err(|_| Error::Io)
     }
 }
 impl Listener {
@@ -139,7 +148,7 @@ impl Listener {
         if self.status.is_some() {
             return Err(Error::EndpointExists);
         }
-        self.status = Some(Endpoint::bind(self.access.store(), self.owner)?);
+        self.status = Some(Endpoint::bind(self.access.store(), self.owner, NAME)?);
         Ok(())
     }
     /// 一回に一接続だけ。未接続なら即座にfalseを返し、Record受付と直列化する。

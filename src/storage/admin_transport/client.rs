@@ -56,7 +56,7 @@ fn endpoint(dir: &rustix::fd::OwnedFd, owner: u32, name: &str) -> Result<(u64, u
         || !meta.file_type().is_socket()
         || meta.uid() != owner
         || meta.mode() & 0o7777 != 0o600
-        || (name == super::status::NAME && meta.nlink() != 1)
+        || (name != super::NAME && meta.nlink() != 1)
     {
         return Err(Error::Endpoint);
     }
@@ -125,6 +125,21 @@ pub fn status(path: &Path, timeout: Duration) -> Result<super::RuntimeStatus> {
     let mut bytes = [0; super::status::SIZE];
     transfer(&mut stream, &mut bytes, deadline).map_err(|_| Error::StatusUnavailable)?;
     super::RuntimeStatus::check(&bytes).ok_or(Error::StatusUnavailable)
+}
+
+/// 評価専用endpointから要求0bytesで診断を取得。旧endpointへ降格しない。
+pub fn evaluate(path: &Path, timeout: Duration) -> Result<super::EvaluationStatus> {
+    let (mut stream, deadline) = connect_to(path, super::evaluation::NAME, timeout)?;
+    let mut header = [0; 8];
+    transfer(&mut stream, &mut header, deadline).map_err(|_| Error::StatusUnavailable)?;
+    if header[..4] != super::evaluation::MAGIC
+        || header[4..] != (super::evaluation::SIZE as u32).to_be_bytes()
+    {
+        return Err(Error::StatusUnavailable);
+    }
+    let mut bytes = [0; super::evaluation::SIZE];
+    transfer(&mut stream, &mut bytes, deadline).map_err(|_| Error::StatusUnavailable)?;
+    super::EvaluationStatus::check(&bytes).ok_or(Error::StatusUnavailable)
 }
 
 /// 接続先のkernel UIDが領域所有者/rootであることを、送信前に照合する。
