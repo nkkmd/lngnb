@@ -11,14 +11,16 @@ pub struct Command {
 #[derive(Debug, PartialEq, Eq)]
 enum Action {
     Probe,
+    Status,
     Serve(Config),
 }
 pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
-    let usage = || AppError::Usage("admin probe/serve の操作・明示領域・設定値を確認してください");
+    let usage =
+        || AppError::Usage("admin probe/status/serve の操作・明示領域・設定値を確認してください");
     let [action, rest @ ..] = args else {
         return Err(usage());
     };
-    if action != "probe" && action != "serve" {
+    if action != "probe" && action != "status" && action != "serve" {
         return Err(usage());
     }
     let mut data = None;
@@ -44,6 +46,8 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
     }
     let action = if action == "probe" {
         Action::Probe
+    } else if action == "status" {
+        Action::Status
     } else {
         Action::Serve(Config::checked(timeout, records).ok_or_else(usage)?)
     };
@@ -64,6 +68,8 @@ fn number(value: &OsString) -> Option<u64> {
 pub enum Error {
     Connection,
     Output,
+    Status,
+    StatusOutput,
     Server(super::admin_server::Error),
 }
 impl Error {
@@ -80,6 +86,8 @@ impl fmt::Display for Error {
             return e.fmt(f);
         }
         f.write_str(match self {
+            Self::Status => "管理受理側の実行時診断を取得・照合できません。保存要求・再送・直接DB読込み・socket削除は行っていません。診断endpointがない旧受理側へは保存経路で再接続しません。",
+            Self::StatusOutput => "管理受理側の実行時診断を照合後、結果出力に失敗しました。保存要求は送っていません。公開・正常停止・復旧完了の判定ではありません。",
             Self::Connection => "管理socketへの認証付き接続を確認できません。初期化・削除・再送・直接保存は行っていません。",
             Self::Server(_) => unreachable!(),
             Self::Output => "接続先の権限・UID照合後、診断出力に失敗しました。保存要求は送っていません。",
@@ -91,6 +99,11 @@ pub fn run(command: Command, output: &mut impl Write) -> Result<(), Error> {
     if let Action::Serve(config) = command.action {
         return super::admin_server::run(&command.data, config, output).map_err(Error::Server);
     }
+    if command.action == Action::Status {
+        let status =
+            client::status(&command.data, Duration::from_secs(30)).map_err(|_| Error::Status)?;
+        return status_report(status, output);
+    }
     client::probe(&command.data, Duration::from_secs(30)).map_err(|_| Error::Connection)?;
     report(output)
 }
@@ -99,6 +112,28 @@ fn report(output: &mut impl Write) -> Result<(), Error> {
         .write_all("管理socketへの接続と接続先の権限・UIDを照合しました。\n保存要求は送っていません。相手の受理準備・プロトコル対応・保存状態・公開可否・正常停止・復旧完了の判定ではありません。\n".as_bytes())
         .and_then(|()| output.flush())
         .map_err(|_| Error::Output)
+}
+
+fn status_report(
+    status: lngnb::storage::admin_transport::RuntimeStatus,
+    output: &mut impl Write,
+) -> Result<(), Error> {
+    let text = format!(
+        "管理受理側の実行時診断（全資料の健全性・公開・正常停止・復旧完了の判定ではありません）。\ngeneration: {}\nsession_new_records: {}\nsession_stored_bytes: {}\nmax_new_records: {}\nmax_stored_bytes: {}\nrequest_timeout_ms: {}\navailable_bytes: {}\nreserved_floor_bytes: {}\ncapacity_warning: {}\n保存要求は送っていません。件数はこの保存sessionの新規挿入だけで、保存済み総件数ではありません。手動確認待ちは解除しません。\n",
+        status.generation,
+        status.new_records,
+        status.stored_bytes,
+        status.max_new_records,
+        status.max_stored_bytes,
+        status.request_timeout_ms,
+        status.available_bytes,
+        status.reserved_floor_bytes,
+        status.capacity_warning
+    );
+    output
+        .write_all(text.as_bytes())
+        .and_then(|()| output.flush())
+        .map_err(|_| Error::StatusOutput)
 }
 
 #[cfg(test)]
@@ -214,5 +249,43 @@ mod tests {
                 assert_eq!(parse(&args).unwrap_err().exit_code(), 2);
             }
         }
+    }
+    #[test]
+    fn status_is_explicit_and_output_failure_is_not_storage_uncertainty() {
+        assert_eq!(
+            parse(&["status".into(), "--data-dir".into(), "data".into()])
+                .unwrap()
+                .action,
+            Action::Status
+        );
+        for option in ["--request-timeout-ms", "--max-new-records"] {
+            let args: Vec<OsString> = ["status", "--data-dir", "data", option, "1"]
+                .map(Into::into)
+                .to_vec();
+            assert_eq!(parse(&args).unwrap_err().exit_code(), 2);
+        }
+        let status = lngnb::storage::admin_transport::RuntimeStatus {
+            generation: 1,
+            new_records: 0,
+            stored_bytes: 0,
+            max_new_records: 1,
+            max_stored_bytes: 1,
+            available_bytes: 1,
+            reserved_floor_bytes: 1,
+            request_timeout_ms: 1,
+            capacity_warning: false,
+        };
+        let mut out = Vec::new();
+        status_report(status, &mut out).unwrap();
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("保存済み総件数ではありません")
+        );
+        let mut closed = std::io::Cursor::new(&mut [0u8; 0][..]);
+        let error = status_report(status, &mut closed).unwrap_err();
+        assert!(matches!(error, Error::StatusOutput));
+        assert_eq!(error.exit_code(), 1);
+        assert_eq!(Error::Status.exit_code(), 1);
     }
 }

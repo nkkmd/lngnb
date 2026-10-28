@@ -279,3 +279,77 @@ fn probe_rejects_policy_missing_and_non_socket_without_creating_or_removing() {
     );
     assert_eq!(std::fs::read(path).unwrap(), b"preserve");
 }
+
+#[test]
+fn absent_or_unsafe_status_endpoint_never_contacts_the_record_endpoint() {
+    let temp = Temp::new();
+    let mut listener = Listener::bind_writer(
+        temp.store().begin().unwrap(),
+        crate::cbor::MAX_RECORD,
+        Duration::from_millis(50),
+    )
+    .unwrap();
+    let path = temp.data().join(super::super::status::NAME);
+    assert_eq!(
+        status(&temp.data(), Duration::from_secs(1)),
+        Err(Error::Endpoint)
+    );
+    std::fs::write(&path, b"preserve").unwrap();
+    assert_eq!(
+        status(&temp.data(), Duration::from_secs(1)),
+        Err(Error::Endpoint)
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), b"preserve");
+    std::fs::remove_file(&path).unwrap();
+    symlink(temp.data().join("missing"), &path).unwrap();
+    assert_eq!(
+        status(&temp.data(), Duration::from_secs(1)),
+        Err(Error::Endpoint)
+    );
+    assert!(matches!(
+        listener.accept(),
+        Err(super::super::Error::Timeout)
+    ));
+    std::fs::remove_file(path).unwrap();
+    listener.close_writer().unwrap().finish().unwrap();
+}
+
+#[test]
+fn status_rejects_unknown_oversized_truncated_and_idle_replies_without_sending_bytes() {
+    use super::super::status::{MAGIC as STATUS_MAGIC, NAME as STATUS_NAME};
+    for reply in [
+        vec![b'L', b'N', b'I', 2, 0, 0, 0, 62],
+        vec![b'L', b'N', b'I', 1, 255, 255, 255, 255],
+        [STATUS_MAGIC.as_slice(), &[0, 0, 0, 62], &[1, 0]].concat(),
+        vec![],
+    ] {
+        let temp = Temp::new();
+        drop(temp.store());
+        let dir = directory(&temp.data()).unwrap();
+        let server = UnixListener::bind(anchored(&dir, STATUS_NAME)).unwrap();
+        std::fs::set_permissions(
+            temp.data().join(STATUS_NAME),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let worker = thread::spawn(move || {
+            let (mut stream, _) = server.accept().unwrap();
+            if reply.is_empty() {
+                thread::sleep(Duration::from_millis(250));
+            } else {
+                stream.write_all(&reply).unwrap();
+                stream.shutdown(std::net::Shutdown::Write).unwrap();
+            }
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut byte = [0; 1];
+            assert_eq!(stream.read(&mut byte).unwrap(), 0);
+        });
+        assert_eq!(
+            status(&temp.data(), Duration::from_millis(150)),
+            Err(Error::StatusUnavailable)
+        );
+        worker.join().unwrap();
+    }
+}

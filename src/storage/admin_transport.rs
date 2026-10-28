@@ -24,6 +24,8 @@ const MAX_FRAME: usize = crate::cbor::MAX_RECORD;
 const MAX_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub mod client;
+mod status;
+pub use status::Snapshot as RuntimeStatus;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
@@ -59,6 +61,7 @@ type Result<T> = std::result::Result<T, Error>;
 /// Drop/失敗ではsocket名を残す。既存名を自動削除・採用せず管理者の確認を要求する。
 pub struct Listener {
     socket: UnixListener,
+    status: Option<status::Endpoint>,
     access: Access,
     identity: (u64, u64),
     owner: u32,
@@ -125,6 +128,7 @@ impl Listener {
         socket.set_nonblocking(true).map_err(|_| Error::Io)?;
         let listener = Self {
             socket,
+            status: None,
             access,
             identity: (created.dev(), created.ino()),
             owner: parent.uid(),
@@ -206,9 +210,21 @@ impl Listener {
     }
     fn close_access(self) -> Result<Access> {
         self.check_endpoint()?;
-        let Self { socket, access, .. } = self;
+        if let Some(status) = &self.status {
+            status.check(self.access.store(), self.owner)?;
+        }
+        let Self {
+            socket,
+            status,
+            access,
+            owner,
+            ..
+        } = self;
         drop(socket);
         let store = access.store();
+        if let Some(status) = status {
+            status.close(store, owner)?;
+        }
         rustix::fs::unlinkat(&store.dir, NAME, rustix::fs::AtFlags::empty())
             .map_err(|_| Error::Io)?;
         rustix::fs::fsync(&store.dir).map_err(|_| Error::Io)?;
