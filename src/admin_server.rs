@@ -134,6 +134,7 @@ fn serve(
         Duration::from_millis(config.timeout_ms),
     )
     .map_err(|_| Error::Unconfirmed)?;
+    listener.enable_status().map_err(|_| Error::Unconfirmed)?;
     let ready = format!(
         "管理受理側のローカル起動検査を完了し、管理socketを開きました。公開・復旧完了の判定ではありません。\nrequest_timeout_ms: {}\nmax_new_records: {}\n設定はこの起動だけに適用し、保存していません。\n",
         config.timeout_ms, config.max_new_records
@@ -143,6 +144,8 @@ fn serve(
         .and_then(|()| output.flush())
         .map_err(|_| Error::Unconfirmed)?;
     while !stop.load(Ordering::SeqCst) {
+        listener.serve_status_if_pending().map_err(|_| Error::Unconfirmed)?;
+        if stop.load(Ordering::SeqCst) { break; }
         let mut connection = match listener.accept_for(Duration::from_millis(100)) {
             Ok(connection) => connection,
             Err(TransportError::Timeout) => continue,
