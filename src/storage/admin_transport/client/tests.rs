@@ -15,6 +15,11 @@ use std::{
     thread,
 };
 
+fn mock_socket(path: &Path) -> UnixListener {
+    let dir = directory(path).unwrap();
+    UnixListener::bind(anchored(&dir, "admin.sock")).unwrap()
+}
+
 #[test]
 fn authenticated_client_matches_commit_ids_and_idempotent_receipts_under_one_lock() {
     let temp = Temp::new();
@@ -60,7 +65,7 @@ fn malformed_truncated_wrong_id_and_closed_responses_never_confirm_storage() {
         let temp = Temp::new();
         drop(temp.store());
         let socket = temp.data().join("admin.sock");
-        let server = UnixListener::bind(&socket).unwrap();
+        let server = mock_socket(&temp.data());
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
         let worker = thread::spawn(move || {
             let (mut stream, _) = server.accept().unwrap();
@@ -96,7 +101,7 @@ fn oversized_unknown_frame_and_idle_peer_obey_one_deadline_without_retry() {
         let temp = Temp::new();
         drop(temp.store());
         let socket = temp.data().join("admin.sock");
-        let server = UnixListener::bind(&socket).unwrap();
+        let server = mock_socket(&temp.data());
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
         let (done_tx, done_rx) = mpsc::channel();
         let worker = thread::spawn(move || {
@@ -161,7 +166,7 @@ fn missing_unsafe_symlink_stale_endpoints_and_invalid_policy_are_not_sent() {
             .is_symlink()
     );
     std::fs::remove_file(&path).unwrap();
-    let server = UnixListener::bind(&path).unwrap();
+    let server = mock_socket(&temp.data());
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
     assert_eq!(
         submit(&temp.data(), &record, Duration::from_secs(1)),
@@ -181,7 +186,8 @@ fn server_authentication_rejects_real_other_uid_before_reading_self_claims() {
     let temp = Temp::new();
     std::fs::set_permissions(&temp.root, std::fs::Permissions::from_mode(0o755)).unwrap();
     let path = temp.root.join("auth.sock");
-    let listener = UnixListener::bind(&path).unwrap();
+    let dir = directory(&temp.root).unwrap();
+    let listener = UnixListener::bind(anchored(&dir, "auth.sock")).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
     listener.set_nonblocking(true).unwrap();
     let current = rustix::process::geteuid().as_raw();

@@ -136,6 +136,7 @@ fn invalid_unsafe_and_oversized_files_never_create_storage_or_echo_contents() {
 fn malformed_reply_returns_unknown_outcome_without_direct_storage_fallback() {
     use std::{
         io::{Read, Write},
+        os::fd::AsRawFd,
         os::unix::net::UnixListener,
     };
     let temp = Temp::new();
@@ -143,7 +144,9 @@ fn malformed_reply_returns_unknown_outcome_without_direct_storage_fallback() {
     fs::write(temp.input(), record.bytes()).unwrap();
     drop(RecordStore::initialize(&temp.data(), Limits::default()).unwrap());
     let endpoint = temp.data().join("admin.sock");
-    let listener = UnixListener::bind(&endpoint).unwrap();
+    let dir = fs::File::open(temp.data()).unwrap();
+    let anchored = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd())).join("admin.sock");
+    let listener = UnixListener::bind(&anchored).unwrap();
     fs::set_permissions(&endpoint, fs::Permissions::from_mode(0o600)).unwrap();
     let worker = thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
