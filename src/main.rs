@@ -7,6 +7,8 @@ use std::process::ExitCode;
 #[cfg(target_os = "linux")]
 mod admin_cli;
 #[cfg(target_os = "linux")]
+mod admin_server;
+#[cfg(target_os = "linux")]
 mod data_cli;
 #[cfg(target_os = "linux")]
 mod document_cli;
@@ -24,6 +26,7 @@ const HELP: &str = "lngnb — 分散図書館・知識基盤（開発初期段�
   lngnb data init --data-dir PATH
   lngnb data status --data-dir PATH
   lngnb admin probe --data-dir PATH
+  lngnb admin serve --data-dir PATH
   lngnb record submit --data-dir PATH --record PATH
   lngnb document create --data-dir PATH --key-dir PATH --name NAME --expect-key-id KEY_ID --payload PATH --metadata PATH [--media-type TYPE] [--max-payload-bytes N]
   lngnb key create --key-dir PATH --name NAME
@@ -59,7 +62,9 @@ data status は排他中の保存状態・管理用再検査・容量を表示�
 record submit は検査済みの完成署名Record一件だけを、認証したローカル管理socketへ送ります。
 入力は2 MiB以下の通常file。保存応答不明は終了3で保全し、自動再送・直接保存へ切り替えません。
 admin probe は保存要求なしでsocket接続先の権限・UIDだけを照合します。受理準備や保存状態は判定しません。
-管理受理側の起動が別途必要です。製品リレー起動・IPC状態診断/設定CLIは未実装です。
+admin serve は前面で管理受理側だけを起動します。SIGINT/SIGTERMで受付停止と進行処理の終結を要求します。
+不正通信・保存障害・応答喪失では正常停止にせず、領域とsocketを保持します。
+製品リレー起動・IPC状態診断/設定CLIは未実装です。
 改訂・派生・pin・公開・リレー起動・復旧確認CLIは未実装です。
 ";
 
