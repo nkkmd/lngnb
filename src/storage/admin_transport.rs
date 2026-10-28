@@ -23,6 +23,8 @@ const MAGIC: [u8; 4] = *b"LNA\x01";
 const MAX_FRAME: usize = crate::cbor::MAX_RECORD;
 const MAX_TIMEOUT: Duration = Duration::from_secs(30);
 
+pub mod client;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
     Policy,

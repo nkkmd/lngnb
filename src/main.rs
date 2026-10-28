@@ -10,6 +10,8 @@ mod data_cli;
 mod document_cli;
 #[cfg(target_os = "linux")]
 mod key_cli;
+#[cfg(target_os = "linux")]
+mod record_cli;
 
 const HELP: &str = "lngnb — 分散図書館・知識基盤（開発初期段階）
 
@@ -19,6 +21,7 @@ const HELP: &str = "lngnb — 分散図書館・知識基盤（開発初期段�
   lngnb config show [--data-dir PATH]
   lngnb data init --data-dir PATH
   lngnb data status --data-dir PATH
+  lngnb record submit --data-dir PATH --record PATH
   lngnb document create --data-dir PATH --key-dir PATH --name NAME --expect-key-id KEY_ID --payload PATH --metadata PATH [--media-type TYPE] [--max-payload-bytes N]
   lngnb key create --key-dir PATH --name NAME
   lngnb key check --key-dir PATH --name NAME
@@ -50,6 +53,9 @@ data init は既存の親ディレクトリの下に新しい保存領域だけ�
 既存領域は空でも上書きせず、待受先・投稿モード等の保存は未実装です。
 data status は排他中の保存状態・管理用再検査・容量を表示します（公開可否ではありません）。
 保持本文の欠損等を新たに検出した場合は停止印と履歴を記録し、自動修復・削除・再開をしません。
+record submit は検査済みの完成署名Record一件だけを、認証したローカル管理socketへ送ります。
+入力は2 MiB以下の通常file。保存応答不明は終了3で保全し、自動再送・直接保存へ切り替えません。
+管理受理側の起動が別途必要です。製品リレー起動・IPC診断/設定CLIは未実装です。
 改訂・派生・pin・公開・リレー起動・復旧確認CLIは未実装です。
 ";
 
@@ -87,6 +93,8 @@ enum Command {
     Document(document_cli::Command),
     #[cfg(target_os = "linux")]
     Data(data_cli::Command),
+    #[cfg(target_os = "linux")]
+    Record(record_cli::Command),
 }
 
 #[derive(Debug)]
@@ -99,6 +107,8 @@ enum AppError {
     Document(document_cli::Error),
     #[cfg(target_os = "linux")]
     Data(data_cli::Error),
+    #[cfg(target_os = "linux")]
+    Record(record_cli::Error),
 }
 
 impl AppError {
@@ -112,6 +122,8 @@ impl AppError {
             Self::Document(e) => e.exit_code(),
             #[cfg(target_os = "linux")]
             Self::Data(e) => e.exit_code(),
+            #[cfg(target_os = "linux")]
+            Self::Record(e) => e.exit_code(),
         }
     }
 }
@@ -127,6 +139,8 @@ impl fmt::Display for AppError {
             Self::Document(e) => e.fmt(f),
             #[cfg(target_os = "linux")]
             Self::Data(e) => e.fmt(f),
+            #[cfg(target_os = "linux")]
+            Self::Record(e) => e.fmt(f),
         }
     }
 }
@@ -142,6 +156,8 @@ impl std::error::Error for AppError {
             Self::Document(_) => None,
             #[cfg(target_os = "linux")]
             Self::Data(_) => None,
+            #[cfg(target_os = "linux")]
+            Self::Record(_) => None,
         }
     }
 }
@@ -159,6 +175,8 @@ fn parse(args: &[OsString]) -> Result<Command, AppError> {
         }
         #[cfg(target_os = "linux")]
         [group, rest @ ..] if group == "data" => data_cli::parse(rest).map(Command::Data),
+        #[cfg(target_os = "linux")]
+        [group, rest @ ..] if group == "record" => record_cli::parse(rest).map(Command::Record),
         [group, action, rest @ ..] if group == "config" && action == "show" => {
             let config = match rest {
                 [] => Config::default(),
@@ -192,6 +210,10 @@ fn run(args: &[OsString], output: &mut impl Write) -> Result<(), AppError> {
         }
         #[cfg(target_os = "linux")]
         Command::Data(command) => return data_cli::run(command, output).map_err(AppError::Data),
+        #[cfg(target_os = "linux")]
+        Command::Record(command) => {
+            return record_cli::run(command, output).map_err(AppError::Record);
+        }
     };
     output
         .write_all(text.as_bytes())
