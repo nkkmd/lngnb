@@ -153,8 +153,16 @@ impl Listener {
     /// kernelのSO_PEERCREDを、要求bytesを読む前に検査する。UID自己申告は利用しない。
     /// &mut借用により二つの管理接続を同時に処理させない。
     pub fn accept(&mut self) -> Result<Connection<'_>> {
+        self.accept_for(self.timeout)
+    }
+    /// 受付待ちだけの期限を短くできる。要求/応答の既存timeoutは変更しない。
+    /// Timeoutは接続受理前だけ。呼出し側は停止要求を確認して再待機できる。
+    pub fn accept_for(&mut self, wait: Duration) -> Result<Connection<'_>> {
+        if wait.is_zero() || wait > MAX_TIMEOUT {
+            return Err(Error::Policy);
+        }
         self.check_endpoint()?;
-        let deadline = Instant::now() + self.timeout;
+        let deadline = Instant::now() + wait;
         let stream = loop {
             ready(&self.socket, PollFlags::IN, deadline)?;
             match self.socket.accept() {
@@ -246,7 +254,21 @@ impl Connection<'_> {
             return Err(RecordError::ReadOnly);
         }
         let bytes = self.receive().map_err(RecordError::Transport)?;
-        let request = RecordRequest::check(&bytes).map_err(RecordError::Invalid)?;
+        self.commit_record(&bytes)
+    }
+    /// 要求の最初のbyte前に閉じた接続だけは診断用の無操作として区別する。
+    /// 部分frame・不正Record・保存/応答失敗は成功へ読み替えない。
+    pub fn store_record_or_probe(&mut self) -> std::result::Result<Option<Receipt>, RecordError> {
+        if !matches!(self.listener.access, Access::Write(_)) {
+            return Err(RecordError::ReadOnly);
+        }
+        let Some(bytes) = self.receive_optional().map_err(RecordError::Transport)? else {
+            return Ok(None);
+        };
+        self.commit_record(&bytes).map(Some)
+    }
+    fn commit_record(&mut self, bytes: &[u8]) -> std::result::Result<Receipt, RecordError> {
+        let request = RecordRequest::check(bytes).map_err(RecordError::Invalid)?;
         let receipt = match &mut self.listener.access {
             Access::Write(writer) => request.submit(writer).map_err(RecordError::Storage)?,
             _ => return Err(RecordError::ReadOnly),
@@ -256,6 +278,9 @@ impl Connection<'_> {
         Ok(receipt)
     }
     pub fn receive(&mut self) -> Result<Vec<u8>> {
+        self.receive_optional()?.ok_or(Error::InvalidFrame)
+    }
+    fn receive_optional(&mut self) -> Result<Option<Vec<u8>>> {
         if self.received {
             return Err(Error::InvalidFrame);
         }
@@ -263,7 +288,16 @@ impl Connection<'_> {
         self.received = true;
         let deadline = Instant::now() + self.listener.timeout;
         let mut header = [0; 8];
-        transfer(&mut self.stream, &mut header, deadline)?;
+        loop {
+            ready(&self.stream, PollFlags::IN, deadline)?;
+            match self.stream.read(&mut header[..1]) {
+                Ok(0) => return Ok(None),
+                Ok(_) => break,
+                Err(e) if retry(&e) => (),
+                Err(_) => return Err(Error::Io),
+            }
+        }
+        transfer(&mut self.stream, &mut header[1..], deadline)?;
         let length =
             u32::from_be_bytes(header[4..].try_into().map_err(|_| Error::InvalidFrame)?) as usize;
         if header[..4] != MAGIC || length == 0 || length > self.listener.max_frame {
@@ -272,7 +306,7 @@ impl Connection<'_> {
         let mut bytes = vec![0; length];
         transfer(&mut self.stream, &mut bytes, deadline)?;
         self.complete = true;
-        Ok(bytes)
+        Ok(Some(bytes))
     }
     /// 応答内容の検査・永続化成否の判定は呼出し側で済ませる。
     pub fn send(&mut self, bytes: &[u8]) -> Result<()> {
