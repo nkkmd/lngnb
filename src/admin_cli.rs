@@ -54,7 +54,8 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
 }
 fn number(value: &OsString) -> Option<u64> {
     let s = value.to_str()?;
-    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) || (s.len() > 1 && s.starts_with('0')) {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) || (s.len() > 1 && s.starts_with('0'))
+    {
         return None;
     }
     s.parse().ok()
@@ -165,15 +166,41 @@ mod tests {
     #[test]
     fn runtime_options_are_canonical_bounded_unique_and_serve_only() {
         let good: Vec<OsString> = [
-            "serve", "--max-new-records", "1", "--data-dir", "資料 space",
-            "--request-timeout-ms", "500",
-        ].map(Into::into).to_vec();
+            "serve",
+            "--max-new-records",
+            "1",
+            "--data-dir",
+            "資料 space",
+            "--request-timeout-ms",
+            "500",
+        ]
+        .map(Into::into)
+        .to_vec();
         let command = parse(&good).unwrap();
         assert_eq!(command.data, PathBuf::from("資料 space"));
-        assert_eq!(command.action, Action::Serve(Config::checked(Some(500), Some(1)).unwrap()));
-        for (option, max) in [("--request-timeout-ms", "30001"), ("--max-new-records", "10001")] {
-            for bad in ["0", max, "01", "+1", "-1", "1.0", " 1", "１", "18446744073709551616", "private"] {
-                let args: Vec<OsString> = ["serve", "--data-dir", "data", option, bad].map(Into::into).to_vec();
+        assert_eq!(
+            command.action,
+            Action::Serve(Config::checked(Some(500), Some(1)).unwrap())
+        );
+        for (option, max) in [
+            ("--request-timeout-ms", "30001"),
+            ("--max-new-records", "10001"),
+        ] {
+            for bad in [
+                "0",
+                max,
+                "01",
+                "+1",
+                "-1",
+                "1.0",
+                " 1",
+                "１",
+                "18446744073709551616",
+                "private",
+            ] {
+                let args: Vec<OsString> = ["serve", "--data-dir", "data", option, bad]
+                    .map(Into::into)
+                    .to_vec();
                 let error = parse(&args).unwrap_err();
                 assert_eq!(error.exit_code(), 2);
                 assert!(!error.to_string().contains("private"));
@@ -188,5 +215,4 @@ mod tests {
             }
         }
     }
-
 }

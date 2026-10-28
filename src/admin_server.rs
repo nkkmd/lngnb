@@ -18,8 +18,7 @@ use std::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Config {
     timeout_ms: u64,
-    max_new_records: u64,
-}
+    max_new_records: u64,}
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -101,7 +100,12 @@ pub fn run(path: &Path, config: Config, output: &mut impl Write) -> Result<(), E
     let signals = Signals::install()?;
     serve(path, config, &signals.stop, output)
 }
-fn serve(path: &Path, config: Config, stop: &AtomicBool, output: &mut impl Write) -> Result<(), Error> {
+fn serve(
+    path: &Path,
+    config: Config,
+    stop: &AtomicBool,
+    output: &mut impl Write,
+) -> Result<(), Error> {
     let limits = Limits {
         session_records: config.max_new_records,
         ..Limits::default()
@@ -123,9 +127,12 @@ fn serve(path: &Path, config: Config, stop: &AtomicBool, output: &mut impl Write
         }
     }
     let writer = startup.into_writer().map_err(|_| Error::Unconfirmed)?;
-    let mut listener =
-        Listener::bind_writer(writer, lngnb::cbor::MAX_RECORD, Duration::from_millis(config.timeout_ms))
-            .map_err(|_| Error::Unconfirmed)?;
+    let mut listener = Listener::bind_writer(
+        writer,
+        lngnb::cbor::MAX_RECORD,
+        Duration::from_millis(config.timeout_ms),
+    )
+    .map_err(|_| Error::Unconfirmed)?;
     let ready = format!(
         "管理受理側のローカル起動検査を完了し、管理socketを開きました。公開・復旧完了の判定ではありません。\nrequest_timeout_ms: {}\nmax_new_records: {}\n設定はこの起動だけに適用し、保存していません。\n",
         config.timeout_ms, config.max_new_records
@@ -182,11 +189,20 @@ mod tests {
     #[test]
     fn runtime_config_only_tightens_existing_defaults() {
         assert_eq!(Config::checked(None, None), Some(Config::default()));
-        assert_eq!(Config::default().max_new_records, Limits::default().session_records);
+        assert_eq!(
+            Config::default().max_new_records,
+            Limits::default().session_records
+        );
         assert_eq!(Config::default().timeout_ms, 30_000);
         assert!(Config::checked(Some(1), Some(1)).is_some());
         assert!(Config::checked(Some(30_000), Some(10_000)).is_some());
-        for (timeout, records) in [(0, 1), (30_001, 1), (1, 0), (1, 10_001), (u64::MAX, u64::MAX)] {
+        for (timeout, records) in [
+            (0, 1),
+            (30_001, 1),
+            (1, 0),
+            (1, 10_001),
+            (u64::MAX, u64::MAX),
+        ] {
             assert!(Config::checked(Some(timeout), Some(records)).is_none());
         }
     }

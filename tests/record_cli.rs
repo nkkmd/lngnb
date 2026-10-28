@@ -564,14 +564,20 @@ fn invalid_runtime_options_fail_before_creating_or_changing_data() {
         ] {
             let out = Command::new(env!("CARGO_BIN_EXE_lngnb"))
                 .args(["admin", "serve", "--data-dir"])
-                .arg(temp.data()).args(args).output().unwrap();
+                .arg(temp.data())
+                .args(args)
+                .output()
+                .unwrap();
             assert_eq!(out.status.code(), Some(2));
             assert!(out.stdout.is_empty());
             assert!(!String::from_utf8_lossy(&out.stderr).contains("private"));
             assert!(!temp.data().join("admin.sock").exists());
             if initialized {
                 let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
-                assert_eq!(store.startup_state().unwrap(), lngnb::storage::StartupState::Clean);
+                assert_eq!(
+                    store.startup_state().unwrap(),
+                    lngnb::storage::StartupState::Clean
+                );
                 assert_eq!(store.generation().unwrap(), 0);
             } else {
                 assert!(!temp.data().exists());
@@ -611,7 +617,10 @@ fn explicit_new_record_budget_preserves_duplicates_and_resets_on_normal_restart(
             assert!(log.contains("request_timeout_ms: 30000\nmax_new_records: 10000\n"));
             let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
             assert!(store.record(revision.id()).unwrap().is_some());
-            assert_eq!(store.startup_state().unwrap(), lngnb::storage::StartupState::Clean);
+            assert_eq!(
+                store.startup_state().unwrap(),
+                lngnb::storage::StartupState::Clean
+            );
         }
     }
 }
