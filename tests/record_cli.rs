@@ -35,6 +35,9 @@ impl Drop for Temp {
     }
 }
 fn fixture() -> LocalRecord {
+    named_fixture("genesis")
+}
+fn named_fixture(kind: &str) -> LocalRecord {
     let spec = include_str!("../docs/specification-v1.0.0.md");
     let json = spec
         .split("## 付録A13 Record・IDの固定計算例")
@@ -47,7 +50,7 @@ fn fixture() -> LocalRecord {
         .next()
         .unwrap();
     let f: serde_json::Value = serde_json::from_str(json).unwrap();
-    let hex = f["genesis"]["envelope_cbor_hex"].as_str().unwrap();
+    let hex = f[kind]["envelope_cbor_hex"].as_str().unwrap();
     let bytes = (0..hex.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
@@ -222,11 +225,15 @@ struct Server {
 }
 impl Server {
     fn start(temp: &Temp) -> Self {
+        Self::configured(temp, &[])
+    }
+    fn configured(temp: &Temp, options: &[&str]) -> Self {
         let log = temp.0.join("server-output");
         let errors = temp.0.join("server-errors");
         let child = Command::new(env!("CARGO_BIN_EXE_lngnb"))
             .args(["admin", "serve", "--data-dir"])
             .arg(temp.data())
+            .args(options)
             .stdout(fs::File::create(&log).unwrap())
             .stderr(fs::File::create(&errors).unwrap())
             .spawn()
@@ -539,4 +546,88 @@ fn failed_final_clean_commit_is_not_reported_as_normal_shutdown() {
             .unwrap()
             .contains("正常終了しました")
     );
+}
+
+#[test]
+fn invalid_runtime_options_fail_before_creating_or_changing_data() {
+    let temp = Temp::new();
+    for initialized in [false, true] {
+        if initialized {
+            drop(RecordStore::initialize(&temp.data(), Limits::default()).unwrap());
+        }
+        for args in [
+            vec!["--request-timeout-ms", "0"],
+            vec!["--request-timeout-ms", "30001"],
+            vec!["--max-new-records", "10001"],
+            vec!["--max-new-records", "private"],
+            vec!["--max-new-records", "1", "--max-new-records", "2"],
+        ] {
+            let out = Command::new(env!("CARGO_BIN_EXE_lngnb"))
+                .args(["admin", "serve", "--data-dir"])
+                .arg(temp.data()).args(args).output().unwrap();
+            assert_eq!(out.status.code(), Some(2));
+            assert!(out.stdout.is_empty());
+            assert!(!String::from_utf8_lossy(&out.stderr).contains("private"));
+            assert!(!temp.data().join("admin.sock").exists());
+            if initialized {
+                let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
+                assert_eq!(store.startup_state().unwrap(), lngnb::storage::StartupState::Clean);
+                assert_eq!(store.generation().unwrap(), 0);
+            } else {
+                assert!(!temp.data().exists());
+            }
+        }
+    }
+}
+
+#[test]
+fn explicit_new_record_budget_preserves_duplicates_and_resets_on_normal_restart() {
+    for exhaust in [false, true] {
+        let temp = Temp::new();
+        drop(RecordStore::initialize(&temp.data(), Limits::default()).unwrap());
+        fs::write(temp.input(), fixture().bytes()).unwrap();
+        let mut server = Server::configured(&temp, &["--max-new-records", "1"]);
+        for _ in 0..2 {
+            assert!(cli(&temp.data(), &temp.input()).status.success());
+        }
+        let revision = named_fixture("revision");
+        fs::write(temp.input(), revision.bytes()).unwrap();
+        if exhaust {
+            assert_eq!(cli(&temp.data(), &temp.input()).status.code(), Some(3));
+            assert_eq!(server.wait().code(), Some(3));
+            assert_review(&temp, true);
+            let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
+            assert!(store.record(revision.id()).unwrap().is_none());
+        } else {
+            server.signal("-TERM");
+            assert!(server.wait().success());
+            let log = fs::read_to_string(&server.log).unwrap();
+            assert!(log.contains("request_timeout_ms: 30000\nmax_new_records: 1\n"));
+            let mut restarted = Server::start(&temp);
+            assert!(cli(&temp.data(), &temp.input()).status.success());
+            restarted.signal("-TERM");
+            assert!(restarted.wait().success());
+            let log = fs::read_to_string(&restarted.log).unwrap();
+            assert!(log.contains("request_timeout_ms: 30000\nmax_new_records: 10000\n"));
+            let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
+            assert!(store.record(revision.id()).unwrap().is_some());
+            assert_eq!(store.startup_state().unwrap(), lngnb::storage::StartupState::Clean);
+        }
+    }
+}
+
+#[test]
+fn explicit_request_deadline_is_applied_and_timeout_never_becomes_clean() {
+    let temp = Temp::new();
+    drop(RecordStore::initialize(&temp.data(), Limits::default()).unwrap());
+    let mut server = Server::configured(&temp, &["--request-timeout-ms", "500"]);
+    let stream = send_raw(&temp.data(), b"L");
+    // 既定30秒ならwaitの10秒上限を超える。相手は閉じずに期限切れを待つ。
+    assert_eq!(server.wait().code(), Some(3));
+    drop(stream);
+    assert_review(&temp, false);
+    let log = fs::read_to_string(&server.log).unwrap();
+    assert!(log.contains("request_timeout_ms: 500\nmax_new_records: 10000\n"));
+    assert!(!log.contains("正常終了しました"));
+    assert!(temp.data().join("admin.sock").exists());
 }
