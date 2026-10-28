@@ -61,10 +61,16 @@ fn endpoint(dir: &rustix::fd::OwnedFd, owner: u32) -> Result<(u64, u64)> {
     Ok((meta.dev(), meta.ino()))
 }
 
-/// 接続先のkernel UIDが領域所有者/rootであることを、送信前に照合する。
-/// timeoutは接続から応答全体まで一つの単調deadline（最大30秒）。
-/// 書込み開始後の失敗・不正応答・ID不一致は保守的にcommit不明として返す。
-pub fn submit(path: &Path, record: &LocalRecord, timeout: Duration) -> Result<Receipt> {
+/// socketの権限・同一性と接続先kernel UIDだけを検査する。要求bytesは送らない。
+/// 相手の受理準備・プロトコル対応・保存状態を確認するものではない。
+/// DB/lockを開かず、失敗時も再送・初期化・残存socket削除をしない。
+pub fn probe(path: &Path, timeout: Duration) -> Result<()> {
+    let (stream, _) = connect(path, timeout)?;
+    drop(stream);
+    Ok(())
+}
+
+fn connect(path: &Path, timeout: Duration) -> Result<(UnixStream, Instant)> {
     if timeout.is_zero() || timeout > MAX_TIMEOUT {
         return Err(Error::Policy);
     }
@@ -97,7 +103,14 @@ pub fn submit(path: &Path, record: &LocalRecord, timeout: Duration) -> Result<Re
     if endpoint(&dir, owner)? != identity {
         return Err(Error::Endpoint);
     }
-    let mut stream = UnixStream::from(fd);
+    Ok((UnixStream::from(fd), deadline))
+}
+
+/// 接続先のkernel UIDが領域所有者/rootであることを、送信前に照合する。
+/// timeoutは接続から応答全体まで一つの単調deadline（最大30秒）。
+/// 書込み開始後の失敗・不正応答・ID不一致は保守的にcommit不明として返す。
+pub fn submit(path: &Path, record: &LocalRecord, timeout: Duration) -> Result<Receipt> {
+    let (mut stream, deadline) = connect(path, timeout)?;
     let mut header = MAGIC.to_vec();
     header.extend_from_slice(&(record.bytes().len() as u32).to_be_bytes());
     send_all(&mut stream, &header, deadline).map_err(|_| Error::OutcomeUnknown)?;
