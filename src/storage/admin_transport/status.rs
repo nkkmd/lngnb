@@ -30,7 +30,10 @@ impl Snapshot {
             self.max_stored_bytes,
             self.available_bytes,
             self.reserved_floor_bytes,
-        ].into_iter().enumerate() {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             bytes[1 + i * 8..9 + i * 8].copy_from_slice(&value.to_be_bytes());
         }
         bytes[57..61].copy_from_slice(&self.request_timeout_ms.to_be_bytes());
@@ -50,12 +53,15 @@ impl Snapshot {
             request_timeout_ms: u32::from_be_bytes(bytes[57..61].try_into().unwrap()),
             capacity_warning: bytes[61] == 1,
         };
-        if bytes[0] != 1 || bytes[61] > 1
+        if bytes[0] != 1
+            || bytes[61] > 1
             || snapshot.generation > i64::MAX as u64
-            || snapshot.max_new_records == 0 || snapshot.max_stored_bytes == 0
+            || snapshot.max_new_records == 0
+            || snapshot.max_stored_bytes == 0
             || snapshot.new_records > snapshot.max_new_records
             || snapshot.stored_bytes > snapshot.max_stored_bytes
-            || snapshot.request_timeout_ms == 0 || snapshot.request_timeout_ms > 30_000
+            || snapshot.request_timeout_ms == 0
+            || snapshot.request_timeout_ms > 30_000
         {
             return None;
         }
@@ -78,22 +84,34 @@ impl Endpoint {
         }
         let socket = UnixListener::bind(&path).map_err(|_| Error::Io)?;
         let meta = std::fs::symlink_metadata(&path).map_err(|_| Error::Io)?;
-        if !meta.file_type().is_socket() { return Err(Error::UnsafeEndpoint); }
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(|_| Error::Io)?;
+        if !meta.file_type().is_socket() {
+            return Err(Error::UnsafeEndpoint);
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|_| Error::Io)?;
         if meta.uid() != owner {
             std::os::unix::fs::chown(&path, Some(owner), None).map_err(|_| Error::Io)?;
         }
         socket.set_nonblocking(true).map_err(|_| Error::Io)?;
-        let endpoint = Self { socket, identity: (meta.dev(), meta.ino()) };
+        let endpoint = Self {
+            socket,
+            identity: (meta.dev(), meta.ino()),
+        };
         endpoint.check(store, owner)?;
         Ok(endpoint)
     }
     pub(super) fn check(&self, store: &RecordStore, owner: u32) -> Result<()> {
         check_area(&store.dir).map_err(|_| Error::UnsafeEndpoint)?;
         let parent = std::fs::metadata(anchored(&store.dir, ".")).map_err(|_| Error::Io)?;
-        let meta = std::fs::symlink_metadata(anchored(&store.dir, NAME)).map_err(|_| Error::UnsafeEndpoint)?;
-        if parent.uid() != owner || meta.uid() != owner || !meta.file_type().is_socket()
-            || meta.mode() & 0o7777 != 0o600 || meta.nlink() != 1 || (meta.dev(), meta.ino()) != self.identity {
+        let meta = std::fs::symlink_metadata(anchored(&store.dir, NAME))
+            .map_err(|_| Error::UnsafeEndpoint)?;
+        if parent.uid() != owner
+            || meta.uid() != owner
+            || !meta.file_type().is_socket()
+            || meta.mode() & 0o7777 != 0o600
+            || meta.nlink() != 1
+            || (meta.dev(), meta.ino()) != self.identity
+        {
             return Err(Error::UnsafeEndpoint);
         }
         Ok(())
@@ -113,10 +131,14 @@ impl Listener {
             Access::Write(_) => (),
             _ => return Err(Error::WrongMode),
         }
-        if self.timeout.as_millis() == 0 || self.timeout != Duration::from_millis(self.timeout.as_millis() as u64) {
+        if self.timeout.as_millis() == 0
+            || self.timeout != Duration::from_millis(self.timeout.as_millis() as u64)
+        {
             return Err(Error::Policy);
         }
-        if self.status.is_some() { return Err(Error::EndpointExists); }
+        if self.status.is_some() {
+            return Err(Error::EndpointExists);
+        }
         self.status = Some(Endpoint::bind(self.access.store(), self.owner)?);
         Ok(())
     }
@@ -135,9 +157,16 @@ impl Listener {
         self.check_endpoint()?;
         endpoint.check(self.access.store(), self.owner)?;
         stream.set_nonblocking(true).map_err(|_| Error::Io)?;
-        let Access::Write(writer) = &self.access else { return Err(Error::WrongMode); };
-        if writer.failed { return Err(Error::SessionFailed); }
-        let generation = writer.store.generation().map_err(|_| Error::SessionFailed)?;
+        let Access::Write(writer) = &self.access else {
+            return Err(Error::WrongMode);
+        };
+        if writer.failed {
+            return Err(Error::SessionFailed);
+        }
+        let generation = writer
+            .store
+            .generation()
+            .map_err(|_| Error::SessionFailed)?;
         let capacity = writer.store.capacity().map_err(|_| Error::SessionFailed)?;
         let snapshot = Snapshot {
             generation: generation.try_into().map_err(|_| Error::SessionFailed)?,
@@ -147,7 +176,11 @@ impl Listener {
             max_stored_bytes: writer.store.limits.session_bytes,
             available_bytes: capacity.available,
             reserved_floor_bytes: capacity.reserved_floor,
-            request_timeout_ms: self.timeout.as_millis().try_into().map_err(|_| Error::Policy)?,
+            request_timeout_ms: self
+                .timeout
+                .as_millis()
+                .try_into()
+                .map_err(|_| Error::Policy)?,
             capacity_warning: capacity.warning,
         };
         let bytes = snapshot.bytes();
@@ -163,13 +196,18 @@ impl Listener {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{Limits, StartupState, tests::{Temp, fixture, logical_snapshot}};
+    use crate::storage::{
+        Limits, StartupState,
+        tests::{Temp, fixture, logical_snapshot},
+    };
     use std::{thread, time::Instant};
 
     fn serve(listener: &mut Listener) {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            if listener.serve_status_if_pending().unwrap() { break; }
+            if listener.serve_status_if_pending().unwrap() {
+                break;
+            }
             assert!(Instant::now() < deadline);
             thread::yield_now();
         }
@@ -183,26 +221,47 @@ mod tests {
     #[test]
     fn fixed_status_bytes_and_invalid_fields_are_independently_checked() {
         let expected = "0100000000000000010000000000000002000000000000000300000000000000040000000000000005000000000000000600000000000000070000000801";
-        let bytes: Vec<u8> = (0..expected.len()).step_by(2).map(|i|u8::from_str_radix(&expected[i..i+2],16).unwrap()).collect();
-        let snapshot = Snapshot { generation: 1, new_records: 2, stored_bytes: 3, max_new_records: 4, max_stored_bytes: 5, available_bytes: 6, reserved_floor_bytes: 7, request_timeout_ms: 8, capacity_warning: true };
+        let bytes: Vec<u8> = (0..expected.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&expected[i..i + 2], 16).unwrap())
+            .collect();
+        let snapshot = Snapshot {
+            generation: 1,
+            new_records: 2,
+            stored_bytes: 3,
+            max_new_records: 4,
+            max_stored_bytes: 5,
+            available_bytes: 6,
+            reserved_floor_bytes: 7,
+            request_timeout_ms: 8,
+            capacity_warning: true,
+        };
         assert_eq!(snapshot.bytes().as_slice(), bytes);
         let valid = snapshot.bytes();
         assert_eq!(Snapshot::check(&valid), Some(snapshot));
         for (offset, value) in [(0, 0), (61, 2), (1, 255), (16, 255), (24, 255)] {
-            let mut bad = valid; bad[offset] = value;
+            let mut bad = valid;
+            bad[offset] = value;
             assert!(Snapshot::check(&bad).is_none());
         }
         for range in [25..33, 33..41, 57..61] {
-            let mut bad = valid; bad[range].fill(0);
+            let mut bad = valid;
+            bad[range].fill(0);
             assert!(Snapshot::check(&bad).is_none());
         }
-        let mut bad = valid; bad[57..61].copy_from_slice(&30_001u32.to_be_bytes());
+        let mut bad = valid;
+        bad[57..61].copy_from_slice(&30_001u32.to_be_bytes());
         assert!(Snapshot::check(&bad).is_none());
     }
     #[test]
     fn runtime_status_is_read_only_counts_new_records_and_keeps_one_lock() {
         let temp = Temp::new();
-        let mut listener = Listener::bind_writer(temp.store().begin().unwrap(), MAX_FRAME, Duration::from_secs(1)).unwrap();
+        let mut listener = Listener::bind_writer(
+            temp.store().begin().unwrap(),
+            MAX_FRAME,
+            Duration::from_secs(1),
+        )
+        .unwrap();
         listener.enable_status().unwrap();
         assert_eq!(listener.enable_status(), Err(Error::EndpointExists));
         let before = logical_snapshot(&listener.access.store().conn);
@@ -214,7 +273,9 @@ mod tests {
         assert!(RecordStore::open(&temp.data(), Limits::default()).is_err());
         for _ in 0..2 {
             let path = temp.data();
-            let worker = thread::spawn(move ||client::submit(&path, &fixture(), Duration::from_secs(2)).unwrap());
+            let worker = thread::spawn(move || {
+                client::submit(&path, &fixture(), Duration::from_secs(2)).unwrap()
+            });
             listener.accept().unwrap().store_record().unwrap();
             worker.join().unwrap();
         }
@@ -227,39 +288,73 @@ mod tests {
         listener.close_writer().unwrap().finish().unwrap();
         assert!(!temp.data().join(NAME).exists());
         assert!(!temp.data().join(super::super::NAME).exists());
-        assert_eq!(RecordStore::open(&temp.data(), Limits::default()).unwrap().startup_state().unwrap(), StartupState::Clean);
+        assert_eq!(
+            RecordStore::open(&temp.data(), Limits::default())
+                .unwrap()
+                .startup_state()
+                .unwrap(),
+            StartupState::Clean
+        );
     }
     #[test]
     fn status_residue_and_replacement_are_never_adopted_or_removed() {
         let inspect = Temp::new();
-        let mut readonly = Listener::bind(inspect.store(), MAX_FRAME, Duration::from_secs(1)).unwrap();
+        let mut readonly =
+            Listener::bind(inspect.store(), MAX_FRAME, Duration::from_secs(1)).unwrap();
         assert_eq!(readonly.enable_status(), Err(Error::WrongMode));
         readonly.close().unwrap();
         let fractional = Temp::new();
-        let mut listener = Listener::bind_writer(fractional.store().begin().unwrap(), MAX_FRAME, Duration::from_micros(500)).unwrap();
+        let mut listener = Listener::bind_writer(
+            fractional.store().begin().unwrap(),
+            MAX_FRAME,
+            Duration::from_micros(500),
+        )
+        .unwrap();
         assert_eq!(listener.enable_status(), Err(Error::Policy));
         drop(listener);
         for replace in [false, true] {
             let temp = Temp::new();
-            let mut listener = Listener::bind_writer(temp.store().begin().unwrap(), MAX_FRAME, Duration::from_secs(1)).unwrap();
+            let mut listener = Listener::bind_writer(
+                temp.store().begin().unwrap(),
+                MAX_FRAME,
+                Duration::from_secs(1),
+            )
+            .unwrap();
             let path = temp.data().join(NAME);
-            if replace { listener.enable_status().unwrap(); std::fs::remove_file(&path).unwrap(); }
+            if replace {
+                listener.enable_status().unwrap();
+                std::fs::remove_file(&path).unwrap();
+            }
             std::fs::write(&path, b"preserve").unwrap();
             if replace {
-                assert!(matches!(listener.close_writer(), Err(Error::UnsafeEndpoint)));
+                assert!(matches!(
+                    listener.close_writer(),
+                    Err(Error::UnsafeEndpoint)
+                ));
             } else {
                 assert_eq!(listener.enable_status(), Err(Error::EndpointExists));
                 drop(listener);
             }
             assert_eq!(std::fs::read(&path).unwrap(), b"preserve");
             assert!(temp.data().join(super::super::NAME).exists());
-            assert_eq!(RecordStore::open(&temp.data(), Limits::default()).unwrap().startup_state().unwrap(), StartupState::NeedsReview);
+            assert_eq!(
+                RecordStore::open(&temp.data(), Limits::default())
+                    .unwrap()
+                    .startup_state()
+                    .unwrap(),
+                StartupState::NeedsReview
+            );
         }
     }
     #[test]
     fn diagnostic_response_loss_does_not_mutate_db_or_confirm_normal_finish() {
         let temp = Temp::new();
-        let mut listener = Listener::bind_writer(temp.store().begin().unwrap(), MAX_FRAME, Duration::from_secs(1)).unwrap();
+        let mut listener = Listener::bind_writer(
+            temp.store().begin().unwrap(),
+            MAX_FRAME,
+            Duration::from_secs(1),
+        )
+        .unwrap();
         listener.enable_status().unwrap();
         let before = logical_snapshot(&listener.access.store().conn);
         let dir = super::super::super::directory(&temp.data()).unwrap();
@@ -268,7 +363,13 @@ mod tests {
         assert!(listener.serve_status_if_pending().is_err());
         assert_eq!(before, logical_snapshot(&listener.access.store().conn));
         drop(listener);
-        assert_eq!(RecordStore::open(&temp.data(), Limits::default()).unwrap().startup_state().unwrap(), StartupState::NeedsReview);
+        assert_eq!(
+            RecordStore::open(&temp.data(), Limits::default())
+                .unwrap()
+                .startup_state()
+                .unwrap(),
+            StartupState::NeedsReview
+        );
         assert!(temp.data().join(NAME).exists());
     }
 }

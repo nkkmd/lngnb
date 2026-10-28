@@ -51,8 +51,7 @@ fn authenticate_server(fd: &impl std::os::fd::AsFd, owner: u32) -> Result<()> {
 fn endpoint(dir: &rustix::fd::OwnedFd, owner: u32, name: &str) -> Result<(u64, u64)> {
     check_area(dir).map_err(|_| Error::Endpoint)?;
     let parent = std::fs::metadata(anchored(dir, ".")).map_err(|_| Error::Endpoint)?;
-    let meta =
-        std::fs::symlink_metadata(anchored(dir, name)).map_err(|_| Error::Endpoint)?;
+    let meta = std::fs::symlink_metadata(anchored(dir, name)).map_err(|_| Error::Endpoint)?;
     if parent.uid() != owner
         || !meta.file_type().is_socket()
         || meta.uid() != owner
@@ -118,7 +117,9 @@ pub fn status(path: &Path, timeout: Duration) -> Result<super::RuntimeStatus> {
     let (mut stream, deadline) = connect_to(path, super::status::NAME, timeout)?;
     let mut header = [0; 8];
     transfer(&mut stream, &mut header, deadline).map_err(|_| Error::StatusUnavailable)?;
-    if header[..4] != super::status::MAGIC || header[4..] != (super::status::SIZE as u32).to_be_bytes() {
+    if header[..4] != super::status::MAGIC
+        || header[4..] != (super::status::SIZE as u32).to_be_bytes()
+    {
         return Err(Error::StatusUnavailable);
     }
     let mut bytes = [0; super::status::SIZE];

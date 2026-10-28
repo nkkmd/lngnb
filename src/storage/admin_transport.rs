@@ -213,7 +213,13 @@ impl Listener {
         if let Some(status) = &self.status {
             status.check(self.access.store(), self.owner)?;
         }
-        let Self { socket, status, access, owner, .. } = self;
+        let Self {
+            socket,
+            status,
+            access,
+            owner,
+            ..
+        } = self;
         drop(socket);
         let store = access.store();
         if let Some(status) = status {

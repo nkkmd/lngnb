@@ -144,8 +144,12 @@ fn serve(
         .and_then(|()| output.flush())
         .map_err(|_| Error::Unconfirmed)?;
     while !stop.load(Ordering::SeqCst) {
-        listener.serve_status_if_pending().map_err(|_| Error::Unconfirmed)?;
-        if stop.load(Ordering::SeqCst) { break; }
+        listener
+            .serve_status_if_pending()
+            .map_err(|_| Error::Unconfirmed)?;
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
         let mut connection = match listener.accept_for(Duration::from_millis(100)) {
             Ok(connection) => connection,
             Err(TransportError::Timeout) => continue,

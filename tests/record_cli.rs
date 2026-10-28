@@ -643,38 +643,63 @@ fn explicit_request_deadline_is_applied_and_timeout_never_becomes_clean() {
 
 fn status_cli(data: &Path) -> Output {
     Command::new(env!("CARGO_BIN_EXE_lngnb"))
-        .args(["admin", "status", "--data-dir"]).arg(data).output().unwrap()
+        .args(["admin", "status", "--data-dir"])
+        .arg(data)
+        .output()
+        .unwrap()
 }
 fn diagnostic_field(output: &Output, name: &str) -> u64 {
     let text = std::str::from_utf8(&output.stdout).unwrap();
-    text.lines().find_map(|line|line.strip_prefix(&format!("{name}: "))).unwrap().parse().unwrap()
+    text.lines()
+        .find_map(|line| line.strip_prefix(&format!("{name}: ")))
+        .unwrap()
+        .parse()
+        .unwrap()
 }
 #[test]
 fn active_runtime_status_is_read_only_reports_limits_and_excludes_duplicate_insertions() {
     let temp = Temp::new();
     drop(RecordStore::initialize(&temp.data(), Limits::default()).unwrap());
-    let mut server = Server::configured(&temp, &["--request-timeout-ms", "5000", "--max-new-records", "2"]);
+    let mut server = Server::configured(
+        &temp,
+        &["--request-timeout-ms", "5000", "--max-new-records", "2"],
+    );
     let first = status_cli(&temp.data());
     assert!(first.status.success(), "{:?}", first.stderr);
-    assert_eq!(diagnostic_field(&first,"session_new_records"),0);
-    assert_eq!(diagnostic_field(&first,"max_new_records"),2);
-    assert_eq!(diagnostic_field(&first,"request_timeout_ms"),5000);
+    assert_eq!(diagnostic_field(&first, "session_new_records"), 0);
+    assert_eq!(diagnostic_field(&first, "max_new_records"), 2);
+    assert_eq!(diagnostic_field(&first, "request_timeout_ms"), 5000);
     let again = status_cli(&temp.data());
     assert!(again.status.success());
-    assert_eq!(diagnostic_field(&first,"generation"), diagnostic_field(&again,"generation"));
+    assert_eq!(
+        diagnostic_field(&first, "generation"),
+        diagnostic_field(&again, "generation")
+    );
     fs::write(temp.input(), fixture().bytes()).unwrap();
-    for _ in 0..2 { assert!(cli(&temp.data(), &temp.input()).status.success()); }
+    for _ in 0..2 {
+        assert!(cli(&temp.data(), &temp.input()).status.success());
+    }
     let second = status_cli(&temp.data());
     assert!(second.status.success());
-    assert_eq!(diagnostic_field(&second,"session_new_records"),1);
-    assert_eq!(diagnostic_field(&second,"session_stored_bytes"),fixture().bytes().len() as u64);
-    assert!(diagnostic_field(&second,"generation") > diagnostic_field(&first,"generation"));
-    assert!(String::from_utf8(second.stdout).unwrap().contains("保存済み総件数ではありません"));
+    assert_eq!(diagnostic_field(&second, "session_new_records"), 1);
+    assert_eq!(
+        diagnostic_field(&second, "session_stored_bytes"),
+        fixture().bytes().len() as u64
+    );
+    assert!(diagnostic_field(&second, "generation") > diagnostic_field(&first, "generation"));
+    assert!(
+        String::from_utf8(second.stdout)
+            .unwrap()
+            .contains("保存済み総件数ではありません")
+    );
     server.signal("-TERM");
     assert!(server.wait().success());
     assert!(!temp.data().join("admin-status.sock").exists());
     let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
-    assert_eq!(store.startup_state().unwrap(),lngnb::storage::StartupState::Clean);
+    assert_eq!(
+        store.startup_state().unwrap(),
+        lngnb::storage::StartupState::Clean
+    );
     assert!(store.record(fixture().id()).unwrap().is_some());
 }
 #[test]
@@ -683,61 +708,97 @@ fn unavailable_status_never_initializes_or_falls_back_to_old_record_listener() {
     assert_eq!(status_cli(&temp.data()).status.code(), Some(1));
     assert!(!temp.data().exists());
     let store = RecordStore::initialize(&temp.data(), Limits::default()).unwrap();
-    let mut old = Listener::bind_writer(store.begin().unwrap(),lngnb::cbor::MAX_RECORD,Duration::from_millis(100)).unwrap();
+    let mut old = Listener::bind_writer(
+        store.begin().unwrap(),
+        lngnb::cbor::MAX_RECORD,
+        Duration::from_millis(100),
+    )
+    .unwrap();
     assert_eq!(status_cli(&temp.data()).status.code(), Some(1));
-    assert!(matches!(old.accept(),Err(lngnb::storage::admin_transport::Error::Timeout)));
-    fs::hard_link(temp.data().join("admin.sock"),temp.data().join("admin-status.sock")).unwrap();
+    assert!(matches!(
+        old.accept(),
+        Err(lngnb::storage::admin_transport::Error::Timeout)
+    ));
+    fs::hard_link(
+        temp.data().join("admin.sock"),
+        temp.data().join("admin-status.sock"),
+    )
+    .unwrap();
     assert_eq!(status_cli(&temp.data()).status.code(), Some(1));
-    assert!(matches!(old.accept(),Err(lngnb::storage::admin_transport::Error::Timeout)));
+    assert!(matches!(
+        old.accept(),
+        Err(lngnb::storage::admin_transport::Error::Timeout)
+    ));
     fs::remove_file(temp.data().join("admin-status.sock")).unwrap();
     old.close_writer().unwrap().finish().unwrap();
 }
 #[test]
 fn status_socket_residue_and_replacement_prevent_normal_shutdown_without_deletion() {
-    for replace in [false,true] {
+    for replace in [false, true] {
         let temp = Temp::new();
         drop(RecordStore::initialize(&temp.data(), Limits::default()).unwrap());
         let path = temp.data().join("admin-status.sock");
         if replace {
             let mut server = Server::start(&temp);
             fs::remove_file(&path).unwrap();
-            fs::write(&path,b"preserve").unwrap();
+            fs::write(&path, b"preserve").unwrap();
             server.signal("-TERM");
             assert_eq!(server.wait().code(), Some(3));
         } else {
-            fs::write(&path,b"preserve").unwrap();
-            let out=Command::new(env!("CARGO_BIN_EXE_lngnb")).args(["admin","serve","--data-dir"]).arg(temp.data()).output().unwrap();
-            assert_eq!(out.status.code(),Some(3));
+            fs::write(&path, b"preserve").unwrap();
+            let out = Command::new(env!("CARGO_BIN_EXE_lngnb"))
+                .args(["admin", "serve", "--data-dir"])
+                .arg(temp.data())
+                .output()
+                .unwrap();
+            assert_eq!(out.status.code(), Some(3));
             assert!(out.stdout.is_empty());
         }
-        assert_eq!(fs::read(&path).unwrap(),b"preserve");
+        assert_eq!(fs::read(&path).unwrap(), b"preserve");
         assert!(temp.data().join("admin.sock").exists());
-        assert_review(&temp,false);
+        assert_review(&temp, false);
     }
 }
 #[test]
 fn malformed_status_reply_is_diagnostic_failure_and_sends_no_request() {
-    use std::{io::{Read,Write},os::fd::AsRawFd,os::unix::net::UnixListener};
+    use std::{
+        io::{Read, Write},
+        os::fd::AsRawFd,
+        os::unix::net::UnixListener,
+    };
     let temp = Temp::new();
     drop(RecordStore::initialize(&temp.data(), Limits::default()).unwrap());
     let dir = fs::File::open(temp.data()).unwrap();
-    let anchored = PathBuf::from(format!("/proc/self/fd/{}",dir.as_raw_fd())).join("admin-status.sock");
-    let socket=UnixListener::bind(anchored).unwrap();
-    fs::set_permissions(temp.data().join("admin-status.sock"),fs::Permissions::from_mode(0o600)).unwrap();
-    fs::write(temp.data().join("admin.sock"),b"preserve").unwrap();
+    let anchored =
+        PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd())).join("admin-status.sock");
+    let socket = UnixListener::bind(anchored).unwrap();
+    fs::set_permissions(
+        temp.data().join("admin-status.sock"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    fs::write(temp.data().join("admin.sock"), b"preserve").unwrap();
     let worker = thread::spawn(move || {
-        let (mut stream,_) = socket.accept().unwrap();
+        let (mut stream, _) = socket.accept().unwrap();
         stream.write_all(b"LNI\x02\x00\x00\x00\x3e").unwrap();
-        let mut byte=[0;1];
-        stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        assert_eq!(stream.read(&mut byte).unwrap(),0);
+        let mut byte = [0; 1];
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        assert_eq!(stream.read(&mut byte).unwrap(), 0);
     });
-    let out=status_cli(&temp.data());
-    assert_eq!(out.status.code(),Some(1));
+    let out = status_cli(&temp.data());
+    assert_eq!(out.status.code(), Some(1));
     assert!(out.stdout.is_empty());
     worker.join().unwrap();
-    assert_eq!(fs::read(temp.data().join("admin.sock")).unwrap(),b"preserve");
-    let store=RecordStore::open(&temp.data(),Limits::default()).unwrap();
-    assert_eq!(store.generation().unwrap(),0);
-    assert_eq!(store.startup_state().unwrap(),lngnb::storage::StartupState::Clean);
+    assert_eq!(
+        fs::read(temp.data().join("admin.sock")).unwrap(),
+        b"preserve"
+    );
+    let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
+    assert_eq!(store.generation().unwrap(), 0);
+    assert_eq!(
+        store.startup_state().unwrap(),
+        lngnb::storage::StartupState::Clean
+    );
 }
