@@ -18,7 +18,8 @@ use std::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Config {
     timeout_ms: u64,
-    max_new_records: u64,}
+    max_new_records: u64,
+}
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -206,5 +207,4 @@ mod tests {
             assert!(Config::checked(Some(timeout), Some(records)).is_none());
         }
     }
-
 }
