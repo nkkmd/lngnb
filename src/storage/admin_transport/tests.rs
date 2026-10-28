@@ -313,3 +313,168 @@ fn slow_trickle_and_response_backpressure_share_one_deadline_per_frame() {
     drop(connection);
     drop(server.close().unwrap());
 }
+
+fn initialized_writer(area: &Area) -> crate::storage::RecordWriter {
+    drop(area.store());
+    let mut startup =
+        crate::storage::LocalStartup::open(&area.0.join("data"), Limits::default()).unwrap();
+    assert!(!startup.needs_review());
+    while !startup
+        .step(
+            crate::storage::EvaluationLimits::default(),
+            crate::storage::LocalStartupBudget::default(),
+        )
+        .unwrap()
+        .checks_complete()
+    {}
+    startup.into_writer().unwrap()
+}
+
+#[test]
+fn authenticated_record_commit_reply_duplicate_and_close_preserve_one_writer_lock() {
+    let area = Area::new();
+    let writer = initialized_writer(&area);
+    let mut server = Listener::bind_writer(writer, MAX_FRAME, Duration::from_millis(100)).unwrap();
+    let record = crate::storage::tests::fixture(); // A13公開fixture
+    for inserted in [true, false] {
+        let mut client = UnixStream::connect(area.endpoint()).unwrap();
+        client.write_all(&frame(record.bytes())).unwrap();
+        let mut connection = server.accept().unwrap();
+        let receipt = connection.store_record().unwrap();
+        assert_eq!(receipt.record_id, record.id());
+        assert_eq!(receipt.inserted, inserted);
+        assert!(matches!(
+            connection.store_record(),
+            Err(RecordError::Transport(Error::InvalidFrame))
+        ));
+        assert!(connection.store().record(record.id()).unwrap().is_some());
+        let mut expected = vec![0; 42];
+        client.read_exact(&mut expected).unwrap();
+        assert_eq!(expected, frame(&receipt.bytes()));
+        assert!(matches!(
+            RecordStore::open(&area.0.join("data"), Limits::default()),
+            Err(StorageError::Busy)
+        ));
+    }
+    let writer = server.close_writer().unwrap();
+    assert!(!area.endpoint().exists());
+    assert!(matches!(
+        RecordStore::open(&area.0.join("data"), Limits::default()),
+        Err(StorageError::Busy)
+    ));
+    writer.finish().unwrap();
+    assert_eq!(
+        RecordStore::open(&area.0.join("data"), Limits::default())
+            .unwrap()
+            .startup_state()
+            .unwrap(),
+        StartupState::Clean
+    );
+}
+
+#[test]
+fn record_storage_failure_never_acknowledges_and_blocks_normal_finish() {
+    let area = Area::new();
+    let writer = initialized_writer(&area);
+    writer.store.conn.execute_batch("CREATE TRIGGER deny_record BEFORE INSERT ON records BEGIN SELECT RAISE(ABORT,'test'); END;").unwrap();
+    let mut server = Listener::bind_writer(writer, MAX_FRAME, Duration::from_millis(100)).unwrap();
+    let record = crate::storage::tests::fixture();
+    let mut client = UnixStream::connect(area.endpoint()).unwrap();
+    client.write_all(&frame(record.bytes())).unwrap();
+    let mut connection = server.accept().unwrap();
+    assert!(matches!(
+        connection.store_record(),
+        Err(RecordError::Storage(_))
+    ));
+    assert!(connection.store().record(record.id()).unwrap().is_none());
+    drop(connection);
+    let writer = server.close_writer().unwrap();
+    assert!(matches!(
+        writer.finish(),
+        Err(StorageError::UnresolvedFailure)
+    ));
+    assert_eq!(
+        RecordStore::open(&area.0.join("data"), Limits::default())
+            .unwrap()
+            .startup_state()
+            .unwrap(),
+        StartupState::NeedsReview
+    );
+}
+
+#[test]
+fn lost_commit_response_retains_receipt_and_record_without_repeating_insertion() {
+    let area = Area::new();
+    let mut server = Listener::bind_writer(
+        initialized_writer(&area),
+        MAX_FRAME,
+        Duration::from_millis(100),
+    )
+    .unwrap();
+    let record = crate::storage::tests::fixture();
+    let mut client = UnixStream::connect(area.endpoint()).unwrap();
+    client.write_all(&frame(record.bytes())).unwrap();
+    client.shutdown(std::net::Shutdown::Read).unwrap();
+    let mut connection = server.accept().unwrap();
+    let Err(RecordError::ResponseLost(receipt)) = connection.store_record() else {
+        panic!("commit and response failure must be distinguished");
+    };
+    assert_eq!(receipt.record_id, record.id());
+    assert!(receipt.inserted);
+    assert!(connection.store().record(record.id()).unwrap().is_some());
+    drop(connection);
+    let mut retry = UnixStream::connect(area.endpoint()).unwrap();
+    retry.write_all(&frame(record.bytes())).unwrap();
+    let mut connection = server.accept().unwrap();
+    assert!(!connection.store_record().unwrap().inserted);
+    drop(connection);
+    server.close_writer().unwrap().finish().unwrap();
+}
+
+#[test]
+fn inspection_mode_and_invalid_requests_never_become_writes_or_clear_review() {
+    let area = Area::new();
+    drop(area.store().begin().unwrap());
+    let store = RecordStore::open(&area.0.join("data"), Limits::default()).unwrap();
+    let before = crate::storage::tests::logical_snapshot(&store.conn);
+    let mut server = Listener::bind(store, MAX_FRAME, Duration::from_millis(100)).unwrap();
+    let record = crate::storage::tests::fixture();
+    let mut client = UnixStream::connect(area.endpoint()).unwrap();
+    client.write_all(&frame(record.bytes())).unwrap();
+    let mut connection = server.accept().unwrap();
+    assert!(matches!(
+        connection.store_record(),
+        Err(RecordError::ReadOnly)
+    ));
+    assert_eq!(
+        crate::storage::tests::logical_snapshot(&connection.store().conn),
+        before
+    );
+    drop(connection);
+    assert_eq!(
+        server.close().unwrap().startup_state().unwrap(),
+        StartupState::NeedsReview
+    );
+
+    let other = Area::new();
+    let mut server = Listener::bind_writer(
+        initialized_writer(&other),
+        MAX_FRAME,
+        Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut client = UnixStream::connect(other.endpoint()).unwrap();
+    client.write_all(&frame(b"not a signed Record")).unwrap();
+    let mut connection = server.accept().unwrap();
+    let before = crate::storage::tests::logical_snapshot(&connection.store().conn);
+    let error = connection.store_record().unwrap_err();
+    assert!(matches!(error, RecordError::Invalid(_)));
+    assert_eq!(error.to_string(), "admin_record_rejected");
+    assert!(std::error::Error::source(&error).is_none());
+    assert_eq!(
+        crate::storage::tests::logical_snapshot(&connection.store().conn),
+        before
+    );
+    drop(connection);
+    server.close_writer().unwrap().finish().unwrap();
+}

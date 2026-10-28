@@ -6,7 +6,9 @@ use lngnb::{
     id::{self, Id, Kind},
     keyfile::{KeyDirectory, KeyFileError},
     secret_terminal::{SecretInputError, SecretTerminal, TerminalSignals},
-    storage::{EvaluationLimits, Limits, LocalStartup, LocalStartupBudget, StorageError},
+    storage::{
+        EvaluationLimits, Limits, LocalStartup, LocalStartupBudget, StorageError, management,
+    },
 };
 use std::{
     ffi::OsString,
@@ -219,8 +221,8 @@ fn save(
     if blob.byte_length != payload.len() as u64 {
         return Err(StorageError::Corrupt);
     }
-    writer.insert(pair.genesis())?;
-    writer.insert(pair.revision())?;
+    management::store_record(&mut writer, pair.genesis())?;
+    management::store_record(&mut writer, pair.revision())?;
     writer.finish()
 }
 fn summary(pair: &InitialRecords) -> Result<String, Error> {
