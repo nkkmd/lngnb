@@ -211,3 +211,71 @@ fn server_authentication_rejects_real_other_uid_before_reading_self_claims() {
     stream.read_exact(&mut untouched).unwrap();
     assert_eq!(&untouched, b"root");
 }
+
+#[test]
+fn probe_sends_no_bytes_and_does_not_require_application_readiness() {
+    let temp = Temp::new();
+    drop(temp.store());
+    let path = temp.data().join("admin.sock");
+    let server = mock_socket(&temp.data());
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    // accept/readしない相手でも接続だけを確認する。アプリケーション成功ではない。
+    probe(&temp.data(), Duration::from_secs(1)).unwrap();
+    let (mut stream, _) = server.accept().unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let mut bytes = [0; 1];
+    assert_eq!(stream.read(&mut bytes).unwrap(), 0);
+    server.set_nonblocking(true).unwrap();
+    assert!(matches!(server.accept(), Err(e) if e.kind()==std::io::ErrorKind::WouldBlock));
+    drop(stream);
+    drop(server);
+    assert_eq!(
+        probe(&temp.data(), Duration::from_secs(1)),
+        Err(Error::Connect)
+    );
+    assert!(path.exists()); // 残存socketを整理しない。
+}
+
+#[test]
+fn probe_disconnect_does_not_change_manual_wait_or_store_records() {
+    let temp = Temp::new();
+    drop(temp.store().begin().unwrap()); // 意図的に異常終了状態を作る。
+    let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
+    let before = store.startup_state().unwrap();
+    assert_ne!(before, StartupState::Clean);
+    let mut listener =
+        Listener::bind(store, crate::cbor::MAX_RECORD, Duration::from_secs(1)).unwrap();
+    probe(&temp.data(), Duration::from_secs(1)).unwrap();
+    let mut connection = listener.accept().unwrap();
+    assert!(connection.receive().is_err()); // 診断は操作frameを送らない。
+    assert_eq!(connection.store().startup_state().unwrap(), before);
+    assert!(connection.store().record(fixture().id()).unwrap().is_none());
+    drop(connection);
+    let store = listener.close().unwrap();
+    assert_eq!(store.startup_state().unwrap(), before);
+}
+
+#[test]
+fn probe_rejects_policy_missing_and_non_socket_without_creating_or_removing() {
+    let temp = Temp::new();
+    assert_eq!(probe(&temp.data(), Duration::ZERO), Err(Error::Policy));
+    assert_eq!(
+        probe(&temp.data(), Duration::from_secs(31)),
+        Err(Error::Policy)
+    );
+    assert_eq!(
+        probe(&temp.data(), Duration::from_secs(1)),
+        Err(Error::Endpoint)
+    );
+    assert!(!temp.data().exists());
+    drop(temp.store());
+    let path = temp.data().join("admin.sock");
+    std::fs::write(&path, b"preserve").unwrap();
+    assert_eq!(
+        probe(&temp.data(), Duration::from_secs(1)),
+        Err(Error::Endpoint)
+    );
+    assert_eq!(std::fs::read(path).unwrap(), b"preserve");
+}

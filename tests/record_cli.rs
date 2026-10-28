@@ -167,3 +167,50 @@ fn malformed_reply_returns_unknown_outcome_without_direct_storage_fallback() {
     assert!(store.record(record.id()).unwrap().is_none());
     assert_eq!(fs::read(temp.input()).unwrap(), record.bytes());
 }
+
+fn probe_cli(data: &Path) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_lngnb"))
+        .args(["admin", "probe", "--data-dir"])
+        .arg(data)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn probe_cli_sends_no_request_and_preserves_manual_wait() {
+    let temp = Temp::new();
+    let store = RecordStore::initialize(&temp.data(), Limits::default()).unwrap();
+    drop(store.begin().unwrap());
+    let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
+    let before = store.startup_state().unwrap();
+    let mut listener =
+        Listener::bind(store, lngnb::cbor::MAX_RECORD, Duration::from_secs(5)).unwrap();
+    let out = probe_cli(&temp.data());
+    assert!(out.status.success(), "{:?}", out.stderr);
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("保存要求は送っていません"));
+    assert!(text.contains("受理準備・プロトコル対応・保存状態"));
+    let mut connection = listener.accept().unwrap();
+    assert!(connection.receive().is_err());
+    assert_eq!(connection.store().startup_state().unwrap(), before);
+    drop(connection);
+    let store = listener.close().unwrap();
+    assert_eq!(store.startup_state().unwrap(), before);
+    assert!(store.record(fixture().id()).unwrap().is_none());
+}
+
+#[test]
+fn probe_cli_missing_and_unsafe_targets_are_preserved_without_fallback() {
+    let temp = Temp::new();
+    let out = probe_cli(&temp.data());
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty());
+    assert!(!temp.data().exists());
+    drop(RecordStore::initialize(&temp.data(), Limits::default()).unwrap());
+    let path = temp.data().join("admin.sock");
+    fs::write(&path, b"preserve").unwrap();
+    let out = probe_cli(&temp.data());
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty());
+    assert_eq!(fs::read(path).unwrap(), b"preserve");
+}
