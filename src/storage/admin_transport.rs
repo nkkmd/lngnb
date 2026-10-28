@@ -24,7 +24,9 @@ const MAX_FRAME: usize = crate::cbor::MAX_RECORD;
 const MAX_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub mod client;
+mod evaluation;
 mod status;
+pub use evaluation::Snapshot as EvaluationStatus;
 pub use status::Snapshot as RuntimeStatus;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +64,7 @@ type Result<T> = std::result::Result<T, Error>;
 pub struct Listener {
     socket: UnixListener,
     status: Option<status::Endpoint>,
+    evaluation: Option<status::Endpoint>,
     access: Access,
     identity: (u64, u64),
     owner: u32,
@@ -129,6 +132,7 @@ impl Listener {
         let listener = Self {
             socket,
             status: None,
+            evaluation: None,
             access,
             identity: (created.dev(), created.ino()),
             owner: parent.uid(),
@@ -213,15 +217,22 @@ impl Listener {
         if let Some(status) = &self.status {
             status.check(self.access.store(), self.owner)?;
         }
+        if let Some(endpoint) = &self.evaluation {
+            endpoint.check(self.access.store(), self.owner)?;
+        }
         let Self {
             socket,
             status,
+            evaluation,
             access,
             owner,
             ..
         } = self;
         drop(socket);
         let store = access.store();
+        if let Some(endpoint) = evaluation {
+            endpoint.close(store, owner)?;
+        }
         if let Some(status) = status {
             status.close(store, owner)?;
         }

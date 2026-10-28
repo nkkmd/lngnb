@@ -12,15 +12,19 @@ pub struct Command {
 enum Action {
     Probe,
     Status,
+    Evaluate,
     Serve(Config),
 }
 pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
-    let usage =
-        || AppError::Usage("admin probe/status/serve の操作・明示領域・設定値を確認してください");
+    let usage = || {
+        AppError::Usage(
+            "admin probe/status/evaluate/serve の操作・明示領域・設定値を確認してください",
+        )
+    };
     let [action, rest @ ..] = args else {
         return Err(usage());
     };
-    if action != "probe" && action != "status" && action != "serve" {
+    if action != "probe" && action != "status" && action != "evaluate" && action != "serve" {
         return Err(usage());
     }
     let mut data = None;
@@ -46,6 +50,8 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
     }
     let action = if action == "probe" {
         Action::Probe
+    } else if action == "evaluate" {
+        Action::Evaluate
     } else if action == "status" {
         Action::Status
     } else {
@@ -70,6 +76,8 @@ pub enum Error {
     Output,
     Status,
     StatusOutput,
+    Evaluation,
+    EvaluationOutput,
     Server(super::admin_server::Error),
 }
 impl Error {
@@ -86,6 +94,8 @@ impl fmt::Display for Error {
             return e.fmt(f);
         }
         f.write_str(match self {
+            Self::Evaluation => "保存・評価診断を取得・照合できません。部分件数・健全性は不明です。受理側が保全停止した可能性があるため領域とsocketを保持して確認してください。自動再送・直接DB読込み・残存物整理・再開は行いません。",
+            Self::EvaluationOutput => "保存・評価診断の照合後、結果出力に失敗しました。診断は評価確定・公開・正常停止・復旧完了ではありません。",
             Self::Status => "管理受理側の実行時診断を取得・照合できません。保存要求・再送・直接DB読込み・socket削除は行っていません。診断endpointがない旧受理側へは保存経路で再接続しません。",
             Self::StatusOutput => "管理受理側の実行時診断を照合後、結果出力に失敗しました。保存要求は送っていません。公開・正常停止・復旧完了の判定ではありません。",
             Self::Connection => "管理socketへの認証付き接続を確認できません。初期化・削除・再送・直接保存は行っていません。",
@@ -98,6 +108,11 @@ impl std::error::Error for Error {}
 pub fn run(command: Command, output: &mut impl Write) -> Result<(), Error> {
     if let Action::Serve(config) = command.action {
         return super::admin_server::run(&command.data, config, output).map_err(Error::Server);
+    }
+    if command.action == Action::Evaluate {
+        let diagnostic = client::evaluate(&command.data, Duration::from_secs(30))
+            .map_err(|_| Error::Evaluation)?;
+        return evaluation_report(diagnostic, output);
     }
     if command.action == Action::Status {
         let status =
@@ -134,6 +149,27 @@ fn status_report(
         .write_all(text.as_bytes())
         .and_then(|()| output.flush())
         .map_err(|_| Error::StatusOutput)
+}
+
+fn evaluation_report(
+    status: lngnb::storage::admin_transport::EvaluationStatus,
+    output: &mut impl Write,
+) -> Result<(), Error> {
+    let text = format!(
+        "管理受理側の保存・評価診断（公開・正常停止・復旧完了の判定ではありません）。\ndiagnostic_generation: {}\nrecords: {}\ndiagnostic_valid: {}\ndiagnostic_pending: {}\ndiagnostic_invalid: {}\npayload_verified: {}\npayload_missing: {}\npayload_unavailable: {}\n診断は保存済み評価へ反映していません。保存要求は送らず、手動確認待ちは解除しません。pin・公開・同期・重要履歴全体の診断は未実装です。\n",
+        status.generation,
+        status.records,
+        status.valid,
+        status.pending,
+        status.invalid,
+        status.payload_verified,
+        status.payload_missing,
+        status.payload_unavailable
+    );
+    output
+        .write_all(text.as_bytes())
+        .and_then(|()| output.flush())
+        .map_err(|_| Error::EvaluationOutput)
 }
 
 #[cfg(test)]
@@ -287,5 +323,59 @@ mod tests {
         assert!(matches!(error, Error::StatusOutput));
         assert_eq!(error.exit_code(), 1);
         assert_eq!(Error::Status.exit_code(), 1);
+    }
+}
+
+#[cfg(test)]
+mod evaluation_tests {
+    use super::*;
+    #[test]
+    fn evaluation_is_explicit_and_output_failure_does_not_claim_storage_uncertainty() {
+        assert_eq!(
+            parse(&["evaluate".into(), "--data-dir".into(), "data".into()])
+                .unwrap()
+                .action,
+            Action::Evaluate
+        );
+        for args in [
+            vec!["evaluate"],
+            vec!["evaluate", "--data-dir", ""],
+            vec![
+                "evaluate",
+                "--data-dir",
+                "data",
+                "--request-timeout-ms",
+                "1",
+            ],
+            vec!["evaluate", "--data-dir", "data", "--max-new-records", "1"],
+        ] {
+            let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
+            assert_eq!(parse(&args).unwrap_err().exit_code(), 2);
+        }
+        let snapshot = lngnb::storage::admin_transport::EvaluationStatus {
+            generation: 1,
+            records: 1,
+            valid: 0,
+            pending: 1,
+            invalid: 0,
+            payload_verified: 0,
+            payload_missing: 1,
+            payload_unavailable: 0,
+        };
+        let mut output = Vec::new();
+        evaluation_report(snapshot, &mut output).unwrap();
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("保存済み評価へ反映していません")
+        );
+        let mut closed = std::io::Cursor::new(&mut [0u8; 0][..]);
+        assert_eq!(
+            evaluation_report(snapshot, &mut closed)
+                .unwrap_err()
+                .exit_code(),
+            1
+        );
+        assert_eq!(Error::Evaluation.exit_code(), 1);
     }
 }

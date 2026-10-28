@@ -48,6 +48,7 @@ pub fn store_record(writer: &mut RecordWriter, record: &LocalRecord) -> Result<R
 #[derive(Debug)]
 pub struct Diagnostic {
     pub generation: i64,
+    pub storage_fault: bool,
     pub startup_state: StartupState,
     pub records: usize,
     pub valid: usize,
@@ -67,12 +68,13 @@ impl RecordStore {
     /// 既存の同じ排他を使い、writer取得・評価確定・finish・手動待ち解除を行わない。
     /// 予算超過や検査失敗では部分集計を返さない。容量は試料で保存成功保証ではない。
     pub fn diagnose(&self, limits: EvaluationLimits) -> Result<Diagnostic> {
-        let snapshot = self.evaluate(limits)?;
+        let (snapshot, storage_fault) = self.diagnostic_evaluation(limits)?;
         let state = self.startup_state()?;
         let capacity = self.capacity()?;
         let recovery = self.blob_recovery();
         let mut diagnostic = Diagnostic {
             generation: snapshot.generation,
+            storage_fault,
             startup_state: state,
             records: snapshot.records.len(),
             valid: 0,

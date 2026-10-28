@@ -27,6 +27,7 @@ const HELP: &str = "lngnb — 分散図書館・知識基盤（開発初期段�
   lngnb data status --data-dir PATH
   lngnb admin probe --data-dir PATH
   lngnb admin status --data-dir PATH
+  lngnb admin evaluate --data-dir PATH
   lngnb admin serve --data-dir PATH [--request-timeout-ms N] [--max-new-records N]
   lngnb record submit --data-dir PATH --record PATH
   lngnb document create --data-dir PATH --key-dir PATH --name NAME --expect-key-id KEY_ID --payload PATH --metadata PATH [--media-type TYPE] [--max-payload-bytes N]
