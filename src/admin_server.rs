@@ -69,7 +69,8 @@ pub fn run(path: &Path, output: &mut impl Write) -> Result<(), Error> {
     serve(path, &signals.stop, output)
 }
 fn serve(path: &Path, stop: &AtomicBool, output: &mut impl Write) -> Result<(), Error> {
-    let mut startup = LocalStartup::open(path, Limits::default()).map_err(|_| Error::Unconfirmed)?;
+    let mut startup =
+        LocalStartup::open(path, Limits::default()).map_err(|_| Error::Unconfirmed)?;
     if startup.needs_review() {
         return Err(Error::Unconfirmed);
     }
@@ -86,8 +87,9 @@ fn serve(path: &Path, stop: &AtomicBool, output: &mut impl Write) -> Result<(), 
         }
     }
     let writer = startup.into_writer().map_err(|_| Error::Unconfirmed)?;
-    let mut listener = Listener::bind_writer(writer, lngnb::cbor::MAX_RECORD, Duration::from_secs(30))
-        .map_err(|_| Error::Unconfirmed)?;
+    let mut listener =
+        Listener::bind_writer(writer, lngnb::cbor::MAX_RECORD, Duration::from_secs(30))
+            .map_err(|_| Error::Unconfirmed)?;
     output
         .write_all("管理受理側のローカル起動検査を完了し、管理socketを開きました。公開・復旧完了の判定ではありません。\n".as_bytes())
         .and_then(|()| output.flush())
@@ -129,7 +131,11 @@ mod tests {
             assert_eq!(error.exit_code(), code);
             assert!(std::error::Error::source(&error).is_none());
         }
-        assert!(Error::Unconfirmed.to_string().contains("正常停止・復旧完了とは扱いません"));
+        assert!(
+            Error::Unconfirmed
+                .to_string()
+                .contains("正常停止・復旧完了とは扱いません")
+        );
         assert!(Error::StoppedOutput.to_string().contains("正常終了後"));
     }
 }

@@ -88,7 +88,9 @@ mod tests {
             PathBuf::from("資料 space")
         );
         assert_eq!(
-            parse(&["serve".into(), "--data-dir".into(), "data".into()]).unwrap().action,
+            parse(&["serve".into(), "--data-dir".into(), "data".into()])
+                .unwrap()
+                .action,
             Action::Serve
         );
         for args in [

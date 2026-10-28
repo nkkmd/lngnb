@@ -484,19 +484,33 @@ fn short_accept_wait_preserves_request_deadline_and_empty_probe_is_not_a_frame()
     let area = Area::new();
     let writer = initialized_writer(&area);
     let mut server = Listener::bind_writer(writer, MAX_FRAME, Duration::from_secs(1)).unwrap();
-    assert!(matches!(server.accept_for(Duration::ZERO), Err(Error::Policy)));
-    assert!(matches!(server.accept_for(Duration::from_secs(31)), Err(Error::Policy)));
-    assert!(matches!(server.accept_for(Duration::from_millis(1)), Err(Error::Timeout)));
+    assert!(matches!(
+        server.accept_for(Duration::ZERO),
+        Err(Error::Policy)
+    ));
+    assert!(matches!(
+        server.accept_for(Duration::from_secs(31)),
+        Err(Error::Policy)
+    ));
+    assert!(matches!(
+        server.accept_for(Duration::from_millis(1)),
+        Err(Error::Timeout)
+    ));
     drop(UnixStream::connect(area.endpoint()).unwrap());
     let mut connection = server.accept_for(Duration::from_millis(10)).unwrap();
     assert!(connection.store_record_or_probe().unwrap().is_none());
-    assert!(matches!(connection.store_record_or_probe(), Err(RecordError::Transport(Error::InvalidFrame))));
+    assert!(matches!(
+        connection.store_record_or_probe(),
+        Err(RecordError::Transport(Error::InvalidFrame))
+    ));
     drop(connection);
     let mut client = UnixStream::connect(area.endpoint()).unwrap();
     let mut connection = server.accept_for(Duration::from_millis(1)).unwrap();
     // 受付予算1msを越えても、要求読取りには元の1秒が適用される。
     std::thread::sleep(Duration::from_millis(20));
-    client.write_all(&frame(crate::storage::tests::fixture().bytes())).unwrap();
+    client
+        .write_all(&frame(crate::storage::tests::fixture().bytes()))
+        .unwrap();
     assert!(connection.store_record_or_probe().unwrap().is_some());
     drop(connection);
     server.close_writer().unwrap().finish().unwrap();

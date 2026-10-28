@@ -237,13 +237,27 @@ impl Server {
             if fs::read_to_string(&server.log).unwrap().contains('\n') {
                 return server;
             }
-            assert!(server.child.try_wait().unwrap().is_none(), "{:?}", fs::read_to_string(&server.errors));
-            assert!(std::time::Instant::now() < deadline, "server did not become ready");
+            assert!(
+                server.child.try_wait().unwrap().is_none(),
+                "{:?}",
+                fs::read_to_string(&server.errors)
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "server did not become ready"
+            );
             thread::sleep(Duration::from_millis(10));
         }
     }
     fn signal(&mut self, signal: &str) {
-        assert!(Command::new("kill").arg(signal).arg(self.child.id().to_string()).status().unwrap().success());
+        assert!(
+            Command::new("kill")
+                .arg(signal)
+                .arg(self.child.id().to_string())
+                .status()
+                .unwrap()
+                .success()
+        );
     }
     fn wait(&mut self) -> std::process::ExitStatus {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -279,7 +293,10 @@ fn raw_record() -> Vec<u8> {
 }
 fn assert_review(temp: &Temp, stored: bool) {
     let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
-    assert_eq!(store.startup_state().unwrap(), lngnb::storage::StartupState::NeedsReview);
+    assert_eq!(
+        store.startup_state().unwrap(),
+        lngnb::storage::StartupState::NeedsReview
+    );
     assert_eq!(store.record(fixture().id()).unwrap().is_some(), stored);
 }
 
@@ -296,17 +313,27 @@ fn foreground_server_probes_submits_stops_and_restarts_without_losing_records() 
     assert!(RecordStore::open(&temp.data(), Limits::default()).is_err());
     server.signal("-TERM");
     assert!(server.wait().success());
-    assert!(fs::read_to_string(&server.log).unwrap().contains("正常終了しました"));
+    assert!(
+        fs::read_to_string(&server.log)
+            .unwrap()
+            .contains("正常終了しました")
+    );
     assert!(!temp.data().join("admin.sock").exists());
     let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
-    assert_eq!(store.startup_state().unwrap(), lngnb::storage::StartupState::Clean);
+    assert_eq!(
+        store.startup_state().unwrap(),
+        lngnb::storage::StartupState::Clean
+    );
     assert!(store.record(fixture().id()).unwrap().is_some());
     drop(store);
     let mut server = Server::start(&temp);
     server.signal("-INT");
     assert!(server.wait().success());
     let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
-    assert_eq!(store.startup_state().unwrap(), lngnb::storage::StartupState::Clean);
+    assert_eq!(
+        store.startup_state().unwrap(),
+        lngnb::storage::StartupState::Clean
+    );
     assert!(store.record(fixture().id()).unwrap().is_some());
 }
 
@@ -325,7 +352,9 @@ fn foreground_server_refuses_missing_manual_wait_and_existing_endpoint() {
         }
         let out = Command::new(env!("CARGO_BIN_EXE_lngnb"))
             .args(["admin", "serve", "--data-dir"])
-            .arg(temp.data()).output().unwrap();
+            .arg(temp.data())
+            .output()
+            .unwrap();
         assert_eq!(out.status.code(), Some(3));
         assert!(out.stdout.is_empty());
         if mode == 0 {
@@ -333,7 +362,10 @@ fn foreground_server_refuses_missing_manual_wait_and_existing_endpoint() {
         } else {
             assert_review(&temp, false);
             if mode == 2 {
-                assert_eq!(fs::read(temp.data().join("admin.sock")).unwrap(), b"preserve");
+                assert_eq!(
+                    fs::read(temp.data().join("admin.sock")).unwrap(),
+                    b"preserve"
+                );
             }
         }
     }
@@ -361,14 +393,19 @@ os.close(fd)
 "#;
     let status = Command::new(std::env::var_os("LNGNB_REFERENCE_PYTHON").unwrap())
         .args(["-c", script])
-        .arg(temp.data()).arg(server.child.id().to_string()).status().unwrap();
+        .arg(temp.data())
+        .arg(server.child.id().to_string())
+        .status()
+        .unwrap();
     assert!(status.success());
     assert_eq!(server.wait().code(), Some(3));
     assert_review(&temp, false);
     assert!(temp.data().join("admin.sock").exists());
     let out = Command::new(env!("CARGO_BIN_EXE_lngnb"))
         .args(["admin", "serve", "--data-dir"])
-        .arg(temp.data()).output().unwrap();
+        .arg(temp.data())
+        .output()
+        .unwrap();
     assert_eq!(out.status.code(), Some(3));
     assert_review(&temp, false);
 }
@@ -388,7 +425,11 @@ fn lost_response_keeps_committed_record_and_forbids_normal_shutdown() {
     drop(stream);
     assert_review(&temp, true);
     assert!(temp.data().join("admin.sock").exists());
-    assert!(!fs::read_to_string(&server.log).unwrap().contains("正常終了しました"));
+    assert!(
+        !fs::read_to_string(&server.log)
+            .unwrap()
+            .contains("正常終了しました")
+    );
 }
 
 #[test]
@@ -410,7 +451,10 @@ fn storage_failure_and_replaced_socket_never_become_clean_on_stop() {
         assert_eq!(server.wait().code(), Some(3));
         assert_review(&temp, false);
         if !sql {
-            assert_eq!(fs::read(temp.data().join("admin.sock")).unwrap(), b"replacement");
+            assert_eq!(
+                fs::read(temp.data().join("admin.sock")).unwrap(),
+                b"replacement"
+            );
         }
     }
 }
@@ -433,8 +477,14 @@ fn ready_output_failure_preserves_unclean_state_and_endpoint() {
     let out = Command::new(env!("CARGO_BIN_EXE_lngnb"))
         .args(["admin", "serve", "--data-dir"])
         .arg(temp.data())
-        .stdout(fs::OpenOptions::new().write(true).open("/dev/full").unwrap())
-        .output().unwrap();
+        .stdout(
+            fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/full")
+                .unwrap(),
+        )
+        .output()
+        .unwrap();
     assert_eq!(out.status.code(), Some(3));
     assert_review(&temp, false);
     assert!(temp.data().join("admin.sock").exists());
@@ -450,7 +500,8 @@ fn shutdown_output_failure_is_distinct_from_uncertain_storage() {
         .arg(temp.data())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
-        .spawn().unwrap();
+        .spawn()
+        .unwrap();
     let mut reader = BufReader::new(child.stdout.take().unwrap());
     let mut line = String::new();
     reader.read_line(&mut line).unwrap();
@@ -465,7 +516,10 @@ fn shutdown_output_failure_is_distinct_from_uncertain_storage() {
     assert_eq!(server.wait().code(), Some(1));
     assert!(!temp.data().join("admin.sock").exists());
     let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
-    assert_eq!(store.startup_state().unwrap(), lngnb::storage::StartupState::Clean);
+    assert_eq!(
+        store.startup_state().unwrap(),
+        lngnb::storage::StartupState::Clean
+    );
 }
 
 #[test]
@@ -480,5 +534,9 @@ fn failed_final_clean_commit_is_not_reported_as_normal_shutdown() {
     assert_eq!(server.wait().code(), Some(3));
     assert!(!temp.data().join("admin.sock").exists());
     assert_review(&temp, false);
-    assert!(!fs::read_to_string(&server.log).unwrap().contains("正常終了しました"));
+    assert!(
+        !fs::read_to_string(&server.log)
+            .unwrap()
+            .contains("正常終了しました")
+    );
 }
