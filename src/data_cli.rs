@@ -1,8 +1,6 @@
 //! R01/R24/R28/R30: 保存領域の明示初期化とローカル診断。公開/復旧/IPCではない。
 use super::AppError;
-use lngnb::storage::{
-    EvaluationLimits, Limits, RecordStore, StartupState, StorageError,
-};
+use lngnb::storage::{EvaluationLimits, Limits, RecordStore, StartupState, StorageError};
 use std::{ffi::OsString, fmt, io::Write, path::PathBuf};
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
