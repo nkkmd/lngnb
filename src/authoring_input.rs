@@ -22,6 +22,7 @@ pub enum InputError {
     InvalidMetadata,
     Cancelled,
     Allocation,
+    RecordLimit,
 }
 impl std::fmt::Display for InputError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -34,6 +35,7 @@ impl std::fmt::Display for InputError {
             Self::InvalidMetadata => "invalid_creation_metadata_cbor",
             Self::Cancelled => "creation_input_cancelled",
             Self::Allocation => "creation_input_allocation_failed",
+            Self::RecordLimit => "record_input_limit",
         })
     }
 }
@@ -161,6 +163,22 @@ fn bounded(
     Ok(out)
 }
 
+/// 完成Recordの通常fileを既存と同じNOFOLLOW/単一link/変更照合で読む。
+/// 最大2 MiB。署名・構造は呼出し側でLocalRecord.checkを行う。
+pub fn read_record_file(path: &Path) -> Result<Vec<u8>> {
+    let mut file = open_regular(path)?;
+    let before = file.metadata().map_err(|_| InputError::Io)?;
+    let bytes = bounded(
+        &mut file,
+        before.len(),
+        cbor::MAX_RECORD,
+        InputError::RecordLimit,
+        &mut |_| Ok(()),
+    )?;
+    unchanged(&file, &before)?;
+    Ok(bytes)
+}
+
 /// 本文予算は変更可能。metadata CBORは規範上限262,144 bytesを超えない。
 /// 通常file/単一linkのみ。symlink（親も含む）、..、特殊fileを拒否する。
 /// 取消しをopen前・各read前・復号前後に確認する。OS I/O待ちの強制中断ではない。
@@ -267,6 +285,20 @@ mod tests {
         CreationBudget {
             max_payload_bytes: n,
         }
+    }
+
+    #[test]
+    fn completed_record_input_keeps_exact_bytes_and_rejects_one_byte_over_limit() {
+        let t = Temp::new();
+        let bytes = vec![0xa5; cbor::MAX_RECORD];
+        let path = t.file("record", &bytes);
+        assert_eq!(read_record_file(&path).unwrap(), bytes);
+        let larger = t.file("larger", &vec![0; cbor::MAX_RECORD + 1]);
+        assert_eq!(read_record_file(&larger), Err(InputError::RecordLimit));
+        let link = t.0.join("link");
+        symlink(&path, &link).unwrap();
+        assert_eq!(read_record_file(&link), Err(InputError::UnsafePath));
+        assert_eq!(stdfs::read(&path).unwrap(), bytes);
     }
 
     #[test]
