@@ -1,0 +1,129 @@
+//! A13公開fixtureのみ。試験鍵を実運用へ流用しない。
+use super::*;
+use crate::storage::{
+    EvaluationLimits, StartupState, StorageError, Validation,
+    tests::{Temp, fixture_data, logical_snapshot, unhex},
+};
+
+fn fixture(kind: &str) -> crate::record::LocalRecord {
+    let f = fixture_data();
+    crate::record::LocalRecord::check(&unhex(f[kind]["envelope_cbor_hex"].as_str().unwrap()), None)
+        .unwrap()
+}
+
+#[test]
+fn checked_requests_commit_idempotently_without_promoting_missing_dependencies() {
+    let temp = Temp::new();
+    let mut writer = temp.store().begin().unwrap();
+    let record = fixture("revision");
+    let receipt = RecordRequest::check(record.bytes())
+        .unwrap()
+        .submit(&mut writer)
+        .unwrap();
+    assert_eq!(receipt.record_id, record.id());
+    assert!(receipt.inserted);
+    assert_eq!(receipt.bytes()[..2], [1, 1]);
+    assert_eq!(receipt.bytes()[2..], record.id().bytes);
+    let before = logical_snapshot(&writer.store.conn);
+    let duplicate = store_record(&mut writer, &record).unwrap();
+    assert!(!duplicate.inserted);
+    assert_eq!(logical_snapshot(&writer.store.conn), before);
+    let diagnostic = writer.store.evaluate(EvaluationLimits::default()).unwrap();
+    assert_eq!(diagnostic.records.len(), 1);
+    assert_eq!(diagnostic.records[0].validation, Validation::Pending);
+    // commit済みでもsessionを終了せずdropしたら手動確認待ちを残す。
+    drop(writer);
+    let store =
+        crate::storage::RecordStore::open(&temp.data(), crate::storage::Limits::default()).unwrap();
+    assert_eq!(store.startup_state().unwrap(), StartupState::NeedsReview);
+    assert!(store.record(record.id()).unwrap().is_some());
+    assert!(matches!(store.begin(), Err(StorageError::NeedsReview)));
+}
+
+#[test]
+fn malformed_secret_shaped_and_tampered_inputs_never_reach_storage() {
+    let temp = Temp::new();
+    let writer = temp.store().begin().unwrap();
+    let before = logical_snapshot(&writer.store.conn);
+    let mut altered = fixture("genesis").bytes().to_vec();
+    let last = altered.len() - 1;
+    altered[last] ^= 1;
+    for bytes in [
+        vec![],
+        vec![0; 32],
+        b"passphrase=private".to_vec(),
+        vec![0xa0],
+        altered,
+        vec![0; crate::cbor::MAX_RECORD + 1],
+    ] {
+        assert!(RecordRequest::check(&bytes).is_err());
+        assert_eq!(logical_snapshot(&writer.store.conn), before);
+    }
+    writer.finish().unwrap();
+}
+
+#[test]
+fn sql_failure_retains_prior_commit_blocks_finish_and_cannot_be_cleared_by_retry() {
+    let temp = Temp::new();
+    let mut writer = temp.store().begin().unwrap();
+    let genesis = fixture("genesis");
+    store_record(&mut writer, &genesis).unwrap();
+    writer.store.conn.execute_batch("CREATE TRIGGER deny_record BEFORE INSERT ON records BEGIN SELECT RAISE(ABORT,'test'); END;").unwrap();
+    assert!(store_record(&mut writer, &fixture("revision")).is_err());
+    assert!(writer.failed);
+    assert!(matches!(
+        store_record(&mut writer, &genesis),
+        Err(StorageError::UnresolvedFailure)
+    ));
+    assert!(matches!(
+        writer.finish(),
+        Err(StorageError::UnresolvedFailure)
+    ));
+    let store =
+        crate::storage::RecordStore::open(&temp.data(), crate::storage::Limits::default()).unwrap();
+    assert_eq!(store.startup_state().unwrap(), StartupState::NeedsReview);
+    assert!(store.record(genesis.id()).unwrap().is_some());
+    assert!(store.record(fixture("revision").id()).unwrap().is_none());
+}
+
+#[test]
+fn budget_refusal_does_not_insert_or_discard_confirmed_record() {
+    let temp = Temp::new();
+    let mut store = temp.store();
+    store.limits.session_records = 1;
+    let mut writer = store.begin().unwrap();
+    store_record(&mut writer, &fixture("genesis")).unwrap();
+    let before = logical_snapshot(&writer.store.conn);
+    assert!(matches!(
+        store_record(&mut writer, &fixture("revision")),
+        Err(StorageError::BudgetExceeded)
+    ));
+    assert_eq!(logical_snapshot(&writer.store.conn), before);
+    assert!(!writer.failed); // preflight拒否は保存syscall失敗と区別する。
+    writer.finish().unwrap();
+}
+
+#[test]
+fn failed_or_policy_rejected_writer_cannot_become_a_fresh_clean_listener() {
+    use crate::storage::admin_transport::{Error, Listener};
+    use std::time::Duration;
+    for failed in [false, true] {
+        let temp = Temp::new();
+        let mut writer = temp.store().begin().unwrap();
+        if failed {
+            writer.store.conn.execute_batch("CREATE TRIGGER deny_record BEFORE INSERT ON records BEGIN SELECT RAISE(ABORT,'test'); END;").unwrap();
+            assert!(store_record(&mut writer, &fixture("genesis")).is_err());
+        }
+        let result = Listener::bind_writer(writer, 0, Duration::from_secs(1));
+        if failed {
+            assert!(matches!(result, Err(Error::SessionFailed)));
+        } else {
+            assert!(matches!(result, Err(Error::Policy)));
+        }
+        assert!(!temp.data().join("admin.sock").exists());
+        let store =
+            crate::storage::RecordStore::open(&temp.data(), crate::storage::Limits::default())
+                .unwrap();
+        assert_eq!(store.startup_state().unwrap(), StartupState::NeedsReview);
+    }
+}

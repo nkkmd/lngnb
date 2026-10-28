@@ -600,6 +600,7 @@ pub struct RecordStore {
     records_checked: bool,
 }
 pub mod admin_transport;
+pub mod management;
 impl RecordStore {
     /// 新しい最終ディレクトリだけを作る。既存/未完了領域を上書きしない。
     /// 管理CLIの初期化手順は工程⑤で接続する。
