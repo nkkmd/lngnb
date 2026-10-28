@@ -245,7 +245,8 @@ fn probe_disconnect_does_not_change_manual_wait_or_store_records() {
     let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
     let before = store.startup_state().unwrap();
     assert_ne!(before, StartupState::Clean);
-    let mut listener = Listener::bind(store, crate::cbor::MAX_RECORD, Duration::from_secs(1)).unwrap();
+    let mut listener =
+        Listener::bind(store, crate::cbor::MAX_RECORD, Duration::from_secs(1)).unwrap();
     probe(&temp.data(), Duration::from_secs(1)).unwrap();
     let mut connection = listener.accept().unwrap();
     assert!(connection.receive().is_err()); // 診断は操作frameを送らない。

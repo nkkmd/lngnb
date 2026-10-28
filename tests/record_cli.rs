@@ -183,7 +183,8 @@ fn probe_cli_sends_no_request_and_preserves_manual_wait() {
     drop(store.begin().unwrap());
     let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
     let before = store.startup_state().unwrap();
-    let mut listener = Listener::bind(store, lngnb::cbor::MAX_RECORD, Duration::from_secs(5)).unwrap();
+    let mut listener =
+        Listener::bind(store, lngnb::cbor::MAX_RECORD, Duration::from_secs(5)).unwrap();
     let out = probe_cli(&temp.data());
     assert!(out.status.success(), "{:?}", out.stderr);
     let text = String::from_utf8(out.stdout).unwrap();
