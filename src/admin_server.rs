@@ -175,7 +175,8 @@ impl Overrides {
     // 設定読込み前から同じ接続/排他/保存sessionへ渡す。writer取得時に戻さない。
     fn storage_limits(self) -> Limits {
         let mut limits = Limits::default();
-        limits.sql_inspection.callbacks = self.sql_inspection_callbacks
+        limits.sql_inspection.callbacks = self
+            .sql_inspection_callbacks
             .unwrap_or(limits.sql_inspection.callbacks);
         limits
     }
@@ -264,9 +265,12 @@ fn serve(
     stop: &AtomicBool,
     output: &mut impl Write,
 ) -> Result<(), Error> {
-    let (mut startup, saved) =
-        LocalStartup::open_with_admin_config(path, overrides.storage_limits(), overrides.max_new_records)
-            .map_err(|_| Error::Unconfirmed)?;
+    let (mut startup, saved) = LocalStartup::open_with_admin_config(
+        path,
+        overrides.storage_limits(),
+        overrides.max_new_records,
+    )
+    .map_err(|_| Error::Unconfirmed)?;
     let config = overrides.resolve(saved).ok_or(Error::Unconfirmed)?;
     if startup.needs_review() {
         return Err(Error::Unconfirmed);
@@ -353,23 +357,47 @@ mod tests {
     #[test]
     fn sql_callback_budget_is_resolved_before_open_without_changing_time_or_saved_values() {
         let defaults = Limits::default();
-        assert_eq!(Config::default().sql_inspection_callbacks, defaults.sql_inspection.callbacks);
+        assert_eq!(
+            Config::default().sql_inspection_callbacks,
+            defaults.sql_inspection.callbacks
+        );
         for value in [1, 100_000] {
-            let overrides = Overrides { sql_inspection_callbacks: Some(value), ..Overrides::default() };
+            let overrides = Overrides {
+                sql_inspection_callbacks: Some(value),
+                ..Overrides::default()
+            };
             let limits = overrides.storage_limits();
-            let config = overrides.resolve(Some(Config::default().saved_values())).unwrap();
+            let config = overrides
+                .resolve(Some(Config::default().saved_values()))
+                .unwrap();
             assert_eq!(limits.sql_inspection.callbacks, value);
             assert_eq!(config.sql_inspection_callbacks, value);
-            assert_eq!(limits.sql_inspection.elapsed, defaults.sql_inspection.elapsed);
+            assert_eq!(
+                limits.sql_inspection.elapsed,
+                defaults.sql_inspection.elapsed
+            );
             assert_eq!(limits.scan_records, defaults.scan_records);
             assert_eq!(limits.session_bytes, defaults.session_bytes);
-            assert_eq!(config.startup_budget().evaluation.nodes, LocalStartupBudget::default().evaluation.nodes);
+            assert_eq!(
+                config.startup_budget().evaluation.nodes,
+                LocalStartupBudget::default().evaluation.nodes
+            );
             assert_eq!(config.saved_values(), Config::default().saved_values());
         }
         for value in [0, 100_001, u64::MAX] {
-            assert!(Config::default().with_sql_inspection_callbacks(Some(value)).is_none());
+            assert!(
+                Config::default()
+                    .with_sql_inspection_callbacks(Some(value))
+                    .is_none()
+            );
         }
-        assert_eq!(Overrides::default().storage_limits().sql_inspection.callbacks, 100_000);
+        assert_eq!(
+            Overrides::default()
+                .storage_limits()
+                .sql_inspection
+                .callbacks,
+            100_000
+        );
     }
 
     #[test]
