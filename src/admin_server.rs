@@ -332,9 +332,14 @@ mod tests {
     #[test]
     fn startup_evaluation_budget_only_tightens_new_assessment_count_without_saving() {
         let defaults = LocalStartupBudget::default();
-        assert_eq!(Config::default().startup_evaluation_records_per_step, defaults.evaluation.nodes);
+        assert_eq!(
+            Config::default().startup_evaluation_records_per_step,
+            defaults.evaluation.nodes
+        );
         for value in [1, 32] {
-            let config = Config::default().with_startup_evaluation_records(Some(value)).unwrap();
+            let config = Config::default()
+                .with_startup_evaluation_records(Some(value))
+                .unwrap();
             let budget = config.startup_budget();
             assert_eq!(budget.evaluation.nodes, value);
             assert_eq!(budget.records.records, defaults.records.records);
@@ -345,11 +350,30 @@ mod tests {
             assert_eq!(config.saved_values(), Config::default().saved_values());
         }
         for value in [0, 33, u64::MAX] {
-            assert!(Config::default().with_startup_evaluation_records(Some(value)).is_none());
+            assert!(
+                Config::default()
+                    .with_startup_evaluation_records(Some(value))
+                    .is_none()
+            );
         }
         let saved = Config::default().saved_values();
-        assert_eq!(Overrides::default().resolve(Some(saved)).unwrap().startup_evaluation_records_per_step, 32);
-        assert_eq!(Overrides { startup_evaluation_records_per_step: Some(1), ..Overrides::default() }.resolve(Some(saved)).unwrap().startup_evaluation_records_per_step, 1);
+        assert_eq!(
+            Overrides::default()
+                .resolve(Some(saved))
+                .unwrap()
+                .startup_evaluation_records_per_step,
+            32
+        );
+        assert_eq!(
+            Overrides {
+                startup_evaluation_records_per_step: Some(1),
+                ..Overrides::default()
+            }
+            .resolve(Some(saved))
+            .unwrap()
+            .startup_evaluation_records_per_step,
+            1
+        );
     }
 
     #[test]
