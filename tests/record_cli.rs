@@ -1443,3 +1443,222 @@ fn saved_startup_split_and_diagnostic_budget_preserve_manual_wait_after_failure(
         assert_eq!(saved_config_row(&temp.data()), (500, 7, 1, 1));
     }
 }
+
+fn config_show_cli(data: &Path) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_lngnb"))
+        .args(["admin", "config-show", "--data-dir"])
+        .arg(data)
+        .output()
+        .unwrap()
+}
+#[test]
+fn config_show_saved_unsaved_and_manual_wait_do_not_change_database() {
+    let temp = Temp::new();
+    drop(RecordStore::initialize(&temp.data(), Limits::default()).unwrap());
+    let before = fs::read(temp.data().join("database.sqlite")).unwrap();
+    let output = config_show_cli(&temp.data());
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("saved: false\n"));
+    assert!(!text.contains("request_timeout_ms:"));
+    assert_eq!(
+        fs::read(temp.data().join("database.sqlite")).unwrap(),
+        before
+    );
+    assert!(
+        config_save_command(&temp.data())
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    for review in [false, true] {
+        if review {
+            drop(
+                RecordStore::open(&temp.data(), Limits::default())
+                    .unwrap()
+                    .begin()
+                    .unwrap(),
+            );
+        }
+        let before = fs::read(temp.data().join("database.sqlite")).unwrap();
+        let output = config_show_cli(&temp.data());
+        assert!(output.status.success());
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(text.contains("saved: true\n"));
+        assert!(text.contains("request_timeout_ms: 500\nmax_new_records: 7\nmax_diagnostic_records: 8\nstartup_records_per_step: 1\n"));
+        assert!(text.contains("現在の起動時適用値ではありません"));
+        assert_eq!(saved_config_row(&temp.data()), (500, 7, 8, 1));
+        assert_eq!(
+            fs::read(temp.data().join("database.sqlite")).unwrap(),
+            before
+        );
+        let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
+        let expected = if review {
+            lngnb::storage::StartupState::NeedsReview
+        } else {
+            lngnb::storage::StartupState::Clean
+        };
+        assert_eq!(store.startup_state().unwrap(), expected);
+        assert!(!temp.data().join("admin.sock").exists());
+    }
+}
+#[test]
+fn config_show_rejects_missing_unsafe_old_and_corrupt_storage_without_repair() {
+    for damage in [
+        "missing", "old", "config", "value", "history", "lock", "unsafe", "symlink", "journal",
+    ] {
+        let temp = Temp::new();
+        if damage != "missing" {
+            drop(RecordStore::initialize(&temp.data(), Limits::default()).unwrap());
+            assert!(
+                config_save_command(&temp.data())
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            );
+            let conn = rusqlite::Connection::open(temp.data().join("database.sqlite")).unwrap();
+            match damage {
+                "old" => {
+                    conn.pragma_update(None, "user_version", 11).unwrap();
+                }
+                "config" => {
+                    conn.execute("DELETE FROM admin_config", []).unwrap();
+                }
+                "value" => {
+                    conn.execute("UPDATE admin_config SET max_new_records=8", [])
+                        .unwrap();
+                }
+                "history" => {
+                    conn.execute("UPDATE history SET reason='changed' WHERE new_state='admin_config_saved_local_only'", []).unwrap();
+                }
+                "journal" => {
+                    conn.pragma_update(None, "journal_mode", "DELETE").unwrap();
+                }
+                _ => {}
+            }
+            drop(conn);
+            if damage == "lock" {
+                fs::remove_file(temp.data().join("lock")).unwrap();
+            }
+            if damage == "unsafe" {
+                fs::set_permissions(temp.data(), fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            if damage == "symlink" {
+                fs::rename(
+                    temp.data().join("database.sqlite"),
+                    temp.0.join("preserved.sqlite"),
+                )
+                .unwrap();
+                symlink(
+                    temp.0.join("preserved.sqlite"),
+                    temp.data().join("database.sqlite"),
+                )
+                .unwrap();
+            }
+        }
+        let before = fs::read(temp.data().join("database.sqlite")).ok();
+        let output = config_show_cli(&temp.data());
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        assert_eq!(fs::read(temp.data().join("database.sqlite")).ok(), before);
+        if damage == "missing" {
+            assert!(!temp.data().exists());
+        }
+        if damage == "lock" {
+            assert!(!temp.data().join("lock").exists());
+        }
+        assert!(!temp.data().join("admin.sock").exists());
+    }
+}
+#[test]
+fn config_show_invalid_arguments_and_active_server_never_fall_back_to_ipc() {
+    let temp = Temp::new();
+    for arguments in [
+        vec!["--max-new-records", "1"],
+        vec!["--data-dir", "private"],
+        vec!["--unknown", "private"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_lngnb"))
+            .args(["admin", "config-show", "--data-dir"])
+            .arg(temp.data())
+            .args(arguments)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("private"));
+        assert!(!temp.data().exists());
+    }
+    drop(RecordStore::initialize(&temp.data(), Limits::default()).unwrap());
+    let mut server = Server::start(&temp);
+    let before = status_cli(&temp.data());
+    let output = config_show_cli(&temp.data());
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let after = status_cli(&temp.data());
+    assert!(before.status.success() && after.status.success());
+    for field in [
+        "generation",
+        "session_new_records",
+        "max_new_records",
+        "request_timeout_ms",
+    ] {
+        assert_eq!(
+            diagnostic_field(&before, field),
+            diagnostic_field(&after, field)
+        );
+    }
+    server.signal("-TERM");
+    assert!(server.wait().success());
+}
+#[test]
+fn config_show_reads_committed_wal_and_output_failure_leaves_manual_wait() {
+    let temp = Temp::new();
+    drop(RecordStore::initialize(&temp.data(), Limits::default()).unwrap());
+    // SQLite接続だけを保持してWALを残す。製品のlockは保持しない試験用接続。
+    let conn = rusqlite::Connection::open(temp.data().join("database.sqlite")).unwrap();
+    conn.execute_batch("PRAGMA wal_autocheckpoint=0; SELECT * FROM storage_state;")
+        .unwrap();
+    let mut writer = RecordStore::open(&temp.data(), Limits::default())
+        .unwrap()
+        .begin()
+        .unwrap();
+    writer
+        .save_admin_config(lngnb::storage::AdminConfig {
+            request_timeout_ms: 700,
+            max_new_records: 9,
+            max_diagnostic_records: 10,
+            startup_records_per_step: 2,
+        })
+        .unwrap();
+    drop(writer);
+    assert!(
+        fs::metadata(temp.data().join("database.sqlite-wal"))
+            .unwrap()
+            .len()
+            > 0
+    );
+    let output = config_show_cli(&temp.data());
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("request_timeout_ms: 700\nmax_new_records: 9\nmax_diagnostic_records: 10\nstartup_records_per_step: 2\n"));
+    let generation: i64 = conn
+        .query_row("SELECT generation FROM storage_state", [], |r| r.get(0))
+        .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_lngnb"))
+        .args(["admin", "config-show", "--data-dir"])
+        .arg(temp.data())
+        .stdout(fs::File::options().write(true).open("/dev/full").unwrap())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("結果出力に失敗"));
+    let unchanged: (i64, String) = conn
+        .query_row("SELECT generation,state FROM storage_state", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(unchanged, (generation, "running".to_owned()));
+    assert_eq!(saved_config_row(&temp.data()), (700, 9, 10, 2));
+}
