@@ -194,7 +194,8 @@ fn saved_config_report(
     saved: Option<lngnb::storage::AdminConfig>,
     output: &mut impl Write,
 ) -> Result<(), Error> {
-    let mut text = "停止中の管理受理側の保存設定（現在の起動時適用値ではありません）。\n".to_owned();
+    let mut text =
+        "停止中の管理受理側の保存設定（現在の起動時適用値ではありません）。\n".to_owned();
     if let Some(config) = saved {
         text.push_str(&format!(
             "saved: true\nrequest_timeout_ms: {}\nmax_new_records: {}\nmax_diagnostic_records: {}\nstartup_records_per_step: {}\n",
@@ -546,7 +547,9 @@ mod config_tests {
 
     #[test]
     fn config_show_requires_only_one_explicit_path_without_runtime_options() {
-        let args: Vec<OsString> = ["config-show", "--data-dir", "資料 space"].map(Into::into).to_vec();
+        let args: Vec<OsString> = ["config-show", "--data-dir", "資料 space"]
+            .map(Into::into)
+            .to_vec();
         assert_eq!(parse(&args).unwrap().action, Action::ShowConfig);
         for extra in [
             vec!["--request-timeout-ms", "1"],
@@ -576,12 +579,20 @@ mod config_tests {
         struct Sink(bool);
         impl Write for Sink {
             fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                if self.0 { Ok(bytes.len()) } else { Err(std::io::Error::other("private")) }
+                if self.0 {
+                    Ok(bytes.len())
+                } else {
+                    Err(std::io::Error::other("private"))
+                }
             }
-            fn flush(&mut self) -> std::io::Result<()> { Err(std::io::Error::other("private")) }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::other("private"))
+            }
         }
         for flush in [false, true] {
-            let error = saved_config_report(Some(Config::default().saved_values()), &mut Sink(flush)).unwrap_err();
+            let error =
+                saved_config_report(Some(Config::default().saved_values()), &mut Sink(flush))
+                    .unwrap_err();
             assert!(matches!(error, Error::ConfigReadOutput));
             assert_eq!(error.exit_code(), 1);
             assert!(!error.to_string().contains("private"));

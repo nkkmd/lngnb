@@ -163,29 +163,52 @@ mod tests {
         drop(temp.store());
         let conn = Connection::open(temp.data().join(DB)).unwrap();
         let before = super::super::tests::logical_snapshot(&conn);
-        assert_eq!(RecordStore::read_saved_admin_config(&temp.data()).unwrap(), None);
+        assert_eq!(
+            RecordStore::read_saved_admin_config(&temp.data()).unwrap(),
+            None
+        );
         assert_eq!(super::super::tests::logical_snapshot(&conn), before);
         drop(conn);
-        let mut writer = RecordStore::open(&temp.data(), Limits::default()).unwrap().begin().unwrap();
+        let mut writer = RecordStore::open(&temp.data(), Limits::default())
+            .unwrap()
+            .begin()
+            .unwrap();
         writer.save_admin_config(config()).unwrap();
         drop(writer);
         let conn = Connection::open(temp.data().join(DB)).unwrap();
         let before = super::super::tests::logical_snapshot(&conn);
-        assert_eq!(RecordStore::read_saved_admin_config(&temp.data()).unwrap(), Some(config()));
+        assert_eq!(
+            RecordStore::read_saved_admin_config(&temp.data()).unwrap(),
+            Some(config())
+        );
         assert_eq!(super::super::tests::logical_snapshot(&conn), before);
         assert_eq!(state(&conn).unwrap(), StartupState::NeedsReview);
-        assert!(LocalStartup::open(&temp.data(), Limits::default()).unwrap().needs_review());
+        assert!(
+            LocalStartup::open(&temp.data(), Limits::default())
+                .unwrap()
+                .needs_review()
+        );
     }
     #[test]
     fn readonly_config_rejects_lock_conflict_and_does_not_scan_records() {
         let temp = Temp::new();
         let store = temp.store();
-        assert!(matches!(RecordStore::read_saved_admin_config(&temp.data()), Err(StorageError::Busy)));
+        assert!(matches!(
+            RecordStore::read_saved_admin_config(&temp.data()),
+            Err(StorageError::Busy)
+        ));
         drop(store);
         let conn = Connection::open(temp.data().join(DB)).unwrap();
-        conn.execute("INSERT INTO records(id,bytes) VALUES(?1,?2)", params![&[255u8;32][..], b"invalid".as_slice()]).unwrap();
+        conn.execute(
+            "INSERT INTO records(id,bytes) VALUES(?1,?2)",
+            params![&[255u8; 32][..], b"invalid".as_slice()],
+        )
+        .unwrap();
         let before = super::super::tests::logical_snapshot(&conn);
-        assert_eq!(RecordStore::read_saved_admin_config(&temp.data()).unwrap(), None);
+        assert_eq!(
+            RecordStore::read_saved_admin_config(&temp.data()).unwrap(),
+            None
+        );
         assert_eq!(super::super::tests::logical_snapshot(&conn), before);
     }
     #[test]
