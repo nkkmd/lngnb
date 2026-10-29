@@ -48,6 +48,7 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
     let mut startup_blob_targets = None;
     let mut startup_record_edges = None;
     let mut startup_evaluation_records = None;
+    let mut sql_inspection_callbacks = None;
     for pair in rest.chunks(2) {
         let [option, value] = pair else {
             return Err(usage());
@@ -103,6 +104,11 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
             {
                 startup_evaluation_records = Some(number(value).ok_or_else(usage)?);
             }
+            Some("--sql-inspection-callbacks")
+                if action == "serve" && sql_inspection_callbacks.is_none() =>
+            {
+                sql_inspection_callbacks = Some(number(value).ok_or_else(usage)?);
+            }
             _ => return Err(usage()),
         }
     }
@@ -131,6 +137,7 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
             .and_then(|c| c.with_startup_blob_targets(startup_blob_targets))
             .and_then(|c| c.with_startup_record_edges(startup_record_edges))
             .and_then(|c| c.with_startup_evaluation_records(startup_evaluation_records))
+            .and_then(|c| c.with_sql_inspection_callbacks(sql_inspection_callbacks))
             .ok_or_else(usage)?;
         if action == "config-save" {
             Action::SaveConfig(config)
@@ -145,6 +152,7 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
                 startup_blob_targets_per_step: startup_blob_targets,
                 startup_record_edges_per_step: startup_record_edges,
                 startup_evaluation_records_per_step: startup_evaluation_records,
+                sql_inspection_callbacks,
             })
         }
     };
@@ -429,6 +437,8 @@ mod tests {
             "3",
             "--startup-evaluation-records-per-step",
             "4",
+            "--sql-inspection-callbacks",
+            "50000",
         ]
         .map(Into::into)
         .to_vec();
@@ -446,6 +456,7 @@ mod tests {
                 startup_blob_targets_per_step: Some(2),
                 startup_record_edges_per_step: Some(3),
                 startup_evaluation_records_per_step: Some(4),
+                sql_inspection_callbacks: Some(50_000),
             })
         );
         for (option, max) in [
@@ -458,6 +469,7 @@ mod tests {
             ("--startup-blob-targets-per-step", "10001"),
             ("--startup-record-edges-per-step", "100001"),
             ("--startup-evaluation-records-per-step", "33"),
+            ("--sql-inspection-callbacks", "100001"),
         ] {
             for bad in [
                 "0",
@@ -699,6 +711,9 @@ mod config_tests {
         assert_eq!(parse(&extra).unwrap_err().exit_code(), 2);
         let mut extra = good.clone();
         extra.extend(["--startup-evaluation-records-per-step".into(), "1".into()]);
+        assert_eq!(parse(&extra).unwrap_err().exit_code(), 2);
+        let mut extra = good.clone();
+        extra.extend(["--sql-inspection-callbacks".into(), "1".into()]);
         assert_eq!(parse(&extra).unwrap_err().exit_code(), 2);
         for option in [3, 5, 7, 9] {
             let mut missing = good.clone();
