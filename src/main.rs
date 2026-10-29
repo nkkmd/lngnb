@@ -28,7 +28,7 @@ const HELP: &str = "lngnb — 分散図書館・知識基盤（開発初期段�
   lngnb admin probe --data-dir PATH
   lngnb admin status --data-dir PATH
   lngnb admin evaluate --data-dir PATH
-  lngnb admin serve --data-dir PATH [--request-timeout-ms N] [--max-new-records N] [--max-diagnostic-records N]
+  lngnb admin serve --data-dir PATH [--request-timeout-ms N] [--max-new-records N] [--max-diagnostic-records N] [--startup-records-per-step N]
   lngnb record submit --data-dir PATH --record PATH
   lngnb document create --data-dir PATH --key-dir PATH --name NAME --expect-key-id KEY_ID --payload PATH --metadata PATH [--media-type TYPE] [--max-payload-bytes N]
   lngnb key create --key-dir PATH --name NAME
@@ -67,7 +67,8 @@ admin probe は保存要求なしでsocket接続先の権限・UIDだけを照�
 admin serve は前面で管理受理側だけを起動します。SIGINT/SIGTERMで受付停止と進行処理の終結を要求します。
 受信/応答の各期限は1〜30000 ms、新規Record上限は1〜10000件で、既定は各上限です。
 評価診断のRecord数予算は --max-diagnostic-records で1〜10000件（既定10000）を指定できます。
-適用値を起動時に表示し、この起動だけに適用します（設定保存・起動検査予算の変更なし）。
+起動時のRecord局所検査と依存入力収集は --startup-records-per-step で一段階の1〜10000件（既定10000）へ分割できます。
+適用値を起動時に表示し、この起動だけに適用します（設定保存なし）。全検査の完了前にはsocketを開きません。
 不正通信・保存障害・応答喪失では正常停止にせず、領域とsocketを保持します。
 admin status は診断専用socketから実行時の世代・新規保存件数/予算・空き容量だけを取得します。
 診断endpointがない旧受理側へは保存経路で再接続せず、保存要求・直接DB読込み・復旧解除をしません。

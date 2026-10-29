@@ -31,6 +31,7 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
     let mut timeout = None;
     let mut records = None;
     let mut diagnostic_records = None;
+    let mut startup_records = None;
     for pair in rest.chunks(2) {
         let [option, value] = pair else {
             return Err(usage());
@@ -51,6 +52,11 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
             {
                 diagnostic_records = Some(number(value).ok_or_else(usage)?);
             }
+            Some("--startup-records-per-step")
+                if action == "serve" && startup_records.is_none() =>
+            {
+                startup_records = Some(number(value).ok_or_else(usage)?);
+            }
             _ => return Err(usage()),
         }
     }
@@ -64,6 +70,7 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
         Action::Serve(
             Config::checked(timeout, records)
                 .and_then(|c| c.with_diagnostic_records(diagnostic_records))
+                .and_then(|c| c.with_startup_records(startup_records))
                 .ok_or_else(usage)?,
         )
     };
@@ -256,6 +263,8 @@ mod tests {
             "500",
             "--max-diagnostic-records",
             "7",
+            "--startup-records-per-step",
+            "3",
         ]
         .map(Into::into)
         .to_vec();
@@ -268,12 +277,15 @@ mod tests {
                     .unwrap()
                     .with_diagnostic_records(Some(7))
                     .unwrap()
+                    .with_startup_records(Some(3))
+                    .unwrap()
             )
         );
         for (option, max) in [
             ("--request-timeout-ms", "30001"),
             ("--max-new-records", "10001"),
             ("--max-diagnostic-records", "10001"),
+            ("--startup-records-per-step", "10001"),
         ] {
             for bad in [
                 "0",
@@ -316,6 +328,7 @@ mod tests {
             "--request-timeout-ms",
             "--max-new-records",
             "--max-diagnostic-records",
+            "--startup-records-per-step",
         ] {
             let args: Vec<OsString> = ["status", "--data-dir", "data", option, "1"]
                 .map(Into::into)
@@ -375,6 +388,13 @@ mod evaluation_tests {
                 "--data-dir",
                 "data",
                 "--max-diagnostic-records",
+                "1",
+            ],
+            vec![
+                "evaluate",
+                "--data-dir",
+                "data",
+                "--startup-records-per-step",
                 "1",
             ],
         ] {

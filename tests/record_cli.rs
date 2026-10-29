@@ -560,6 +560,15 @@ fn invalid_runtime_options_fail_before_creating_or_changing_data() {
             vec!["--request-timeout-ms", "30001"],
             vec!["--max-new-records", "10001"],
             vec!["--max-diagnostic-records", "0"],
+            vec!["--startup-records-per-step", "0"],
+            vec!["--startup-records-per-step", "10001"],
+            vec!["--startup-records-per-step", "private"],
+            vec![
+                "--startup-records-per-step",
+                "1",
+                "--startup-records-per-step",
+                "2",
+            ],
             vec!["--max-diagnostic-records", "10001"],
             vec!["--max-diagnostic-records", "private"],
             vec![
@@ -999,4 +1008,97 @@ fn diagnostic_limit_does_not_reduce_startup_inspection_or_clear_review_after_fai
     assert_eq!(retry.status.code(), Some(3));
     assert!(retry.stdout.is_empty());
     assert!(temp.data().join("admin-evaluate.sock").exists());
+}
+
+#[test]
+fn startup_step_budget_splits_both_record_checks_without_limiting_the_collection() {
+    let temp = Temp::new();
+    let mut writer = RecordStore::initialize(&temp.data(), Limits::default())
+        .unwrap()
+        .begin()
+        .unwrap();
+    writer.insert(&fixture()).unwrap();
+    writer.insert(&named_fixture("revision")).unwrap();
+    writer.finish().unwrap();
+    let mut server = Server::configured(&temp, &["--startup-records-per-step", "1"]);
+    let diagnostic = evaluate_cli(&temp.data());
+    assert!(diagnostic.status.success());
+    assert_eq!(diagnostic_field(&diagnostic, "records"), 2);
+    assert_eq!(diagnostic_field(&diagnostic, "diagnostic_valid"), 2);
+    server.signal("-TERM");
+    assert!(server.wait().success());
+    assert!(
+        fs::read_to_string(&server.log)
+            .unwrap()
+            .contains("startup_records_per_step: 1\n")
+    );
+    let conn = rusqlite::Connection::open(temp.data().join("database.sqlite")).unwrap();
+    let split: i64 = conn.query_row("SELECT count(*) FROM history WHERE reason='record_inspection_checkpoint' AND old_state LIKE 'records:epoch=%:records=1:bytes=%'",[],|r|r.get(0)).unwrap();
+    assert!(split > 0);
+    let split: i64 = conn.query_row("SELECT count(*) FROM history WHERE new_state='evaluation_input_pending' AND reason LIKE 'evaluation_input_checkpoint:epoch=%:records=1:bytes=%'",[],|r|r.get(0)).unwrap();
+    assert!(split > 0);
+    drop(conn);
+    let mut restarted = Server::start(&temp);
+    restarted.signal("-TERM");
+    assert!(restarted.wait().success());
+    assert!(
+        fs::read_to_string(&restarted.log)
+            .unwrap()
+            .contains("startup_records_per_step: 10000\n")
+    );
+}
+
+#[test]
+fn invalid_later_startup_record_never_opens_socket_or_clears_manual_review() {
+    let temp = Temp::new();
+    let mut writer = RecordStore::initialize(&temp.data(), Limits::default())
+        .unwrap()
+        .begin()
+        .unwrap();
+    let record = fixture();
+    writer.insert(&record).unwrap();
+    writer.finish().unwrap();
+    // 新規試験領域だけに、正常Recordの後に並ぶID不一致の保存破損を注入する。
+    let conn = rusqlite::Connection::open(temp.data().join("database.sqlite")).unwrap();
+    conn.execute(
+        "INSERT INTO records(id,bytes) VALUES(?1,?2)",
+        rusqlite::params![&[255u8; 32][..], record.bytes()],
+    )
+    .unwrap();
+    drop(conn);
+    let out = Command::new(env!("CARGO_BIN_EXE_lngnb"))
+        .args(["admin", "serve", "--data-dir"])
+        .arg(temp.data())
+        .args(["--startup-records-per-step", "1"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3));
+    assert!(out.stdout.is_empty());
+    for name in ["admin.sock", "admin-status.sock", "admin-evaluate.sock"] {
+        assert!(!temp.data().join(name).exists());
+    }
+    let conn = rusqlite::Connection::open(temp.data().join("database.sqlite")).unwrap();
+    let checked: i64 = conn
+        .query_row("SELECT checked_records FROM record_inspection", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(checked, 1);
+    let state: String = conn
+        .query_row("SELECT state FROM storage_state", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(state, "running");
+    let count: i64 = conn
+        .query_row("SELECT count(*) FROM records", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 2);
+    drop(conn);
+    let retry = Command::new(env!("CARGO_BIN_EXE_lngnb"))
+        .args(["admin", "serve", "--data-dir"])
+        .arg(temp.data())
+        .output()
+        .unwrap();
+    assert_eq!(retry.status.code(), Some(3));
+    assert!(retry.stdout.is_empty());
+    assert!(!temp.data().join("admin.sock").exists());
 }

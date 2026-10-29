@@ -20,6 +20,7 @@ pub struct Config {
     timeout_ms: u64,
     max_new_records: u64,
     max_diagnostic_records: u64,
+    startup_records_per_step: u64,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -27,6 +28,7 @@ impl Default for Config {
             timeout_ms: 30_000,
             max_new_records: 10_000,
             max_diagnostic_records: 10_000,
+            startup_records_per_step: 10_000,
         }
     }
 }
@@ -46,6 +48,7 @@ impl Config {
             timeout_ms,
             max_new_records,
             max_diagnostic_records: defaults.max_diagnostic_records,
+            startup_records_per_step: defaults.startup_records_per_step,
         })
     }
     pub fn with_diagnostic_records(mut self, value: Option<u64>) -> Option<Self> {
@@ -55,6 +58,20 @@ impl Config {
         }
         self.max_diagnostic_records = value;
         Some(self)
+    }
+    pub fn with_startup_records(mut self, value: Option<u64>) -> Option<Self> {
+        let value = value.unwrap_or(self.startup_records_per_step);
+        if value == 0 || value > 10_000 {
+            return None;
+        }
+        self.startup_records_per_step = value;
+        Some(self)
+    }
+    fn startup_budget(self) -> LocalStartupBudget {
+        let mut budget = LocalStartupBudget::default();
+        budget.inspection.records = self.startup_records_per_step;
+        budget.records.records = self.startup_records_per_step;
+        budget
     }
 }
 
@@ -131,7 +148,7 @@ fn serve(
             return Err(Error::Unconfirmed);
         }
         if startup
-            .step(EvaluationLimits::default(), LocalStartupBudget::default())
+            .step(EvaluationLimits::default(), config.startup_budget())
             .map_err(|_| Error::Unconfirmed)?
             .checks_complete()
         {
@@ -150,8 +167,11 @@ fn serve(
         .enable_evaluation_with_record_limit(config.max_diagnostic_records)
         .map_err(|_| Error::Unconfirmed)?;
     let ready = format!(
-        "管理受理側のローカル起動検査を完了し、管理socketを開きました。公開・復旧完了の判定ではありません。\nrequest_timeout_ms: {}\nmax_new_records: {}\nmax_diagnostic_records: {}\n設定はこの起動だけに適用し、保存していません。\n",
-        config.timeout_ms, config.max_new_records, config.max_diagnostic_records
+        "管理受理側のローカル起動検査を完了し、管理socketを開きました。公開・復旧完了の判定ではありません。\nrequest_timeout_ms: {}\nmax_new_records: {}\nmax_diagnostic_records: {}\nstartup_records_per_step: {}\n設定はこの起動だけに適用し、保存していません。\n",
+        config.timeout_ms,
+        config.max_new_records,
+        config.max_diagnostic_records,
+        config.startup_records_per_step
     );
     output
         .write_all(ready.as_bytes())
@@ -244,6 +264,31 @@ mod tests {
             );
         }
 
+        let defaults = LocalStartupBudget::default();
+        assert_eq!(
+            Config::default().startup_records_per_step,
+            defaults.inspection.records
+        );
+        assert_eq!(
+            Config::default().startup_records_per_step,
+            defaults.records.records
+        );
+        assert_eq!(
+            Config::default().with_startup_records(None),
+            Some(Config::default())
+        );
+        for n in [1, 10_000] {
+            let config = Config::default().with_startup_records(Some(n)).unwrap();
+            let budget = config.startup_budget();
+            assert_eq!(budget.inspection.records, n);
+            assert_eq!(budget.records.records, n);
+            assert_eq!(budget.inspection.bytes, defaults.inspection.bytes);
+            assert_eq!(budget.records.edges, defaults.records.edges);
+            assert_eq!(config.max_diagnostic_records, 10_000);
+        }
+        for n in [0, 10_001, u64::MAX] {
+            assert!(Config::default().with_startup_records(Some(n)).is_none());
+        }
         assert!(Config::checked(Some(1), Some(1)).is_some());
         assert!(Config::checked(Some(30_000), Some(10_000)).is_some());
         for (timeout, records) in [
