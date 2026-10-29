@@ -414,8 +414,14 @@ mod tests {
             assert_eq!(budget.evaluation.nodes, defaults.evaluation.nodes);
             let limits = overrides.storage_limits();
             let expected = Limits::default();
-            assert_eq!(limits.sql_inspection.elapsed, expected.sql_inspection.elapsed);
-            assert_eq!(limits.sql_inspection.callbacks, expected.sql_inspection.callbacks);
+            assert_eq!(
+                limits.sql_inspection.elapsed,
+                expected.sql_inspection.elapsed
+            );
+            assert_eq!(
+                limits.sql_inspection.callbacks,
+                expected.sql_inspection.callbacks
+            );
             assert_eq!(config.saved_values(), Config::default().saved_values());
         }
         for value in [0, 60_001, u64::MAX] {
