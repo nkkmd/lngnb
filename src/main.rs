@@ -30,7 +30,7 @@ const HELP: &str = "lngnb — 分散図書館・知識基盤（開発初期段�
   lngnb admin evaluate --data-dir PATH
   lngnb admin config-show --data-dir PATH
   lngnb admin config-save --data-dir PATH --request-timeout-ms N --max-new-records N --max-diagnostic-records N --startup-records-per-step N
-  lngnb admin serve --data-dir PATH [--request-timeout-ms N] [--max-new-records N] [--max-diagnostic-records N] [--startup-records-per-step N]
+  lngnb admin serve --data-dir PATH [--request-timeout-ms N] [--max-new-records N] [--max-diagnostic-records N] [--startup-records-per-step N] [--startup-record-bytes-per-step N]
   lngnb record submit --data-dir PATH --record PATH
   lngnb document create --data-dir PATH --key-dir PATH --name NAME --expect-key-id KEY_ID --payload PATH --metadata PATH [--media-type TYPE] [--max-payload-bytes N]
   lngnb key create --key-dir PATH --name NAME
@@ -70,7 +70,9 @@ admin serve は前面で管理受理側だけを起動します。SIGINT/SIGTERM
 受信/応答の各期限は1〜30000 ms、新規Record上限は1〜10000件で、既定は各上限です。
 評価診断のRecord数予算は --max-diagnostic-records で1〜10000件（既定10000）を指定できます。
 起動時のRecord局所検査と依存入力収集は --startup-records-per-step で一段階の1〜10000件（既定10000）へ分割できます。
-項目ごとに起動引数→検査済み保存値→既定値を選び、適用値を起動時に表示します。引数は自動保存しません。
+--startup-record-bytes-per-step は両Record段階の一stepのbyte予算（1〜67108864、既定67108864）です。
+このbyte予算は保存対象外で、省略時は既定へ戻ります。一件も収まらなければ受付前に保全停止します。
+保存対象4項目は項目ごとに起動引数→検査済み保存値→既定値を選び、適用値を起動時に表示します。引数は自動保存しません。
 不正保存値を明示引数で補わず、全検査の完了前にはsocketを開きません。
 不正通信・保存障害・応答喪失では正常停止にせず、領域とsocketを保持します。
 admin status は診断専用socketから実行時の世代・新規保存件数/予算・空き容量だけを取得します。
