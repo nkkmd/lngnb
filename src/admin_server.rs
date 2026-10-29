@@ -100,8 +100,14 @@ impl Overrides {
             self.timeout_ms.or(saved.map(|c| c.request_timeout_ms)),
             self.max_new_records.or(saved.map(|c| c.max_new_records)),
         )?
-        .with_diagnostic_records(self.max_diagnostic_records.or(saved.map(|c| c.max_diagnostic_records)))?
-        .with_startup_records(self.startup_records_per_step.or(saved.map(|c| c.startup_records_per_step)))
+        .with_diagnostic_records(
+            self.max_diagnostic_records
+                .or(saved.map(|c| c.max_diagnostic_records)),
+        )?
+        .with_startup_records(
+            self.startup_records_per_step
+                .or(saved.map(|c| c.startup_records_per_step)),
+        )
     }
 }
 
@@ -165,11 +171,9 @@ fn serve(
     stop: &AtomicBool,
     output: &mut impl Write,
 ) -> Result<(), Error> {
-    let (mut startup, saved) = LocalStartup::open_with_admin_config(
-        path,
-        Limits::default(),
-        overrides.max_new_records,
-    ).map_err(|_| Error::Unconfirmed)?;
+    let (mut startup, saved) =
+        LocalStartup::open_with_admin_config(path, Limits::default(), overrides.max_new_records)
+            .map_err(|_| Error::Unconfirmed)?;
     let config = overrides.resolve(saved).ok_or(Error::Unconfirmed)?;
     if startup.needs_review() {
         return Err(Error::Unconfirmed);
@@ -256,7 +260,13 @@ mod tests {
             startup_records_per_step: 1,
         };
         assert_eq!(Overrides::default().resolve(None), Some(Config::default()));
-        assert_eq!(Overrides::default().resolve(Some(saved)).unwrap().saved_values(), saved);
+        assert_eq!(
+            Overrides::default()
+                .resolve(Some(saved))
+                .unwrap()
+                .saved_values(),
+            saved
+        );
         let explicit = Overrides {
             timeout_ms: Some(30_000),
             max_new_records: Some(10_000),
@@ -267,7 +277,10 @@ mod tests {
         assert_eq!(resolved.max_new_records, 10_000);
         assert_eq!(resolved.max_diagnostic_records, 8);
         assert_eq!(resolved.startup_records_per_step, 1);
-        let invalid = lngnb::storage::AdminConfig { request_timeout_ms: 0, ..saved };
+        let invalid = lngnb::storage::AdminConfig {
+            request_timeout_ms: 0,
+            ..saved
+        };
         assert!(explicit.resolve(Some(invalid)).is_none());
     }
 

@@ -1,5 +1,8 @@
 //! 管理socketの接続診断と前面の管理受理側。公開リレーではない。
-use super::{AppError, admin_server::{Config, Overrides}};
+use super::{
+    AppError,
+    admin_server::{Config, Overrides},
+};
 use lngnb::storage::admin_transport::client;
 use std::{ffi::OsString, fmt, io::Write, path::PathBuf, time::Duration};
 

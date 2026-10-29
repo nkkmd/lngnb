@@ -17,22 +17,27 @@ use std::{
 fn admin_config_startup_keeps_lock_and_selects_session_limit_before_inspection() {
     let t = Temp::new();
     let mut writer = t.store().begin().unwrap();
-    writer.save_admin_config(AdminConfig {
-        request_timeout_ms: 500,
-        max_new_records: 1,
-        max_diagnostic_records: 8,
-        startup_records_per_step: 1,
-    }).unwrap();
+    writer
+        .save_admin_config(AdminConfig {
+            request_timeout_ms: 500,
+            max_new_records: 1,
+            max_diagnostic_records: 8,
+            startup_records_per_step: 1,
+        })
+        .unwrap();
     writer.finish().unwrap();
     for override_value in [None, Some(2)] {
-        let (mut startup, saved) = LocalStartup::open_with_admin_config(
-            &t.data(), Limits::default(), override_value,
-        ).unwrap();
+        let (mut startup, saved) =
+            LocalStartup::open_with_admin_config(&t.data(), Limits::default(), override_value)
+                .unwrap();
         assert_eq!(saved.unwrap().max_new_records, 1);
         assert!(RecordStore::open(&t.data(), Limits::default()).is_err());
         drive(&mut startup);
         let writer = startup.into_writer().unwrap();
-        assert_eq!(writer.store.limits.session_records, override_value.unwrap_or(1));
+        assert_eq!(
+            writer.store.limits.session_records,
+            override_value.unwrap_or(1)
+        );
         writer.finish().unwrap();
     }
 }
