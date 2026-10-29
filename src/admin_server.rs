@@ -303,7 +303,9 @@ mod tests {
     fn startup_blob_target_budget_is_bounded_and_separate_from_bytes_and_saved_values() {
         let defaults = LocalStartupBudget::default();
         for value in [1, 10_000] {
-            let config = Config::default().with_startup_blob_targets(Some(value)).unwrap();
+            let config = Config::default()
+                .with_startup_blob_targets(Some(value))
+                .unwrap();
             let budget = config.startup_budget();
             assert_eq!(budget.inspection.blob_files, value);
             assert_eq!(budget.blobs.targets, value);
@@ -314,11 +316,30 @@ mod tests {
             assert_eq!(config.saved_values(), Config::default().saved_values());
         }
         for value in [0, 10_001, u64::MAX] {
-            assert!(Config::default().with_startup_blob_targets(Some(value)).is_none());
+            assert!(
+                Config::default()
+                    .with_startup_blob_targets(Some(value))
+                    .is_none()
+            );
         }
         let saved = Config::default().saved_values();
-        assert_eq!(Overrides::default().resolve(Some(saved)).unwrap().startup_blob_targets_per_step, 10_000);
-        assert_eq!(Overrides { startup_blob_targets_per_step: Some(1), ..Overrides::default() }.resolve(Some(saved)).unwrap().startup_blob_targets_per_step, 1);
+        assert_eq!(
+            Overrides::default()
+                .resolve(Some(saved))
+                .unwrap()
+                .startup_blob_targets_per_step,
+            10_000
+        );
+        assert_eq!(
+            Overrides {
+                startup_blob_targets_per_step: Some(1),
+                ..Overrides::default()
+            }
+            .resolve(Some(saved))
+            .unwrap()
+            .startup_blob_targets_per_step,
+            1
+        );
     }
 
     #[test]
