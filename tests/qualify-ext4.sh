@@ -38,3 +38,6 @@ cargo test --locked --offline --lib storage::filesystem_tests:: -- --ignored --t
 cargo test --locked --offline --lib storage::tests:: -- --test-threads=1
 cargo test --locked --offline --lib storage::blobs::tests::file_io_fault_points_never_create_durable_success -- --exact --test-threads=1
 cargo test --locked --offline --lib storage::blobs::tests::process_kill_between_placement_and_database_commit -- --exact --test-threads=1
+
+# 設定の原子的保存・SQL拒否・commit前後killも同じ隔離ext4で再実行する。
+cargo test --locked --offline --lib storage::admin_config::tests:: -- --test-threads=1

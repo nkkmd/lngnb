@@ -16,12 +16,23 @@ impl AdminConfig {
             && (1..=10_000).contains(&self.startup_records_per_step)
     }
     fn description(self) -> String {
-        format!("admin_config_v1:{},{},{},{}", self.request_timeout_ms, self.max_new_records,
-            self.max_diagnostic_records, self.startup_records_per_step)
+        format!(
+            "admin_config_v1:{},{},{},{}",
+            self.request_timeout_ms,
+            self.max_new_records,
+            self.max_diagnostic_records,
+            self.startup_records_per_step
+        )
     }
 }
 
-type StoredConfig = (Option<u64>, Option<u64>, Option<u64>, Option<u64>, Option<i64>);
+type StoredConfig = (
+    Option<u64>,
+    Option<u64>,
+    Option<u64>,
+    Option<u64>,
+    Option<i64>,
+);
 
 pub(super) fn load(conn: &Connection) -> Result<Option<AdminConfig>> {
     let (timeout, records, diagnostic, startup, generation):
@@ -69,7 +80,11 @@ impl RecordWriter {
     pub fn save_admin_config(&mut self, config: AdminConfig) -> Result<()> {
         self.save_admin_config_with(config, |_| {})
     }
-    fn save_admin_config_with(&mut self, config: AdminConfig, mut checkpoint: impl FnMut(bool)) -> Result<()> {
+    fn save_admin_config_with(
+        &mut self,
+        config: AdminConfig,
+        mut checkpoint: impl FnMut(bool),
+    ) -> Result<()> {
         if self.failed {
             return Err(StorageError::UnresolvedFailure);
         }
@@ -88,8 +103,13 @@ impl RecordWriter {
                 params![config.request_timeout_ms,config.max_new_records,config.max_diagnostic_records,config.startup_records_per_step])? != 1 {
                 return Err(StorageError::Corrupt);
             }
-            audit(&tx, None, &old.map_or_else(|| "unsaved".into(), AdminConfig::description),
-                "admin_config_saved_local_only", &config.description())?;
+            audit(
+                &tx,
+                None,
+                &old.map_or_else(|| "unsaved".into(), AdminConfig::description),
+                "admin_config_saved_local_only",
+                &config.description(),
+            )?;
             checkpoint(true);
             tx.commit()?;
             checkpoint(false);
@@ -108,8 +128,12 @@ mod tests {
     use crate::storage::tests::{Temp, logical_snapshot};
 
     fn config() -> AdminConfig {
-        AdminConfig { request_timeout_ms: 5000, max_new_records: 100,
-            max_diagnostic_records: 500, startup_records_per_step: 1 }
+        AdminConfig {
+            request_timeout_ms: 5000,
+            max_new_records: 100,
+            max_diagnostic_records: 500,
+            startup_records_per_step: 1,
+        }
     }
     #[test]
     fn explicit_save_survives_reopen_without_becoming_runtime_configuration() {
@@ -120,7 +144,10 @@ mod tests {
         writer.save_admin_config(config()).unwrap();
         assert_eq!(writer.store.saved_admin_config().unwrap(), Some(config()));
         // 保存設定で現sessionの予算を変更しない。
-        assert_eq!(writer.store.limits.session_records, Limits::default().session_records);
+        assert_eq!(
+            writer.store.limits.session_records,
+            Limits::default().session_records
+        );
         writer.finish().unwrap();
         let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
         assert_eq!(store.saved_admin_config().unwrap(), Some(config()));
@@ -135,9 +162,16 @@ mod tests {
         for field in 0..4 {
             for value in [0, 30_001, u64::MAX] {
                 let mut bad = config();
-                match field { 0 => bad.request_timeout_ms=value, 1 => bad.max_new_records=value,
-                    2 => bad.max_diagnostic_records=value, _ => bad.startup_records_per_step=value }
-                assert!(matches!(writer.save_admin_config(bad), Err(StorageError::BudgetExceeded)));
+                match field {
+                    0 => bad.request_timeout_ms = value,
+                    1 => bad.max_new_records = value,
+                    2 => bad.max_diagnostic_records = value,
+                    _ => bad.startup_records_per_step = value,
+                }
+                assert!(matches!(
+                    writer.save_admin_config(bad),
+                    Err(StorageError::BudgetExceeded)
+                ));
                 assert_eq!(logical_snapshot(&writer.store.conn), before);
             }
         }
@@ -148,16 +182,26 @@ mod tests {
         let temp = Temp::new();
         let mut writer = temp.store().begin().unwrap();
         for n in [1, 10_000] {
-            let value = AdminConfig { request_timeout_ms: 30_000, max_new_records: n,
-                max_diagnostic_records: n, startup_records_per_step: n };
+            let value = AdminConfig {
+                request_timeout_ms: 30_000,
+                max_new_records: n,
+                max_diagnostic_records: n,
+                startup_records_per_step: n,
+            };
             writer.save_admin_config(value).unwrap();
             assert_eq!(writer.store.saved_admin_config().unwrap(), Some(value));
         }
         let before = logical_snapshot(&writer.store.conn);
-        writer.store.limits.reserve_min_bytes=u64::MAX;
-        assert!(matches!(writer.save_admin_config(config()), Err(StorageError::Capacity)));
+        writer.store.limits.reserve_min_bytes = u64::MAX;
+        assert!(matches!(
+            writer.save_admin_config(config()),
+            Err(StorageError::Capacity)
+        ));
         assert_eq!(logical_snapshot(&writer.store.conn), before);
-        assert!(matches!(writer.finish(), Err(StorageError::UnresolvedFailure)));
+        assert!(matches!(
+            writer.finish(),
+            Err(StorageError::UnresolvedFailure)
+        ));
     }
     #[test]
     fn old_schema_is_rejected_without_modification_or_reinitialization() {
@@ -165,9 +209,13 @@ mod tests {
         drop(temp.store());
         let conn = Connection::open(temp.data().join(DB)).unwrap();
         conn.pragma_update(None, "user_version", 11).unwrap();
-        conn.execute_batch("DROP TABLE admin_config; DROP INDEX history_admin_config;").unwrap();
+        conn.execute_batch("DROP TABLE admin_config; DROP INDEX history_admin_config;")
+            .unwrap();
         let before = logical_snapshot(&conn);
-        assert!(matches!(RecordStore::open(&temp.data(), Limits::default()), Err(StorageError::UnsupportedFormat)));
+        assert!(matches!(
+            RecordStore::open(&temp.data(), Limits::default()),
+            Err(StorageError::UnsupportedFormat)
+        ));
         assert_eq!(logical_snapshot(&conn), before);
     }
     #[test]
@@ -177,21 +225,24 @@ mod tests {
         if let Some(path) = std::env::var_os("LNGNB_CONFIG_KILL_CHILD") {
             let store = RecordStore::open(Path::new(&path), Limits::default()).unwrap();
             let mut writer = store.begin().unwrap();
-            let before = std::env::var("LNGNB_CONFIG_KILL_BEFORE").unwrap()=="true";
-            let mut next = config(); next.max_new_records=2;
-            writer.save_admin_config_with(next, |point| {
-                if point==before {
-                    println!("LNGNB_CONFIG_KILL_READY");
-                    std::io::stdout().flush().unwrap();
-                    let mut line=String::new();
-                    std::io::stdin().read_line(&mut line).unwrap();
-                }
-            }).unwrap();
+            let before = std::env::var("LNGNB_CONFIG_KILL_BEFORE").unwrap() == "true";
+            let mut next = config();
+            next.max_new_records = 2;
+            writer
+                .save_admin_config_with(next, |point| {
+                    if point == before {
+                        println!("LNGNB_CONFIG_KILL_READY");
+                        std::io::stdout().flush().unwrap();
+                        let mut line = String::new();
+                        std::io::stdin().read_line(&mut line).unwrap();
+                    }
+                })
+                .unwrap();
             panic!("parent must kill the child");
         }
-        for before in [true,false] {
-            let temp=Temp::new();
-            let mut writer=temp.store().begin().unwrap();
+        for before in [true, false] {
+            let temp = Temp::new();
+            let mut writer = temp.store().begin().unwrap();
             writer.save_admin_config(config()).unwrap();
             writer.finish().unwrap();
             let mut child=Command::new(std::env::current_exe().unwrap())
@@ -199,22 +250,37 @@ mod tests {
                 .env("LNGNB_CONFIG_KILL_CHILD",temp.data())
                 .env("LNGNB_CONFIG_KILL_BEFORE",before.to_string())
                 .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn().unwrap();
-            let mut output=std::io::BufReader::new(child.stdout.take().unwrap());
-            let mut ready=false;
+            let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
+            let mut ready = false;
             for _ in 0..20 {
-                let mut line=String::new();
-                if output.read_line(&mut line).unwrap()==0 { break; }
-                if line.contains("LNGNB_CONFIG_KILL_READY") { ready=true; break; }
+                let mut line = String::new();
+                if output.read_line(&mut line).unwrap() == 0 {
+                    break;
+                }
+                if line.contains("LNGNB_CONFIG_KILL_READY") {
+                    ready = true;
+                    break;
+                }
             }
-            if !ready { let _=child.kill(); let _=child.wait(); panic!("child did not reach commit boundary"); }
-            assert!(matches!(RecordStore::open(&temp.data(),Limits::default()),Err(StorageError::Busy)));
+            if !ready {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("child did not reach commit boundary");
+            }
+            assert!(matches!(
+                RecordStore::open(&temp.data(), Limits::default()),
+                Err(StorageError::Busy)
+            ));
             child.kill().unwrap();
             assert!(!child.wait().unwrap().success());
-            let store=RecordStore::open(&temp.data(),Limits::default()).unwrap();
-            let mut expected=config(); if !before { expected.max_new_records=2; }
-            assert_eq!(store.saved_admin_config().unwrap(),Some(expected));
-            assert_eq!(store.startup_state().unwrap(),StartupState::NeedsReview);
-            assert!(matches!(store.begin(),Err(StorageError::NeedsReview)));
+            let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
+            let mut expected = config();
+            if !before {
+                expected.max_new_records = 2;
+            }
+            assert_eq!(store.saved_admin_config().unwrap(), Some(expected));
+            assert_eq!(store.startup_state().unwrap(), StartupState::NeedsReview);
+            assert!(matches!(store.begin(), Err(StorageError::NeedsReview)));
         }
     }
     #[test]
@@ -223,15 +289,26 @@ mod tests {
             let temp = Temp::new();
             let mut writer = temp.store().begin().unwrap();
             writer.save_admin_config(config()).unwrap();
-            let operation = if table == "history" { "INSERT" } else { "UPDATE" };
+            let operation = if table == "history" {
+                "INSERT"
+            } else {
+                "UPDATE"
+            };
             writer.store.conn.execute_batch(&format!("CREATE TRIGGER deny_config BEFORE {operation} ON {table} BEGIN SELECT RAISE(ABORT,'test'); END;")).unwrap();
             let before = logical_snapshot(&writer.store.conn);
-            let mut next = config(); next.max_new_records=2;
+            let mut next = config();
+            next.max_new_records = 2;
             assert!(writer.save_admin_config(next).is_err());
             assert_eq!(logical_snapshot(&writer.store.conn), before);
             assert_eq!(writer.store.saved_admin_config().unwrap(), Some(config()));
-            assert!(matches!(writer.save_admin_config(config()), Err(StorageError::UnresolvedFailure)));
-            assert!(matches!(writer.finish(), Err(StorageError::UnresolvedFailure)));
+            assert!(matches!(
+                writer.save_admin_config(config()),
+                Err(StorageError::UnresolvedFailure)
+            ));
+            assert!(matches!(
+                writer.finish(),
+                Err(StorageError::UnresolvedFailure)
+            ));
             let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
             assert_eq!(store.startup_state().unwrap(), StartupState::NeedsReview);
             assert_eq!(store.saved_admin_config().unwrap(), Some(config()));
@@ -250,9 +327,12 @@ mod tests {
     }
     #[test]
     fn missing_changed_or_detached_configuration_is_not_defaulted() {
-        for sql in ["DELETE FROM admin_config", "UPDATE admin_config SET max_new_records=2",
+        for sql in [
+            "DELETE FROM admin_config",
+            "UPDATE admin_config SET max_new_records=2",
             "UPDATE admin_config SET generation=NULL,request_timeout_ms=NULL,max_new_records=NULL,max_diagnostic_records=NULL,startup_records_per_step=NULL",
-            "UPDATE history SET reason='changed' WHERE new_state='admin_config_saved_local_only'"] {
+            "UPDATE history SET reason='changed' WHERE new_state='admin_config_saved_local_only'",
+        ] {
             let temp = Temp::new();
             let mut writer = temp.store().begin().unwrap();
             writer.save_admin_config(config()).unwrap();

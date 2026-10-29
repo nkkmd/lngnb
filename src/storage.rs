@@ -615,9 +615,9 @@ pub struct RecordStore {
     blob_recovery: BlobRecovery,
     records_checked: bool,
 }
+mod admin_config;
 pub mod admin_transport;
 pub mod management;
-mod admin_config;
 pub use admin_config::AdminConfig;
 impl RecordStore {
     /// 新しい最終ディレクトリだけを作る。既存/未完了領域を上書きしない。
