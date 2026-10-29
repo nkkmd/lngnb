@@ -565,7 +565,12 @@ fn invalid_runtime_options_fail_before_creating_or_changing_data() {
             vec!["--startup-record-bytes-per-step", "67108865"],
             vec!["--startup-record-bytes-per-step", "private"],
             vec!["--startup-record-bytes-per-step", "01"],
-            vec!["--startup-record-bytes-per-step", "1", "--startup-record-bytes-per-step", "2"],
+            vec![
+                "--startup-record-bytes-per-step",
+                "1",
+                "--startup-record-bytes-per-step",
+                "2",
+            ],
             vec!["--startup-records-per-step", "10001"],
             vec!["--startup-records-per-step", "private"],
             vec![
@@ -1675,15 +1680,20 @@ fn startup_byte_budget_splits_both_record_stages_and_returns_to_default() {
     let revision = named_fixture("revision");
     let bytes = genesis.bytes().len().max(revision.bytes().len());
     assert!(bytes < genesis.bytes().len() + revision.bytes().len());
-    let mut writer = RecordStore::initialize(&temp.data(), Limits::default()).unwrap().begin().unwrap();
+    let mut writer = RecordStore::initialize(&temp.data(), Limits::default())
+        .unwrap()
+        .begin()
+        .unwrap();
     writer.insert(&genesis).unwrap();
     writer.insert(&revision).unwrap();
-    writer.save_admin_config(lngnb::storage::AdminConfig {
-        request_timeout_ms: 500,
-        max_new_records: 7,
-        max_diagnostic_records: 8,
-        startup_records_per_step: 10_000,
-    }).unwrap();
+    writer
+        .save_admin_config(lngnb::storage::AdminConfig {
+            request_timeout_ms: 500,
+            max_new_records: 7,
+            max_diagnostic_records: 8,
+            startup_records_per_step: 10_000,
+        })
+        .unwrap();
     writer.finish().unwrap();
     let value = bytes.to_string();
     let mut server = Server::configured(&temp, &["--startup-record-bytes-per-step", &value]);
@@ -1708,7 +1718,11 @@ fn startup_byte_budget_splits_both_record_stages_and_returns_to_default() {
     let mut restarted = Server::start(&temp);
     restarted.signal("-TERM");
     assert!(restarted.wait().success());
-    assert!(fs::read_to_string(&restarted.log).unwrap().contains("startup_record_bytes_per_step: 67108864\n"));
+    assert!(
+        fs::read_to_string(&restarted.log)
+            .unwrap()
+            .contains("startup_record_bytes_per_step: 67108864\n")
+    );
     assert_eq!(saved_config_row(&temp.data()), (500, 7, 8, 10_000));
 }
 
@@ -1716,13 +1730,21 @@ fn startup_byte_budget_splits_both_record_stages_and_returns_to_default() {
 fn startup_byte_budget_cannot_skip_one_record_or_clear_manual_wait_on_retry() {
     let temp = Temp::new();
     let record = fixture();
-    let mut writer = RecordStore::initialize(&temp.data(), Limits::default()).unwrap().begin().unwrap();
+    let mut writer = RecordStore::initialize(&temp.data(), Limits::default())
+        .unwrap()
+        .begin()
+        .unwrap();
     writer.insert(&record).unwrap();
     writer.finish().unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_lngnb"))
-        .args(["admin", "serve", "--data-dir"]).arg(temp.data())
-        .args(["--startup-record-bytes-per-step", &(record.bytes().len()-1).to_string()])
-        .output().unwrap();
+        .args(["admin", "serve", "--data-dir"])
+        .arg(temp.data())
+        .args([
+            "--startup-record-bytes-per-step",
+            &(record.bytes().len() - 1).to_string(),
+        ])
+        .output()
+        .unwrap();
     assert_eq!(output.status.code(), Some(3));
     assert!(output.stdout.is_empty());
     assert!(!String::from_utf8_lossy(&output.stderr).contains("署名不正"));
@@ -1730,20 +1752,34 @@ fn startup_byte_budget_cannot_skip_one_record_or_clear_manual_wait_on_retry() {
         assert!(!temp.data().join(name).exists());
     }
     let conn = rusqlite::Connection::open(temp.data().join("database.sqlite")).unwrap();
-    let checked: i64 = conn.query_row("SELECT checked_records FROM record_inspection", [], |r|r.get(0)).unwrap();
+    let checked: i64 = conn
+        .query_row("SELECT checked_records FROM record_inspection", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
     assert_eq!(checked, 0);
-    let cursor: Option<Vec<u8>> = conn.query_row("SELECT cursor FROM record_inspection", [], |r|r.get(0)).unwrap();
+    let cursor: Option<Vec<u8>> = conn
+        .query_row("SELECT cursor FROM record_inspection", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(cursor, None);
-    let state: String = conn.query_row("SELECT state FROM storage_state", [], |r|r.get(0)).unwrap();
+    let state: String = conn
+        .query_row("SELECT state FROM storage_state", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(state, "running");
     drop(conn);
     assert_review(&temp, true);
     let retry = Command::new(env!("CARGO_BIN_EXE_lngnb"))
-        .args(["admin", "serve", "--data-dir"]).arg(temp.data()).output().unwrap();
+        .args(["admin", "serve", "--data-dir"])
+        .arg(temp.data())
+        .output()
+        .unwrap();
     assert_eq!(retry.status.code(), Some(3));
     assert!(retry.stdout.is_empty());
     assert_review(&temp, true);
     let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
     assert_eq!(store.saved_admin_config().unwrap(), None);
-    assert_eq!(store.record(record.id()).unwrap().unwrap().bytes(), record.bytes());
+    assert_eq!(
+        store.record(record.id()).unwrap().unwrap().bytes(),
+        record.bytes()
+    );
 }
