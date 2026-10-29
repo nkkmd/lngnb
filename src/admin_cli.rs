@@ -43,6 +43,7 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
     let mut records = None;
     let mut diagnostic_records = None;
     let mut startup_records = None;
+    let mut startup_record_bytes = None;
     for pair in rest.chunks(2) {
         let [option, value] = pair else {
             return Err(usage());
@@ -73,6 +74,11 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
             {
                 startup_records = Some(number(value).ok_or_else(usage)?);
             }
+            Some("--startup-record-bytes-per-step")
+                if action == "serve" && startup_record_bytes.is_none() =>
+            {
+                startup_record_bytes = Some(number(value).ok_or_else(usage)?);
+            }
             _ => return Err(usage()),
         }
     }
@@ -96,6 +102,7 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
         let config = Config::checked(timeout, records)
             .and_then(|c| c.with_diagnostic_records(diagnostic_records))
             .and_then(|c| c.with_startup_records(startup_records))
+            .and_then(|c| c.with_startup_record_bytes(startup_record_bytes))
             .ok_or_else(usage)?;
         if action == "config-save" {
             Action::SaveConfig(config)
@@ -105,6 +112,7 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
                 max_new_records: records,
                 max_diagnostic_records: diagnostic_records,
                 startup_records_per_step: startup_records,
+                startup_record_bytes_per_step: startup_record_bytes,
             })
         }
     };
@@ -379,6 +387,8 @@ mod tests {
             "7",
             "--startup-records-per-step",
             "3",
+            "--startup-record-bytes-per-step",
+            "1024",
         ]
         .map(Into::into)
         .to_vec();
@@ -391,6 +401,7 @@ mod tests {
                 max_new_records: Some(1),
                 max_diagnostic_records: Some(7),
                 startup_records_per_step: Some(3),
+                startup_record_bytes_per_step: Some(1024),
             })
         );
         for (option, max) in [
@@ -398,6 +409,7 @@ mod tests {
             ("--max-new-records", "10001"),
             ("--max-diagnostic-records", "10001"),
             ("--startup-records-per-step", "10001"),
+            ("--startup-record-bytes-per-step", "67108865"),
         ] {
             for bad in [
                 "0",
@@ -422,6 +434,9 @@ mod tests {
                 vec!["serve", "--data-dir", "data", option],
                 vec!["serve", "--data-dir", "data", option, "1", option, "2"],
                 vec!["probe", "--data-dir", "data", option, "1"],
+                vec!["status", "--data-dir", "data", option, "1"],
+                vec!["evaluate", "--data-dir", "data", option, "1"],
+                vec!["config-show", "--data-dir", "data", option, "1"],
             ] {
                 let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
                 assert_eq!(parse(&args).unwrap_err().exit_code(), 2);
@@ -622,6 +637,9 @@ mod config_tests {
             parse(&good).unwrap().action,
             Action::SaveConfig(_)
         ));
+        let mut extra = good.clone();
+        extra.extend(["--startup-record-bytes-per-step".into(), "1".into()]);
+        assert_eq!(parse(&extra).unwrap_err().exit_code(), 2);
         for option in [3, 5, 7, 9] {
             let mut missing = good.clone();
             missing.drain(option..option + 2);

@@ -50,3 +50,6 @@ cargo test --locked --offline --test record_cli saved_startup_ -- --test-threads
 
 # 停止中保存設定の読取り・拒否・出力失敗を再実行する。
 cargo test --locked --offline --test record_cli config_show_ -- --test-threads=1
+
+# 起動Recordのbyte分割・一件未満の予算不足を再実行する。
+cargo test --locked --offline --test record_cli startup_byte_budget_ -- --test-threads=1
