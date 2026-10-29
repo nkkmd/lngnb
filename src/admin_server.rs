@@ -27,6 +27,7 @@ pub struct Config {
     startup_record_edges_per_step: u64,
     startup_evaluation_records_per_step: u64,
     sql_inspection_callbacks: u64,
+    sql_inspection_timeout_ms: u64,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -41,6 +42,7 @@ impl Default for Config {
             startup_record_edges_per_step: 100_000,
             startup_evaluation_records_per_step: 32,
             sql_inspection_callbacks: 100_000,
+            sql_inspection_timeout_ms: 60_000,
         }
     }
 }
@@ -75,6 +77,7 @@ impl Config {
             startup_record_edges_per_step: defaults.startup_record_edges_per_step,
             startup_evaluation_records_per_step: defaults.startup_evaluation_records_per_step,
             sql_inspection_callbacks: defaults.sql_inspection_callbacks,
+            sql_inspection_timeout_ms: defaults.sql_inspection_timeout_ms,
         })
     }
     pub fn with_diagnostic_records(mut self, value: Option<u64>) -> Option<Self> {
@@ -141,6 +144,14 @@ impl Config {
         self.sql_inspection_callbacks = value;
         Some(self)
     }
+    pub fn with_sql_inspection_timeout(mut self, value: Option<u64>) -> Option<Self> {
+        let value = value.unwrap_or(self.sql_inspection_timeout_ms);
+        if value == 0 || value > 60_000 {
+            return None;
+        }
+        self.sql_inspection_timeout_ms = value;
+        Some(self)
+    }
     fn startup_budget(self) -> LocalStartupBudget {
         let mut budget = LocalStartupBudget::default();
         budget.inspection.records = self.startup_records_per_step;
@@ -170,6 +181,7 @@ pub struct Overrides {
     pub startup_record_edges_per_step: Option<u64>,
     pub startup_evaluation_records_per_step: Option<u64>,
     pub sql_inspection_callbacks: Option<u64>,
+    pub sql_inspection_timeout_ms: Option<u64>,
 }
 impl Overrides {
     // 設定読込み前から同じ接続/排他/保存sessionへ渡す。writer取得時に戻さない。
@@ -178,6 +190,10 @@ impl Overrides {
         limits.sql_inspection.callbacks = self
             .sql_inspection_callbacks
             .unwrap_or(limits.sql_inspection.callbacks);
+        limits.sql_inspection.elapsed = self
+            .sql_inspection_timeout_ms
+            .map(Duration::from_millis)
+            .unwrap_or(limits.sql_inspection.elapsed);
         limits
     }
     pub fn resolve(self, saved: Option<lngnb::storage::AdminConfig>) -> Option<Config> {
@@ -201,7 +217,8 @@ impl Overrides {
         .with_startup_blob_targets(self.startup_blob_targets_per_step)?
         .with_startup_record_edges(self.startup_record_edges_per_step)?
         .with_startup_evaluation_records(self.startup_evaluation_records_per_step)?
-        .with_sql_inspection_callbacks(self.sql_inspection_callbacks)
+        .with_sql_inspection_callbacks(self.sql_inspection_callbacks)?
+        .with_sql_inspection_timeout(self.sql_inspection_timeout_ms)
     }
 }
 
@@ -299,7 +316,7 @@ fn serve(
         .enable_evaluation_with_record_limit(config.max_diagnostic_records)
         .map_err(|_| Error::Unconfirmed)?;
     let ready = format!(
-        "管理受理側のローカル起動検査を完了し、管理socketを開きました。公開・復旧完了の判定ではありません。\nrequest_timeout_ms: {}\nmax_new_records: {}\nmax_diagnostic_records: {}\nstartup_records_per_step: {}\nstartup_record_bytes_per_step: {}\nstartup_blob_bytes_per_step: {}\nstartup_blob_targets_per_step: {}\nstartup_record_edges_per_step: {}\nstartup_evaluation_records_per_step: {}\nsql_inspection_callbacks: {}\n起動引数・保存値・既定値の順で選んだ設定を適用しました。起動引数は保存していません。Record/Blobのbyte予算・Blob対象数・Record辺数・親評価件数はこの起動だけの指定で、保存対象外です。SQL照合callback予算は起動後の保存sessionにも適用し、保存対象外です。\n",
+        "管理受理側のローカル起動検査を完了し、管理socketを開きました。公開・復旧完了の判定ではありません。\nrequest_timeout_ms: {}\nmax_new_records: {}\nmax_diagnostic_records: {}\nstartup_records_per_step: {}\nstartup_record_bytes_per_step: {}\nstartup_blob_bytes_per_step: {}\nstartup_blob_targets_per_step: {}\nstartup_record_edges_per_step: {}\nstartup_evaluation_records_per_step: {}\nsql_inspection_callbacks: {}\nsql_inspection_timeout_ms: {}\n起動引数・保存値・既定値の順で選んだ設定を適用しました。起動引数は保存していません。Record/Blobのbyte予算・Blob対象数・Record辺数・親評価件数はこの起動だけの指定で、保存対象外です。SQL照合callback/時間予算は起動後の保存sessionにも適用し、保存対象外です。\n",
         config.timeout_ms,
         config.max_new_records,
         config.max_diagnostic_records,
@@ -309,7 +326,8 @@ fn serve(
         config.startup_blob_targets_per_step,
         config.startup_record_edges_per_step,
         config.startup_evaluation_records_per_step,
-        config.sql_inspection_callbacks
+        config.sql_inspection_callbacks,
+        config.sql_inspection_timeout_ms
     );
     output
         .write_all(ready.as_bytes())
@@ -353,6 +371,50 @@ fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sql_time_budget_is_resolved_before_open_without_changing_other_limits_or_saving() {
+        let defaults = Limits::default();
+        assert_eq!(
+            Duration::from_millis(Config::default().sql_inspection_timeout_ms),
+            defaults.sql_inspection.elapsed
+        );
+        for value in [1, 30_000, 60_000] {
+            let overrides = Overrides {
+                sql_inspection_timeout_ms: Some(value),
+                sql_inspection_callbacks: Some(50_000),
+                ..Overrides::default()
+            };
+            let limits = overrides.storage_limits();
+            let config = overrides
+                .resolve(Some(Config::default().saved_values()))
+                .unwrap();
+            assert_eq!(limits.sql_inspection.elapsed, Duration::from_millis(value));
+            assert_eq!(config.sql_inspection_timeout_ms, value);
+            assert_eq!(limits.sql_inspection.callbacks, 50_000);
+            assert_eq!(config.sql_inspection_callbacks, 50_000);
+            assert_eq!(limits.scan_records, defaults.scan_records);
+            assert_eq!(limits.session_bytes, defaults.session_bytes);
+            let budget = config.startup_budget();
+            let expected = LocalStartupBudget::default();
+            assert_eq!(budget.inspection.elapsed, expected.inspection.elapsed);
+            assert_eq!(budget.records.elapsed, expected.records.elapsed);
+            assert_eq!(budget.blobs.elapsed, expected.blobs.elapsed);
+            assert_eq!(budget.evaluation.nodes, expected.evaluation.nodes);
+            assert_eq!(config.saved_values(), Config::default().saved_values());
+        }
+        for value in [0, 60_001, u64::MAX] {
+            assert!(
+                Config::default()
+                    .with_sql_inspection_timeout(Some(value))
+                    .is_none()
+            );
+        }
+        assert_eq!(
+            Overrides::default().storage_limits().sql_inspection.elapsed,
+            defaults.sql_inspection.elapsed
+        );
+    }
 
     #[test]
     fn sql_callback_budget_is_resolved_before_open_without_changing_time_or_saved_values() {

@@ -30,7 +30,7 @@ const HELP: &str = "lngnb — 分散図書館・知識基盤（開発初期段�
   lngnb admin evaluate --data-dir PATH
   lngnb admin config-show --data-dir PATH
   lngnb admin config-save --data-dir PATH --request-timeout-ms N --max-new-records N --max-diagnostic-records N --startup-records-per-step N
-  lngnb admin serve --data-dir PATH [--request-timeout-ms N] [--max-new-records N] [--max-diagnostic-records N] [--startup-records-per-step N] [--startup-record-bytes-per-step N] [--startup-blob-bytes-per-step N] [--startup-blob-targets-per-step N] [--startup-record-edges-per-step N] [--startup-evaluation-records-per-step N] [--sql-inspection-callbacks N]
+  lngnb admin serve --data-dir PATH [--request-timeout-ms N] [--max-new-records N] [--max-diagnostic-records N] [--startup-records-per-step N] [--startup-record-bytes-per-step N] [--startup-blob-bytes-per-step N] [--startup-blob-targets-per-step N] [--startup-record-edges-per-step N] [--startup-evaluation-records-per-step N] [--sql-inspection-callbacks N] [--sql-inspection-timeout-ms N]
   lngnb record submit --data-dir PATH --record PATH
   lngnb document create --data-dir PATH --key-dir PATH --name NAME --expect-key-id KEY_ID --payload PATH --metadata PATH [--media-type TYPE] [--max-payload-bytes N]
   lngnb key create --key-dir PATH --name NAME
@@ -81,6 +81,9 @@ admin serve は前面で管理受理側だけを起動します。SIGINT/SIGTERM
 --sql-inspection-callbacks は既存SQL照合群の進捗callback上限（1〜100000、既定100000）です。
 設定読込み前から同じ保存sessionへ適用し、起動後のSQL照合にも使います。正確な行数/命令数ではありません。
 保存/commit/rollbackへの中断handlerは追加せず、保存対象外です。
+--sql-inspection-timeout-ms は同じSQL照合群の時間予算（1〜60000 ms、既定60000）です。
+進捗通知時と照合群の前後で確認し、OSのI/O待ちを強制中断する実時間保証ではありません。
+設定読込み前から保存sessionへ適用し、起動後にも使います。保存対象外で、省略時は既定へ戻ります。
 Record/Blobのbyte予算・Blob対象数・Record辺数・親評価件数は保存対象外で、省略時は既定へ戻ります。一件も収まらなければ受付前に保全停止します。
 保存対象4項目は項目ごとに起動引数→検査済み保存値→既定値を選び、適用値を起動時に表示します。引数は自動保存しません。
 不正保存値を明示引数で補わず、全検査の完了前にはsocketを開きません。
