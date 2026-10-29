@@ -566,6 +566,16 @@ fn invalid_runtime_options_fail_before_creating_or_changing_data() {
             vec!["--startup-records-per-step", "0"],
             vec!["--startup-record-bytes-per-step", "0"],
             vec!["--startup-blob-bytes-per-step", "0"],
+            vec!["--startup-blob-targets-per-step", "0"],
+            vec!["--startup-blob-targets-per-step", "10001"],
+            vec!["--startup-blob-targets-per-step", "private"],
+            vec!["--startup-blob-targets-per-step", "01"],
+            vec![
+                "--startup-blob-targets-per-step",
+                "1",
+                "--startup-blob-targets-per-step",
+                "2",
+            ],
             vec!["--startup-blob-bytes-per-step", "67108865"],
             vec!["--startup-blob-bytes-per-step", "private"],
             vec!["--startup-blob-bytes-per-step", "01"],
@@ -1993,4 +2003,93 @@ fn startup_blob_byte_budget_detects_later_corruption_before_opening_any_socket()
     assert!(retry.stdout.is_empty());
     assert_review(&temp, true);
     assert_eq!(saved_config_row(&temp.data()), (500, 7, 8, 10_000));
+}
+
+#[test]
+fn startup_blob_target_budget_splits_both_stages_without_tightening_bytes_or_saving() {
+    let temp = Temp::new();
+    let payloads = startup_blobs(&temp);
+    let mut server = Server::configured(&temp, &["--startup-blob-targets-per-step", "1"]);
+    let diagnostic = evaluate_cli(&temp.data());
+    assert!(diagnostic.status.success());
+    assert_eq!(diagnostic_field(&diagnostic, "records"), 3);
+    assert_eq!(diagnostic_field(&diagnostic, "payload_missing"), 0);
+    server.signal("-TERM");
+    assert!(server.wait().success());
+    let text = fs::read_to_string(&server.log).unwrap();
+    assert!(text.contains("startup_blob_targets_per_step: 1\n"));
+    assert!(text.contains("startup_blob_bytes_per_step: 67108864\n"));
+    let conn = rusqlite::Connection::open(temp.data().join("database.sqlite")).unwrap();
+    let split: i64 = conn.query_row("SELECT count(*) FROM history WHERE reason='record_inspection_checkpoint' AND old_state LIKE 'blobs:epoch=%' AND new_state='record_inspection_pending'",[],|r|r.get(0)).unwrap();
+    assert!(split > 0);
+    let split: i64 = conn.query_row("SELECT count(*) FROM history WHERE new_state='evaluation_blob_pending' AND reason LIKE 'evaluation_blob_checkpoint:records=%:payloads=%:checked=1:total=2:bytes=%'",[],|r|r.get(0)).unwrap();
+    assert!(split > 0);
+    drop(conn);
+    for payload in &payloads {
+        assert_eq!(
+            fs::read(startup_blob_path(&temp, payload)).unwrap(),
+            *payload
+        );
+    }
+    assert_eq!(saved_config_row(&temp.data()), (500, 7, 8, 10_000));
+    let mut restarted = Server::start(&temp);
+    restarted.signal("-TERM");
+    assert!(restarted.wait().success());
+    assert!(
+        fs::read_to_string(&restarted.log)
+            .unwrap()
+            .contains("startup_blob_targets_per_step: 10000\n")
+    );
+    assert_eq!(saved_config_row(&temp.data()), (500, 7, 8, 10_000));
+}
+#[test]
+fn startup_blob_target_budget_counts_unheld_payloads_even_with_zero_hash_bytes() {
+    let temp = Temp::new();
+    let payloads = [
+        b"first unheld blob".to_vec(),
+        b"second unheld blob".to_vec(),
+    ];
+    let mut writer = RecordStore::initialize(&temp.data(), Limits::default())
+        .unwrap()
+        .begin()
+        .unwrap();
+    writer.insert(&fixture()).unwrap();
+    for payload in &payloads {
+        writer.insert(&blob_revision(payload)).unwrap();
+    }
+    writer.finish().unwrap();
+    let mut server = Server::configured(&temp, &["--startup-blob-targets-per-step", "1"]);
+    let diagnostic = evaluate_cli(&temp.data());
+    assert!(diagnostic.status.success());
+    assert_eq!(diagnostic_field(&diagnostic, "records"), 3);
+    assert_eq!(diagnostic_field(&diagnostic, "payload_missing"), 2);
+    server.signal("-TERM");
+    assert!(server.wait().success());
+    let conn = rusqlite::Connection::open(temp.data().join("database.sqlite")).unwrap();
+    let split: i64 = conn.query_row("SELECT count(*) FROM history WHERE new_state='evaluation_blob_pending' AND reason LIKE 'evaluation_blob_checkpoint:records=%:payloads=%:checked=1:total=2:bytes=0:digest=%'",[],|r|r.get(0)).unwrap();
+    assert!(split > 0);
+    let files: i64 = conn
+        .query_row("SELECT count(*) FROM blob_inspection_files", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(files, 0);
+    let checked: (i64, i64) = conn
+        .query_row(
+            "SELECT count(*),sum(examined_bytes) FROM evaluation_blob_facts WHERE state='missing'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(checked, (2, 0));
+    drop(conn);
+    for payload in &payloads {
+        assert!(!startup_blob_path(&temp, payload).exists());
+    }
+    let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
+    assert_eq!(
+        store.startup_state().unwrap(),
+        lngnb::storage::StartupState::Clean
+    );
+    assert_eq!(store.saved_admin_config().unwrap(), None);
 }
