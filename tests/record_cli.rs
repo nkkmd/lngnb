@@ -569,6 +569,16 @@ fn invalid_runtime_options_fail_before_creating_or_changing_data() {
             vec!["--startup-blob-targets-per-step", "0"],
             vec!["--startup-record-edges-per-step", "0"],
             vec!["--startup-evaluation-records-per-step", "0"],
+            vec!["--startup-inspection-timeout-ms", "0"],
+            vec!["--startup-inspection-timeout-ms", "60001"],
+            vec!["--startup-inspection-timeout-ms", "private"],
+            vec!["--startup-inspection-timeout-ms", "01"],
+            vec![
+                "--startup-inspection-timeout-ms",
+                "1",
+                "--startup-inspection-timeout-ms",
+                "2",
+            ],
             vec!["--sql-inspection-timeout-ms", "0"],
             vec!["--sql-inspection-timeout-ms", "60001"],
             vec!["--sql-inspection-timeout-ms", "private"],
@@ -2536,6 +2546,88 @@ fn sql_time_budget_is_used_for_runtime_without_saving_or_clearing_manual_wait() 
             .arg(temp.data());
         if explicit {
             command.args(["--sql-inspection-timeout-ms", "30000"]);
+        }
+        let retry = command.output().unwrap();
+        assert_eq!(retry.status.code(), Some(3));
+        assert!(retry.stdout.is_empty());
+        assert_review(&temp, true);
+        assert_eq!(saved_config_row(&temp.data()), (500, 7, 8, 10_000));
+    }
+}
+
+#[test]
+fn startup_inspection_time_budget_completes_split_checks_without_saving_or_clearing_manual_wait() {
+    let temp = Temp::new();
+    let payloads = startup_blobs(&temp);
+    let mut server = Server::configured(
+        &temp,
+        &[
+            "--startup-inspection-timeout-ms",
+            "30000",
+            "--startup-records-per-step",
+            "1",
+            "--startup-blob-targets-per-step",
+            "1",
+        ],
+    );
+    let diagnostic = evaluate_cli(&temp.data());
+    assert!(diagnostic.status.success());
+    assert_eq!(diagnostic_field(&diagnostic, "records"), 3);
+    assert_eq!(diagnostic_field(&diagnostic, "payload_missing"), 0);
+    server.signal("-TERM");
+    assert!(server.wait().success());
+    let ready = fs::read_to_string(&server.log).unwrap();
+    assert!(ready.contains("startup_inspection_timeout_ms: 30000\n"));
+    assert!(ready.contains("sql_inspection_timeout_ms: 60000\n"));
+    let conn = rusqlite::Connection::open(temp.data().join("database.sqlite")).unwrap();
+    let progress: (String, i64, i64) = conn
+        .query_row(
+            "SELECT phase,checked_records,checked_blob_files FROM record_inspection",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(progress, ("complete".into(), 3, 2));
+    let split: i64 = conn.query_row("SELECT count(*) FROM history WHERE reason='record_inspection_checkpoint' AND old_state LIKE 'records:epoch=%:records=1:bytes=%'", [], |r| r.get(0)).unwrap();
+    assert!(split > 0);
+    let split: i64 = conn.query_row("SELECT count(*) FROM history WHERE reason='record_inspection_checkpoint' AND old_state LIKE 'blobs:epoch=%' AND new_state='record_inspection_pending'", [], |r| r.get(0)).unwrap();
+    assert!(split > 0);
+    drop(conn);
+    assert_eq!(saved_config_row(&temp.data()), (500, 7, 8, 10_000));
+    let mut restarted = Server::start(&temp);
+    restarted.signal("-TERM");
+    assert!(restarted.wait().success());
+    assert!(
+        fs::read_to_string(&restarted.log)
+            .unwrap()
+            .contains("startup_inspection_timeout_ms: 60000\n")
+    );
+    for payload in &payloads {
+        assert_eq!(
+            fs::read(startup_blob_path(&temp, payload)).unwrap(),
+            *payload
+        );
+    }
+    let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
+    assert_eq!(
+        store.record(fixture().id()).unwrap().unwrap().bytes(),
+        fixture().bytes()
+    );
+    for payload in &payloads {
+        let record = blob_revision(payload);
+        assert_eq!(
+            store.record(record.id()).unwrap().unwrap().bytes(),
+            record.bytes()
+        );
+    }
+    drop(store.begin().unwrap());
+    for explicit in [false, true] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_lngnb"));
+        command
+            .args(["admin", "serve", "--data-dir"])
+            .arg(temp.data());
+        if explicit {
+            command.args(["--startup-inspection-timeout-ms", "30000"]);
         }
         let retry = command.output().unwrap();
         assert_eq!(retry.status.code(), Some(3));
