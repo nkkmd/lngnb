@@ -1242,7 +1242,7 @@ fn config_save_failure_preserves_old_or_committed_new_values_and_blocks_restart(
                 "CREATE TRIGGER deny_settings BEFORE INSERT ON history WHEN NEW.new_state='admin_config_saved_local_only' BEGIN SELECT RAISE(ABORT,'test'); END;"
             }
             _ => {
-                "CREATE TRIGGER deny_settings BEFORE UPDATE ON storage_state WHEN NEW.state='clean' BEGIN SELECT RAISE(ABORT,'test'); END;"
+                "CREATE TRIGGER deny_settings BEFORE UPDATE ON storage_state WHEN OLD.state='running' AND NEW.state='clean' BEGIN SELECT RAISE(ABORT,'test'); END;"
             }
         };
         conn.execute_batch(sql).unwrap();
