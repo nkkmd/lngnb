@@ -208,7 +208,9 @@ pub struct RecordInspection {
 }
 impl RecordInspection {
     pub fn open(path: &Path, limits: Limits) -> Result<Self> {
-        let mut store = RecordStore::open_locked(path, limits)?;
+        Self::from_store(RecordStore::open_locked(path, limits)?)
+    }
+    pub(super) fn from_store(mut store: RecordStore) -> Result<Self> {
         let started_clean = state(&store.conn)? == StartupState::Clean;
         let old = checkpoint(&store.conn, store.limits.sql_inspection)?;
         let previous_report =

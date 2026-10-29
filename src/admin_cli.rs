@@ -1,5 +1,8 @@
 //! 管理socketの接続診断と前面の管理受理側。公開リレーではない。
-use super::{AppError, admin_server::Config};
+use super::{
+    AppError,
+    admin_server::{Config, Overrides},
+};
 use lngnb::storage::admin_transport::client;
 use std::{ffi::OsString, fmt, io::Write, path::PathBuf, time::Duration};
 
@@ -13,7 +16,7 @@ enum Action {
     Probe,
     Status,
     Evaluate,
-    Serve(Config),
+    Serve(Overrides),
     SaveConfig(Config),
 }
 pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
@@ -93,7 +96,12 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
         if action == "config-save" {
             Action::SaveConfig(config)
         } else {
-            Action::Serve(config)
+            Action::Serve(Overrides {
+                timeout_ms: timeout,
+                max_new_records: records,
+                max_diagnostic_records: diagnostic_records,
+                startup_records_per_step: startup_records,
+            })
         }
     };
     Ok(Command {
@@ -275,7 +283,7 @@ mod tests {
             parse(&["serve".into(), "--data-dir".into(), "data".into()])
                 .unwrap()
                 .action,
-            Action::Serve(Config::default())
+            Action::Serve(Overrides::default())
         );
         for args in [
             vec!["serve", "--data-dir", "a", "--data-dir", "b"],
@@ -342,14 +350,12 @@ mod tests {
         assert_eq!(command.data, PathBuf::from("資料 space"));
         assert_eq!(
             command.action,
-            Action::Serve(
-                Config::checked(Some(500), Some(1))
-                    .unwrap()
-                    .with_diagnostic_records(Some(7))
-                    .unwrap()
-                    .with_startup_records(Some(3))
-                    .unwrap()
-            )
+            Action::Serve(Overrides {
+                timeout_ms: Some(500),
+                max_new_records: Some(1),
+                max_diagnostic_records: Some(7),
+                startup_records_per_step: Some(3),
+            })
         );
         for (option, max) in [
             ("--request-timeout-ms", "30001"),

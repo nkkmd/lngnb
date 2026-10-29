@@ -44,3 +44,6 @@ cargo test --locked --offline --lib storage::admin_config::tests:: -- --test-thr
 
 # 停止中設定CLIの正常・拒否・保存/出力失敗も再実行する（通常件数へ二重加算しない）。
 cargo test --locked --offline --test record_cli config_save_ -- --test-threads=1
+
+# 保存設定の起動適用・破損拒否・手動待ち維持も再実行する。
+cargo test --locked --offline --test record_cli saved_startup_ -- --test-threads=1
