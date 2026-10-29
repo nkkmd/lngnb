@@ -44,6 +44,7 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
     let mut diagnostic_records = None;
     let mut startup_records = None;
     let mut startup_record_bytes = None;
+    let mut startup_blob_bytes = None;
     for pair in rest.chunks(2) {
         let [option, value] = pair else {
             return Err(usage());
@@ -79,6 +80,11 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
             {
                 startup_record_bytes = Some(number(value).ok_or_else(usage)?);
             }
+            Some("--startup-blob-bytes-per-step")
+                if action == "serve" && startup_blob_bytes.is_none() =>
+            {
+                startup_blob_bytes = Some(number(value).ok_or_else(usage)?);
+            }
             _ => return Err(usage()),
         }
     }
@@ -103,6 +109,7 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
             .and_then(|c| c.with_diagnostic_records(diagnostic_records))
             .and_then(|c| c.with_startup_records(startup_records))
             .and_then(|c| c.with_startup_record_bytes(startup_record_bytes))
+            .and_then(|c| c.with_startup_blob_bytes(startup_blob_bytes))
             .ok_or_else(usage)?;
         if action == "config-save" {
             Action::SaveConfig(config)
@@ -113,6 +120,7 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
                 max_diagnostic_records: diagnostic_records,
                 startup_records_per_step: startup_records,
                 startup_record_bytes_per_step: startup_record_bytes,
+                startup_blob_bytes_per_step: startup_blob_bytes,
             })
         }
     };
@@ -389,6 +397,8 @@ mod tests {
             "3",
             "--startup-record-bytes-per-step",
             "1024",
+            "--startup-blob-bytes-per-step",
+            "2048",
         ]
         .map(Into::into)
         .to_vec();
@@ -402,6 +412,7 @@ mod tests {
                 max_diagnostic_records: Some(7),
                 startup_records_per_step: Some(3),
                 startup_record_bytes_per_step: Some(1024),
+                startup_blob_bytes_per_step: Some(2048),
             })
         );
         for (option, max) in [
@@ -410,6 +421,7 @@ mod tests {
             ("--max-diagnostic-records", "10001"),
             ("--startup-records-per-step", "10001"),
             ("--startup-record-bytes-per-step", "67108865"),
+            ("--startup-blob-bytes-per-step", "67108865"),
         ] {
             for bad in [
                 "0",
@@ -639,6 +651,9 @@ mod config_tests {
         ));
         let mut extra = good.clone();
         extra.extend(["--startup-record-bytes-per-step".into(), "1".into()]);
+        assert_eq!(parse(&extra).unwrap_err().exit_code(), 2);
+        let mut extra = good.clone();
+        extra.extend(["--startup-blob-bytes-per-step".into(), "1".into()]);
         assert_eq!(parse(&extra).unwrap_err().exit_code(), 2);
         for option in [3, 5, 7, 9] {
             let mut missing = good.clone();
