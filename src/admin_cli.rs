@@ -52,7 +52,9 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
             {
                 diagnostic_records = Some(number(value).ok_or_else(usage)?);
             }
-            Some("--startup-records-per-step") if action == "serve" && startup_records.is_none() => {
+            Some("--startup-records-per-step")
+                if action == "serve" && startup_records.is_none() =>
+            {
                 startup_records = Some(number(value).ok_or_else(usage)?);
             }
             _ => return Err(usage()),
@@ -388,7 +390,13 @@ mod evaluation_tests {
                 "--max-diagnostic-records",
                 "1",
             ],
-            vec!["evaluate", "--data-dir", "data", "--startup-records-per-step", "1"],
+            vec![
+                "evaluate",
+                "--data-dir",
+                "data",
+                "--startup-records-per-step",
+                "1",
+            ],
         ] {
             let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
             assert_eq!(parse(&args).unwrap_err().exit_code(), 2);
