@@ -28,6 +28,7 @@ const HELP: &str = "lngnb — 分散図書館・知識基盤（開発初期段�
   lngnb admin probe --data-dir PATH
   lngnb admin status --data-dir PATH
   lngnb admin evaluate --data-dir PATH
+  lngnb admin config-save --data-dir PATH --request-timeout-ms N --max-new-records N --max-diagnostic-records N --startup-records-per-step N
   lngnb admin serve --data-dir PATH [--request-timeout-ms N] [--max-new-records N] [--max-diagnostic-records N] [--startup-records-per-step N]
   lngnb record submit --data-dir PATH --record PATH
   lngnb document create --data-dir PATH --key-dir PATH --name NAME --expect-key-id KEY_ID --payload PATH --metadata PATH [--media-type TYPE] [--max-payload-bytes N]
@@ -72,7 +73,10 @@ admin serve は前面で管理受理側だけを起動します。SIGINT/SIGTERM
 不正通信・保存障害・応答喪失では正常停止にせず、領域とsocketを保持します。
 admin status は診断専用socketから実行時の世代・新規保存件数/予算・空き容量だけを取得します。
 診断endpointがない旧受理側へは保存経路で再接続せず、保存要求・直接DB読込み・復旧解除をしません。
-全管理状態・製品リレー起動・設定永続化CLIは未実装です。
+admin config-save は停止中の正常領域へ4項目すべてを明示保存します。保存値の起動時適用は未実装です。
+保存失敗・正常停止未確認は終了3、保存/正常停止後の出力失敗は1です。
+稼働中は排他競合で拒否し、IPCへ切り替えません。手動待ち・既存不正設定を自動解除・補完しません。
+全管理状態・製品リレー起動は未実装です。
 改訂・派生・pin・公開・リレー起動・復旧確認CLIは未実装です。
 ";
 

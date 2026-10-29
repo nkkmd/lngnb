@@ -41,3 +41,6 @@ cargo test --locked --offline --lib storage::blobs::tests::process_kill_between_
 
 # 設定の原子的保存・SQL拒否・commit前後killも同じ隔離ext4で再実行する。
 cargo test --locked --offline --lib storage::admin_config::tests:: -- --test-threads=1
+
+# 停止中設定CLIの正常・拒否・保存/出力失敗も再実行する（通常件数へ二重加算しない）。
+cargo test --locked --offline --test record_cli config_save_ -- --test-threads=1

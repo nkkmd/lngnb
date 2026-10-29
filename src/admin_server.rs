@@ -33,6 +33,14 @@ impl Default for Config {
     }
 }
 impl Config {
+    pub fn saved_values(self) -> lngnb::storage::AdminConfig {
+        lngnb::storage::AdminConfig {
+            request_timeout_ms: self.timeout_ms,
+            max_new_records: self.max_new_records,
+            max_diagnostic_records: self.max_diagnostic_records,
+            startup_records_per_step: self.startup_records_per_step,
+        }
+    }
     pub fn checked(timeout_ms: Option<u64>, max_new_records: Option<u64>) -> Option<Self> {
         let defaults = Self::default();
         let timeout_ms = timeout_ms.unwrap_or(defaults.timeout_ms);
