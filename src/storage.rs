@@ -16,7 +16,7 @@ use std::{
 };
 
 pub const IMPLEMENTATION: &str = "lngnb-rust-sqlite-1";
-pub const SCHEMA_VERSION: i64 = 11;
+pub const SCHEMA_VERSION: i64 = 12;
 const DB: &str = "database.sqlite";
 const SCHEMA: &str = "
 CREATE TABLE storage_state (
@@ -26,6 +26,19 @@ CREATE TABLE storage_state (
  generation INTEGER NOT NULL CHECK(generation>=0),
  state TEXT NOT NULL CHECK(state IN ('clean','running'))
 ) STRICT;
+CREATE TABLE admin_config (
+ singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+ request_timeout_ms INTEGER CHECK(request_timeout_ms BETWEEN 1 AND 30000),
+ max_new_records INTEGER CHECK(max_new_records BETWEEN 1 AND 10000),
+ max_diagnostic_records INTEGER CHECK(max_diagnostic_records BETWEEN 1 AND 10000),
+ startup_records_per_step INTEGER CHECK(startup_records_per_step BETWEEN 1 AND 10000),
+ generation INTEGER CHECK(generation>=0),
+ CHECK((generation IS NULL AND request_timeout_ms IS NULL AND max_new_records IS NULL
+ AND max_diagnostic_records IS NULL AND startup_records_per_step IS NULL)
+ OR (generation IS NOT NULL AND request_timeout_ms IS NOT NULL AND max_new_records IS NOT NULL
+ AND max_diagnostic_records IS NOT NULL AND startup_records_per_step IS NOT NULL))
+) STRICT;
+INSERT INTO admin_config(singleton) VALUES(1);
 CREATE TABLE records (
  id BLOB PRIMARY KEY NOT NULL CHECK(length(id)=32),
  bytes BLOB NOT NULL CHECK(length(bytes) BETWEEN 1 AND 2097152)
@@ -228,6 +241,7 @@ CREATE TABLE history (
  actor TEXT NOT NULL, reason TEXT NOT NULL, rules TEXT NOT NULL,
  at TEXT NOT NULL
 ) STRICT;
+CREATE INDEX history_admin_config ON history(generation) WHERE new_state='admin_config_saved_local_only';
 CREATE INDEX history_blob_retention ON history(target,generation) WHERE new_state IN ('blob_staged_local_only','blob_retained_local_only');
 ";
 
@@ -480,6 +494,7 @@ fn check_format(conn: &Connection, budget: SqlInspectionBudget) -> Result<()> {
     if version != SCHEMA_VERSION {
         return Err(StorageError::UnsupportedFormat);
     }
+    admin_config::load(conn)?;
     blobs::validate_holds(conn, budget)?;
     let (implementation, namespace, generation, state): (String, Vec<u8>, i64, String) = conn
         .query_row(
@@ -499,6 +514,7 @@ fn check_format(conn: &Connection, budget: SqlInspectionBudget) -> Result<()> {
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
     let expected_state = if [
+        "admin_config_saved_local_only",
         "stored_local_only",
         "blob_retained_local_only",
         "blob_staged_local_only",
@@ -601,6 +617,8 @@ pub struct RecordStore {
 }
 pub mod admin_transport;
 pub mod management;
+mod admin_config;
+pub use admin_config::AdminConfig;
 impl RecordStore {
     /// 新しい最終ディレクトリだけを作る。既存/未完了領域を上書きしない。
     /// 管理CLIの初期化手順は工程⑤で接続する。
