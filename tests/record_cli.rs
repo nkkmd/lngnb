@@ -1102,3 +1102,205 @@ fn invalid_later_startup_record_never_opens_socket_or_clears_manual_review() {
     assert!(retry.stdout.is_empty());
     assert!(!temp.data().join("admin.sock").exists());
 }
+
+fn config_save_command(data: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_lngnb"));
+    command
+        .args(["admin", "config-save", "--data-dir"])
+        .arg(data)
+        .args([
+            "--request-timeout-ms",
+            "500",
+            "--max-new-records",
+            "7",
+            "--max-diagnostic-records",
+            "8",
+            "--startup-records-per-step",
+            "1",
+        ]);
+    command
+}
+fn saved_config_row(data: &Path) -> (i64, i64, i64, i64) {
+    rusqlite::Connection::open(data.join("database.sqlite")).unwrap().query_row(
+        "SELECT request_timeout_ms,max_new_records,max_diagnostic_records,startup_records_per_step FROM admin_config WHERE singleton=1",
+        [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).unwrap()
+}
+#[test]
+fn config_save_persists_explicit_values_without_applying_them_on_serve() {
+    let temp = Temp::new();
+    let mut writer = RecordStore::initialize(&temp.data(), Limits::default())
+        .unwrap()
+        .begin()
+        .unwrap();
+    writer.insert(&fixture()).unwrap();
+    writer.finish().unwrap();
+    for _ in 0..2 {
+        let output = config_save_command(&temp.data()).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("保存値は起動へ適用していません"));
+        assert_eq!(saved_config_row(&temp.data()), (500, 7, 8, 1));
+        let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
+        assert_eq!(
+            store.startup_state().unwrap(),
+            lngnb::storage::StartupState::Clean
+        );
+        assert_eq!(
+            store.record(fixture().id()).unwrap().unwrap().bytes(),
+            fixture().bytes()
+        );
+    }
+    let candidate = Command::new(env!("CARGO_BIN_EXE_lngnb"))
+        .args(["config", "show", "--data-dir"])
+        .arg(temp.data())
+        .output()
+        .unwrap();
+    assert!(candidate.status.success());
+    assert!(String::from_utf8_lossy(&candidate.stdout).contains("未保存・未適用"));
+    let mut server = Server::start(&temp);
+    let runtime = status_cli(&temp.data());
+    assert!(runtime.status.success());
+    assert_eq!(diagnostic_field(&runtime, "max_new_records"), 10_000);
+    assert_eq!(diagnostic_field(&runtime, "request_timeout_ms"), 30_000);
+    server.signal("-TERM");
+    assert!(server.wait().success());
+    assert_eq!(saved_config_row(&temp.data()), (500, 7, 8, 1));
+}
+#[test]
+fn config_save_invalid_or_incomplete_arguments_never_touch_the_area() {
+    let temp = Temp::new();
+    for initialized in [false, true] {
+        if initialized {
+            drop(RecordStore::initialize(&temp.data(), Limits::default()).unwrap());
+        }
+        for arguments in [
+            vec![],
+            vec!["--request-timeout-ms", "500"],
+            vec!["--request-timeout-ms", "private"],
+            vec!["--request-timeout-ms", "500", "--request-timeout-ms", "500"],
+        ] {
+            let output = Command::new(env!("CARGO_BIN_EXE_lngnb"))
+                .args(["admin", "config-save", "--data-dir"])
+                .arg(temp.data())
+                .args(arguments)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(2));
+            assert!(output.stdout.is_empty());
+            assert!(!String::from_utf8_lossy(&output.stderr).contains("private"));
+            if initialized {
+                let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
+                assert_eq!(store.generation().unwrap(), 0);
+                assert_eq!(store.saved_admin_config().unwrap(), None);
+            } else {
+                assert!(!temp.data().exists());
+            }
+        }
+    }
+}
+#[test]
+fn config_save_rejects_active_lock_and_manual_review_without_changing_values() {
+    let temp = Temp::new();
+    let store = RecordStore::initialize(&temp.data(), Limits::default()).unwrap();
+    let output = config_save_command(&temp.data()).output().unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(store.saved_admin_config().unwrap(), None);
+    let mut writer = store.begin().unwrap();
+    writer
+        .save_admin_config(lngnb::storage::AdminConfig {
+            request_timeout_ms: 700,
+            max_new_records: 9,
+            max_diagnostic_records: 10,
+            startup_records_per_step: 2,
+        })
+        .unwrap();
+    drop(writer);
+    let output = config_save_command(&temp.data()).output().unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(saved_config_row(&temp.data()), (700, 9, 10, 2));
+    let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
+    assert_eq!(
+        store.startup_state().unwrap(),
+        lngnb::storage::StartupState::NeedsReview
+    );
+    assert!(!temp.data().join("admin.sock").exists());
+}
+#[test]
+fn config_save_failure_preserves_old_or_committed_new_values_and_blocks_restart() {
+    for failure in ["setting", "history", "finish"] {
+        let temp = Temp::new();
+        drop(RecordStore::initialize(&temp.data(), Limits::default()).unwrap());
+        let conn = rusqlite::Connection::open(temp.data().join("database.sqlite")).unwrap();
+        let sql = match failure {
+            "setting" => {
+                "CREATE TRIGGER deny_settings BEFORE UPDATE ON admin_config BEGIN SELECT RAISE(ABORT,'test'); END;"
+            }
+            "history" => {
+                "CREATE TRIGGER deny_settings BEFORE INSERT ON history WHEN NEW.new_state='admin_config_saved_local_only' BEGIN SELECT RAISE(ABORT,'test'); END;"
+            }
+            _ => {
+                "CREATE TRIGGER deny_settings BEFORE UPDATE ON storage_state WHEN OLD.state='running' AND NEW.state='clean' BEGIN SELECT RAISE(ABORT,'test'); END;"
+            }
+        };
+        conn.execute_batch(sql).unwrap();
+        drop(conn);
+        let output = config_save_command(&temp.data()).output().unwrap();
+        assert_eq!(output.status.code(), Some(3));
+        assert!(output.stdout.is_empty());
+        let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
+        assert_eq!(
+            store.saved_admin_config().unwrap().is_some(),
+            failure == "finish"
+        );
+        assert_eq!(
+            store.startup_state().unwrap(),
+            lngnb::storage::StartupState::NeedsReview
+        );
+        drop(store);
+        let retry = config_save_command(&temp.data()).output().unwrap();
+        assert_eq!(retry.status.code(), Some(3));
+        assert!(!temp.data().join("admin.sock").exists());
+    }
+}
+#[test]
+fn config_save_output_failure_does_not_undo_confirmed_settings() {
+    let temp = Temp::new();
+    drop(RecordStore::initialize(&temp.data(), Limits::default()).unwrap());
+    let output = config_save_command(&temp.data())
+        .stdout(fs::File::options().write(true).open("/dev/full").unwrap())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("正常終了後"));
+    assert_eq!(saved_config_row(&temp.data()), (500, 7, 8, 1));
+    let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
+    assert_eq!(
+        store.startup_state().unwrap(),
+        lngnb::storage::StartupState::Clean
+    );
+}
+
+#[test]
+fn config_save_never_repairs_corrupt_old_or_missing_storage() {
+    for damaged in ["missing", "old", "config"] {
+        let temp = Temp::new();
+        if damaged != "missing" {
+            drop(RecordStore::initialize(&temp.data(), Limits::default()).unwrap());
+            let conn = rusqlite::Connection::open(temp.data().join("database.sqlite")).unwrap();
+            if damaged == "old" {
+                conn.pragma_update(None, "user_version", 11).unwrap();
+            } else {
+                conn.execute("DELETE FROM admin_config", []).unwrap();
+            }
+        }
+        let before = fs::read(temp.data().join("database.sqlite")).ok();
+        let output = config_save_command(&temp.data()).output().unwrap();
+        assert_eq!(output.status.code(), Some(3));
+        assert!(output.stdout.is_empty());
+        assert_eq!(fs::read(temp.data().join("database.sqlite")).ok(), before);
+        assert!(!temp.data().join("admin.sock").exists());
+    }
+}
