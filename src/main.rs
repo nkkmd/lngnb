@@ -30,7 +30,7 @@ const HELP: &str = "lngnb — 分散図書館・知識基盤（開発初期段�
   lngnb admin evaluate --data-dir PATH
   lngnb admin config-show --data-dir PATH
   lngnb admin config-save --data-dir PATH --request-timeout-ms N --max-new-records N --max-diagnostic-records N --startup-records-per-step N
-  lngnb admin serve --data-dir PATH [--request-timeout-ms N] [--max-new-records N] [--max-diagnostic-records N] [--startup-records-per-step N] [--startup-record-bytes-per-step N] [--startup-blob-bytes-per-step N] [--startup-blob-targets-per-step N] [--startup-record-edges-per-step N]
+  lngnb admin serve --data-dir PATH [--request-timeout-ms N] [--max-new-records N] [--max-diagnostic-records N] [--startup-records-per-step N] [--startup-record-bytes-per-step N] [--startup-blob-bytes-per-step N] [--startup-blob-targets-per-step N] [--startup-record-edges-per-step N] [--startup-evaluation-records-per-step N]
   lngnb record submit --data-dir PATH --record PATH
   lngnb document create --data-dir PATH --key-dir PATH --name NAME --expect-key-id KEY_ID --payload PATH --metadata PATH [--media-type TYPE] [--max-payload-bytes N]
   lngnb key create --key-dir PATH --name NAME
@@ -76,7 +76,9 @@ admin serve は前面で管理受理側だけを起動します。SIGINT/SIGTERM
 未保持Blob等も本文評価の一対象として数えます。
 --startup-record-edges-per-step は依存入力収集の各stepの親参照数（1〜100000、既定100000）です。
 一Revisionの親参照も収まらなければ不正判定せず受付前に保全停止します。
-Record/Blobのbyte予算・Blob対象数・Record辺数は保存対象外で、省略時は既定へ戻ります。一件も収まらなければ受付前に保全停止します。
+--startup-evaluation-records-per-step は親評価が各stepで新たに判定するRecord数（1〜32、既定32）です。
+入力収集・台帳照合の予算や全対象数の上限は変更しません。
+Record/Blobのbyte予算・Blob対象数・Record辺数・親評価件数は保存対象外で、省略時は既定へ戻ります。一件も収まらなければ受付前に保全停止します。
 保存対象4項目は項目ごとに起動引数→検査済み保存値→既定値を選び、適用値を起動時に表示します。引数は自動保存しません。
 不正保存値を明示引数で補わず、全検査の完了前にはsocketを開きません。
 不正通信・保存障害・応答喪失では正常停止にせず、領域とsocketを保持します。

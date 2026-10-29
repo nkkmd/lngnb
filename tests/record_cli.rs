@@ -568,6 +568,16 @@ fn invalid_runtime_options_fail_before_creating_or_changing_data() {
             vec!["--startup-blob-bytes-per-step", "0"],
             vec!["--startup-blob-targets-per-step", "0"],
             vec!["--startup-record-edges-per-step", "0"],
+            vec!["--startup-evaluation-records-per-step", "0"],
+            vec!["--startup-evaluation-records-per-step", "33"],
+            vec!["--startup-evaluation-records-per-step", "private"],
+            vec!["--startup-evaluation-records-per-step", "01"],
+            vec![
+                "--startup-evaluation-records-per-step",
+                "1",
+                "--startup-evaluation-records-per-step",
+                "2",
+            ],
             vec!["--startup-record-edges-per-step", "100001"],
             vec!["--startup-record-edges-per-step", "private"],
             vec!["--startup-record-edges-per-step", "01"],
@@ -2215,6 +2225,106 @@ fn startup_edge_budget_below_one_revision_preserves_records_without_invalidating
         .query_row("SELECT count(*) FROM known_invalid", [], |r| r.get(0))
         .unwrap();
     assert_eq!(invalid, 0);
+    drop(conn);
+    assert_review(&temp, true);
+    let retry = Command::new(env!("CARGO_BIN_EXE_lngnb"))
+        .args(["admin", "serve", "--data-dir"])
+        .arg(temp.data())
+        .output()
+        .unwrap();
+    assert_eq!(retry.status.code(), Some(3));
+    assert!(retry.stdout.is_empty());
+    assert_review(&temp, true);
+    let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
+    for record in &records {
+        assert_eq!(
+            store.record(record.id()).unwrap().unwrap().bytes(),
+            record.bytes()
+        );
+    }
+    drop(store);
+    assert_eq!(saved_config_row(&temp.data()), (500, 7, 8, 10_000));
+}
+
+#[test]
+fn startup_evaluation_budget_splits_new_assessments_and_returns_to_default_without_saving() {
+    let temp = Temp::new();
+    let records = startup_edge_records(&temp, false);
+    let mut server = Server::configured(&temp, &["--startup-evaluation-records-per-step", "1"]);
+    let diagnostic = evaluate_cli(&temp.data());
+    assert!(diagnostic.status.success());
+    assert_eq!(diagnostic_field(&diagnostic, "records"), 4);
+    assert_eq!(diagnostic_field(&diagnostic, "diagnostic_invalid"), 0);
+    server.signal("-TERM");
+    assert!(server.wait().success());
+    let text = fs::read_to_string(&server.log).unwrap();
+    assert!(text.contains("startup_evaluation_records_per_step: 1\n"));
+    assert!(text.contains("startup_records_per_step: 10000\n"));
+    let conn = rusqlite::Connection::open(temp.data().join("database.sqlite")).unwrap();
+    for count in [1, 2, 3] {
+        let pattern = format!("evaluation_queue_checkpoint:input=%:digest=%:count={count}:total=4");
+        let split: i64 = conn.query_row("SELECT count(*) FROM history WHERE new_state='evaluation_job_pending' AND reason LIKE ?1",[pattern],|r|r.get(0)).unwrap();
+        assert_eq!(split, 1);
+    }
+    let result: (i64, i64) = conn
+        .query_row(
+            "SELECT (SELECT count(*) FROM evaluation_work),complete FROM evaluation_job",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(result, (4, 1));
+    drop(conn);
+    let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
+    for record in &records {
+        assert_eq!(
+            store.record(record.id()).unwrap().unwrap().bytes(),
+            record.bytes()
+        );
+    }
+    drop(store);
+    assert_eq!(saved_config_row(&temp.data()), (500, 7, 8, 10_000));
+    let mut restarted = Server::start(&temp);
+    restarted.signal("-TERM");
+    assert!(restarted.wait().success());
+    assert!(
+        fs::read_to_string(&restarted.log)
+            .unwrap()
+            .contains("startup_evaluation_records_per_step: 32\n")
+    );
+    assert_eq!(saved_config_row(&temp.data()), (500, 7, 8, 10_000));
+}
+#[test]
+fn startup_evaluation_budget_keeps_first_checkpoint_and_manual_wait_when_next_save_fails() {
+    let temp = Temp::new();
+    let records = startup_edge_records(&temp, false);
+    let conn = rusqlite::Connection::open(temp.data().join("database.sqlite")).unwrap();
+    conn.execute_batch("CREATE TRIGGER deny_later_evaluation BEFORE INSERT ON evaluation_work WHEN (SELECT count(*) FROM evaluation_work)>=1 BEGIN SELECT RAISE(ABORT,'test'); END;").unwrap();
+    drop(conn);
+    let output = Command::new(env!("CARGO_BIN_EXE_lngnb"))
+        .args(["admin", "serve", "--data-dir"])
+        .arg(temp.data())
+        .args(["--startup-evaluation-records-per-step", "1"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    assert!(output.stdout.is_empty());
+    for name in ["admin.sock", "admin-status.sock", "admin-evaluate.sock"] {
+        assert!(!temp.data().join(name).exists());
+    }
+    let conn = rusqlite::Connection::open(temp.data().join("database.sqlite")).unwrap();
+    let result: (i64, i64) = conn
+        .query_row(
+            "SELECT (SELECT count(*) FROM evaluation_work),complete FROM evaluation_job",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(result, (1, 0));
+    let split: i64 = conn.query_row("SELECT count(*) FROM history WHERE new_state='evaluation_job_pending' AND reason LIKE 'evaluation_queue_checkpoint:input=%:digest=%:count=1:total=4'",[],|r|r.get(0)).unwrap();
+    assert_eq!(split, 1);
+    conn.execute_batch("DROP TRIGGER deny_later_evaluation;")
+        .unwrap();
     drop(conn);
     assert_review(&temp, true);
     let retry = Command::new(env!("CARGO_BIN_EXE_lngnb"))
