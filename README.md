@@ -77,17 +77,19 @@ cargo build --locked --offline --release
 ./target/release/lngnb admin serve --data-dir /path/to/existing-data
 ```
 
-既存の正常停止領域を明示します。同じ排他のまま分割起動検査・保存Record/Blob照合・管理用親評価を完了してからsocketを開きます。起動中も一般配信はありません。手動確認待ち・未完了検査・予算不足・既存socket名を成功にせず、socketの自動採用・削除、初期化、復旧解除はしません。起動検査予算の変更・設定永続化はまだ提供しません。
+既存の正常停止領域を明示します。同じ排他のまま分割起動検査・保存Record/Blob照合・管理用親評価を完了してからsocketを開きます。起動中も一般配信はありません。手動確認待ち・未完了検査・予算不足・既存socket名を成功にせず、socketの自動採用・削除、初期化、復旧解除はしません。起動検査のbytes・時間等の予算変更と設定永続化はまだ提供しません。Record検査の分割件数は次のoptionで指定できます。
 
 この起動の受理側予算を明示できます。
 
 ```sh
-./target/release/lngnb admin serve --data-dir /path/to/existing-data --request-timeout-ms 5000 --max-new-records 100 --max-diagnostic-records 500
+./target/release/lngnb admin serve --data-dir /path/to/existing-data --request-timeout-ms 5000 --max-new-records 100 --max-diagnostic-records 500 --startup-records-per-step 100
 ```
 
 `--request-timeout-ms`は受信・応答それぞれの通信期限（1〜30,000 ms、既定30,000）、`--max-new-records`は一回の起動で新規挿入するRecord数（1〜10,000件、既定10,000）です。現CLIでは既定上限の引下げだけを認めます。後者は既存の同一Recordの重複送信を数えず、保存済み総件数や起動検査件数の上限を変更しません。通信期限は保存syscallを強制中断せず、受付待ち100 msや送信側`record submit`全体の30秒予算も変更しません。
 
 `--max-diagnostic-records`は`admin evaluate`一回の全件評価に使うRecord数予算（1〜10,000件、既定10,000）です。この起動だけで既定上限の引下げを認め、適用値を`max_diagnostic_records`として起動時に表示します。起動検査・保存受付・`admin status`の実行時情報・Blob走査やbytes/辺/時間予算は変更しません。既存IPCの固定応答へ設定項目を追加せず、clientから受理側設定を変更することもありません。対象が予算を超えれば部分件数を返さず、client終了1・受理側終了3で保全停止します。値の変更や省略で手動確認待ちは解除されません。
+
+`--startup-records-per-step`は起動時のRecord局所検査と依存入力収集で、一回のstepが扱う件数（1〜10,000件、既定10,000）を指定します。小さい値では同じ排他と永続cursorのまま複数stepへ分け、検査対象全体を終えるまで受付socketと起動完了表示を出しません。総Record数の上限や検査省略数ではなく、段階ごとのbytes/辺/時間・Blob検査・親評価予算も変更しません。保存受付や稼働中の評価診断予算とも別です。適用値は`startup_records_per_step`として起動完了時に表示し、この起動だけに適用します。途中の破損・失敗・取消しでは正常停止にせず、値を変えても手動待ちは解除しません。
 
 指定した予算の適用値をsocketの起動表示に続けて出力します。設定ファイル/DBへ保存・読込みせず、次回の省略時は既定値へ戻ります。永続設定や既存の`config show`を適用済み状態と扱いません。ASCIIの先頭0なし正整数だけを受け付け、0・上限超過・重複指定・符号・空白・小数・不明optionは領域へ触る前に終了2で拒否します。これらのoptionは`admin probe/status/evaluate`には指定できません。通信期限切れや新規件数上限超過は既存の保全停止（終了3）となり、既に保存したRecordを削除せず、手動確認待ちを自動解除しません。値の変更や診断だけを復旧完了とは扱いません。
 
