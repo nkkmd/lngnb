@@ -53,3 +53,6 @@ cargo test --locked --offline --test record_cli config_show_ -- --test-threads=1
 
 # 起動Recordのbyte分割・一件未満の予算不足を再実行する。
 cargo test --locked --offline --test record_cli startup_byte_budget_ -- --test-threads=1
+
+# 起動Blobのbyte分割・予算不足・後続破損を再実行する。
+cargo test --locked --offline --test record_cli startup_blob_byte_budget_ -- --test-threads=1

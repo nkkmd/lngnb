@@ -37,7 +37,7 @@ impl Drop for Temp {
 fn fixture() -> LocalRecord {
     named_fixture("genesis")
 }
-fn named_fixture(kind: &str) -> LocalRecord {
+fn fixture_data() -> serde_json::Value {
     let spec = include_str!("../docs/specification-v1.0.0.md");
     let json = spec
         .split("## 付録A13 Record・IDの固定計算例")
@@ -49,7 +49,10 @@ fn named_fixture(kind: &str) -> LocalRecord {
         .split("\n```")
         .next()
         .unwrap();
-    let f: serde_json::Value = serde_json::from_str(json).unwrap();
+    serde_json::from_str(json).unwrap()
+}
+fn named_fixture(kind: &str) -> LocalRecord {
+    let f = fixture_data();
     let hex = f[kind]["envelope_cbor_hex"].as_str().unwrap();
     let bytes = (0..hex.len())
         .step_by(2)
@@ -562,6 +565,16 @@ fn invalid_runtime_options_fail_before_creating_or_changing_data() {
             vec!["--max-diagnostic-records", "0"],
             vec!["--startup-records-per-step", "0"],
             vec!["--startup-record-bytes-per-step", "0"],
+            vec!["--startup-blob-bytes-per-step", "0"],
+            vec!["--startup-blob-bytes-per-step", "67108865"],
+            vec!["--startup-blob-bytes-per-step", "private"],
+            vec!["--startup-blob-bytes-per-step", "01"],
+            vec![
+                "--startup-blob-bytes-per-step",
+                "1",
+                "--startup-blob-bytes-per-step",
+                "2",
+            ],
             vec!["--startup-record-bytes-per-step", "67108865"],
             vec!["--startup-record-bytes-per-step", "private"],
             vec!["--startup-record-bytes-per-step", "01"],
@@ -1782,4 +1795,202 @@ fn startup_byte_budget_cannot_skip_one_record_or_clear_manual_wait_on_retry() {
         store.record(record.id()).unwrap().unwrap().bytes(),
         record.bytes()
     );
+}
+
+// A13の公開試験鍵で本文宣言だけを変更した署名済みfixture。実運用禁止。
+fn blob_revision(payload: &[u8]) -> LocalRecord {
+    use lngnb::cbor::Value;
+    let data = fixture_data();
+    let hex = data["seed_hex"].as_str().unwrap();
+    let seed: [u8; 32] = (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap();
+    let mut body = named_fixture("revision").body().clone();
+    let Value::Map(fields) = &mut body else {
+        panic!("body map")
+    };
+    let Value::Map(fields) = &mut fields.iter_mut().find(|(k, _)| k == "payload").unwrap().1 else {
+        panic!("payload map")
+    };
+    fields.iter_mut().find(|(k, _)| k == "blob_id").unwrap().1 =
+        Value::Bytes(lngnb::id::blob_id(payload).bytes.to_vec());
+    fields
+        .iter_mut()
+        .find(|(k, _)| k == "byte_length")
+        .unwrap()
+        .1 = Value::Int(payload.len() as i64);
+    let record = LocalRecord::sign(body, &ed25519_dalek::SigningKey::from_bytes(&seed)).unwrap();
+    record.check_genesis(&fixture()).unwrap();
+    record
+}
+fn startup_blobs(temp: &Temp) -> Vec<Vec<u8>> {
+    let payloads = vec![
+        b"first startup blob".to_vec(),
+        b"second startup blob".to_vec(),
+    ];
+    let mut writer = RecordStore::initialize(&temp.data(), Limits::default())
+        .unwrap()
+        .begin()
+        .unwrap();
+    writer.insert(&fixture()).unwrap();
+    for payload in &payloads {
+        writer.insert(&blob_revision(payload)).unwrap();
+        writer
+            .put_blob(lngnb::id::blob_id(payload), std::io::Cursor::new(payload))
+            .unwrap();
+    }
+    writer
+        .save_admin_config(lngnb::storage::AdminConfig {
+            request_timeout_ms: 500,
+            max_new_records: 7,
+            max_diagnostic_records: 8,
+            startup_records_per_step: 10_000,
+        })
+        .unwrap();
+    writer.finish().unwrap();
+    payloads
+}
+fn startup_blob_path(temp: &Temp, payload: &[u8]) -> PathBuf {
+    let id = lngnb::id::blob_id(payload);
+    temp.data()
+        .join("blobs")
+        .join(data_encoding::HEXLOWER.encode(&id.bytes))
+}
+#[test]
+fn startup_blob_byte_budget_splits_physical_and_evaluation_scans_and_is_not_saved() {
+    let temp = Temp::new();
+    let payloads = startup_blobs(&temp);
+    let bytes = payloads.iter().map(Vec::len).max().unwrap();
+    let value = bytes.to_string();
+    let mut server = Server::configured(&temp, &["--startup-blob-bytes-per-step", &value]);
+    let diagnostic = evaluate_cli(&temp.data());
+    assert!(diagnostic.status.success());
+    assert_eq!(diagnostic_field(&diagnostic, "records"), 3);
+    assert_eq!(diagnostic_field(&diagnostic, "payload_missing"), 0);
+    server.signal("-TERM");
+    assert!(server.wait().success());
+    let text = fs::read_to_string(&server.log).unwrap();
+    assert!(text.contains(&format!("startup_blob_bytes_per_step: {bytes}\n")));
+    assert!(text.contains("startup_record_bytes_per_step: 67108864\n"));
+    let conn = rusqlite::Connection::open(temp.data().join("database.sqlite")).unwrap();
+    let split: i64 = conn.query_row("SELECT count(*) FROM history WHERE reason='record_inspection_checkpoint' AND old_state LIKE 'blobs:epoch=%' AND new_state='record_inspection_pending'",[],|r|r.get(0)).unwrap();
+    assert!(split > 0);
+    let split: i64 = conn.query_row("SELECT count(*) FROM history WHERE new_state='evaluation_blob_pending' AND reason LIKE 'evaluation_blob_checkpoint:records=%:payloads=%:checked=1:total=2:bytes=%'",[],|r|r.get(0)).unwrap();
+    assert!(split > 0);
+    let verified: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM blob_inspection_files WHERE result='verified'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(verified, 2);
+    drop(conn);
+    for payload in &payloads {
+        assert_eq!(
+            fs::read(startup_blob_path(&temp, payload)).unwrap(),
+            *payload
+        );
+    }
+    assert_eq!(saved_config_row(&temp.data()), (500, 7, 8, 10_000));
+    let mut restarted = Server::start(&temp);
+    restarted.signal("-TERM");
+    assert!(restarted.wait().success());
+    assert!(
+        fs::read_to_string(&restarted.log)
+            .unwrap()
+            .contains("startup_blob_bytes_per_step: 67108864\n")
+    );
+    assert_eq!(saved_config_row(&temp.data()), (500, 7, 8, 10_000));
+}
+#[test]
+fn startup_blob_byte_budget_below_one_file_preserves_bytes_without_calling_them_corrupt() {
+    let temp = Temp::new();
+    let payloads = startup_blobs(&temp);
+    let output = Command::new(env!("CARGO_BIN_EXE_lngnb"))
+        .args(["admin", "serve", "--data-dir"])
+        .arg(temp.data())
+        .args(["--startup-blob-bytes-per-step", "1"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    assert!(output.stdout.is_empty());
+    for name in ["admin.sock", "admin-status.sock", "admin-evaluate.sock"] {
+        assert!(!temp.data().join(name).exists());
+    }
+    let conn = rusqlite::Connection::open(temp.data().join("database.sqlite")).unwrap();
+    let corrupt: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM blob_inspection_files WHERE result='corrupt'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(corrupt, 0);
+    drop(conn);
+    for payload in &payloads {
+        assert_eq!(
+            fs::read(startup_blob_path(&temp, payload)).unwrap(),
+            *payload
+        );
+    }
+    assert_review(&temp, true);
+    let retry = Command::new(env!("CARGO_BIN_EXE_lngnb"))
+        .args(["admin", "serve", "--data-dir"])
+        .arg(temp.data())
+        .output()
+        .unwrap();
+    assert_eq!(retry.status.code(), Some(3));
+    assert!(retry.stdout.is_empty());
+    assert_review(&temp, true);
+    assert_eq!(saved_config_row(&temp.data()), (500, 7, 8, 10_000));
+}
+#[test]
+fn startup_blob_byte_budget_detects_later_corruption_before_opening_any_socket() {
+    let temp = Temp::new();
+    let mut payloads = startup_blobs(&temp);
+    payloads.sort_by_key(|payload| lngnb::id::blob_id(payload).bytes);
+    let damaged = payloads.last().unwrap();
+    fs::write(startup_blob_path(&temp, damaged), vec![0; damaged.len()]).unwrap();
+    let value = payloads.iter().map(Vec::len).max().unwrap().to_string();
+    let output = Command::new(env!("CARGO_BIN_EXE_lngnb"))
+        .args(["admin", "serve", "--data-dir"])
+        .arg(temp.data())
+        .args(["--startup-blob-bytes-per-step", &value])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    assert!(output.stdout.is_empty());
+    for name in ["admin.sock", "admin-status.sock", "admin-evaluate.sock"] {
+        assert!(!temp.data().join(name).exists());
+    }
+    let conn = rusqlite::Connection::open(temp.data().join("database.sqlite")).unwrap();
+    for result in ["verified", "corrupt"] {
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM blob_inspection_files WHERE result=?1",
+                [result],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+    drop(conn);
+    assert_eq!(
+        fs::read(startup_blob_path(&temp, damaged)).unwrap(),
+        vec![0; damaged.len()]
+    );
+    fs::write(startup_blob_path(&temp, damaged), damaged).unwrap();
+    let retry = Command::new(env!("CARGO_BIN_EXE_lngnb"))
+        .args(["admin", "serve", "--data-dir"])
+        .arg(temp.data())
+        .output()
+        .unwrap();
+    assert_eq!(retry.status.code(), Some(3));
+    assert!(retry.stdout.is_empty());
+    assert_review(&temp, true);
+    assert_eq!(saved_config_row(&temp.data()), (500, 7, 8, 10_000));
 }
