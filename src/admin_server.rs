@@ -83,6 +83,28 @@ impl Config {
     }
 }
 
+/// 省略と明示的な既定値指定を区別し、自動保存しない。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Overrides {
+    pub timeout_ms: Option<u64>,
+    pub max_new_records: Option<u64>,
+    pub max_diagnostic_records: Option<u64>,
+    pub startup_records_per_step: Option<u64>,
+}
+impl Overrides {
+    pub fn resolve(self, saved: Option<lngnb::storage::AdminConfig>) -> Option<Config> {
+        if saved.is_some_and(|c| !c.is_valid()) {
+            return None;
+        }
+        Config::checked(
+            self.timeout_ms.or(saved.map(|c| c.request_timeout_ms)),
+            self.max_new_records.or(saved.map(|c| c.max_new_records)),
+        )?
+        .with_diagnostic_records(self.max_diagnostic_records.or(saved.map(|c| c.max_diagnostic_records)))?
+        .with_startup_records(self.startup_records_per_step.or(saved.map(|c| c.startup_records_per_step)))
+    }
+}
+
 #[derive(Debug)]
 pub enum Error {
     Signal,
@@ -133,21 +155,22 @@ impl Drop for Signals {
         }
     }
 }
-pub fn run(path: &Path, config: Config, output: &mut impl Write) -> Result<(), Error> {
+pub fn run(path: &Path, config: Overrides, output: &mut impl Write) -> Result<(), Error> {
     let signals = Signals::install()?;
     serve(path, config, &signals.stop, output)
 }
 fn serve(
     path: &Path,
-    config: Config,
+    overrides: Overrides,
     stop: &AtomicBool,
     output: &mut impl Write,
 ) -> Result<(), Error> {
-    let limits = Limits {
-        session_records: config.max_new_records,
-        ..Limits::default()
-    };
-    let mut startup = LocalStartup::open(path, limits).map_err(|_| Error::Unconfirmed)?;
+    let (mut startup, saved) = LocalStartup::open_with_admin_config(
+        path,
+        Limits::default(),
+        overrides.max_new_records,
+    ).map_err(|_| Error::Unconfirmed)?;
+    let config = overrides.resolve(saved).ok_or(Error::Unconfirmed)?;
     if startup.needs_review() {
         return Err(Error::Unconfirmed);
     }
@@ -175,7 +198,7 @@ fn serve(
         .enable_evaluation_with_record_limit(config.max_diagnostic_records)
         .map_err(|_| Error::Unconfirmed)?;
     let ready = format!(
-        "管理受理側のローカル起動検査を完了し、管理socketを開きました。公開・復旧完了の判定ではありません。\nrequest_timeout_ms: {}\nmax_new_records: {}\nmax_diagnostic_records: {}\nstartup_records_per_step: {}\n設定はこの起動だけに適用し、保存していません。\n",
+        "管理受理側のローカル起動検査を完了し、管理socketを開きました。公開・復旧完了の判定ではありません。\nrequest_timeout_ms: {}\nmax_new_records: {}\nmax_diagnostic_records: {}\nstartup_records_per_step: {}\n起動引数・保存値・既定値の順で選んだ設定を適用しました。起動引数は保存していません。\n",
         config.timeout_ms,
         config.max_new_records,
         config.max_diagnostic_records,
@@ -223,6 +246,30 @@ fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overrides_resolve_per_field_without_hiding_invalid_saved_values() {
+        let saved = lngnb::storage::AdminConfig {
+            request_timeout_ms: 500,
+            max_new_records: 7,
+            max_diagnostic_records: 8,
+            startup_records_per_step: 1,
+        };
+        assert_eq!(Overrides::default().resolve(None), Some(Config::default()));
+        assert_eq!(Overrides::default().resolve(Some(saved)).unwrap().saved_values(), saved);
+        let explicit = Overrides {
+            timeout_ms: Some(30_000),
+            max_new_records: Some(10_000),
+            ..Overrides::default()
+        };
+        let resolved = explicit.resolve(Some(saved)).unwrap().saved_values();
+        assert_eq!(resolved.request_timeout_ms, 30_000);
+        assert_eq!(resolved.max_new_records, 10_000);
+        assert_eq!(resolved.max_diagnostic_records, 8);
+        assert_eq!(resolved.startup_records_per_step, 1);
+        let invalid = lngnb::storage::AdminConfig { request_timeout_ms: 0, ..saved };
+        assert!(explicit.resolve(Some(invalid)).is_none());
+    }
 
     #[test]
     fn failure_boundaries_do_not_disclose_sources_or_claim_recovery() {

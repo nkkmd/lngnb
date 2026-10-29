@@ -66,13 +66,32 @@ pub struct LocalStartup {
 impl LocalStartup {
     pub fn open(path: &Path, limits: Limits) -> Result<Self> {
         let inspection = RecordInspection::open(path, limits)?;
+        Ok(Self::from_inspection(inspection))
+    }
+    /// 同じ排他中で保存設定を検査し、session件数を明示値→保存値→呼出し側既定の順で選ぶ。
+    /// 他の設定は返すだけ。設定保存・手動確認待ち解除はしない。
+    pub fn open_with_admin_config(
+        path: &Path,
+        limits: Limits,
+        session_records: Option<u64>,
+    ) -> Result<(Self, Option<AdminConfig>)> {
+        let mut store = RecordStore::open_locked(path, limits)?;
+        let saved = store.saved_admin_config()?;
+        store.limits.session_records = session_records
+            .or(saved.map(|c| c.max_new_records))
+            .unwrap_or(store.limits.session_records);
+        store.limits = store.limits.check()?;
+        let inspection = RecordInspection::from_store(store)?;
+        Ok((Self::from_inspection(inspection), saved))
+    }
+    fn from_inspection(inspection: RecordInspection) -> Self {
         let began_clean = inspection.began_clean();
-        Ok(Self {
+        Self {
             stage: Some(Stage::Inspection(inspection)),
             began_clean,
             inputs: None,
             failed: false,
-        })
+        }
     }
     pub fn needs_review(&self) -> bool {
         !self.began_clean || self.failed

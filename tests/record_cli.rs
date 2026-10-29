@@ -1126,7 +1126,7 @@ fn saved_config_row(data: &Path) -> (i64, i64, i64, i64) {
         [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).unwrap()
 }
 #[test]
-fn config_save_persists_explicit_values_without_applying_them_on_serve() {
+fn config_save_persists_explicit_values_and_serve_loads_them() {
     let temp = Temp::new();
     let mut writer = RecordStore::initialize(&temp.data(), Limits::default())
         .unwrap()
@@ -1163,8 +1163,8 @@ fn config_save_persists_explicit_values_without_applying_them_on_serve() {
     let mut server = Server::start(&temp);
     let runtime = status_cli(&temp.data());
     assert!(runtime.status.success());
-    assert_eq!(diagnostic_field(&runtime, "max_new_records"), 10_000);
-    assert_eq!(diagnostic_field(&runtime, "request_timeout_ms"), 30_000);
+    assert_eq!(diagnostic_field(&runtime, "max_new_records"), 7);
+    assert_eq!(diagnostic_field(&runtime, "request_timeout_ms"), 500);
     server.signal("-TERM");
     assert!(server.wait().success());
     assert_eq!(saved_config_row(&temp.data()), (500, 7, 8, 1));
@@ -1302,5 +1302,99 @@ fn config_save_never_repairs_corrupt_old_or_missing_storage() {
         assert!(output.stdout.is_empty());
         assert_eq!(fs::read(temp.data().join("database.sqlite")).ok(), before);
         assert!(!temp.data().join("admin.sock").exists());
+    }
+}
+
+#[test]
+fn saved_startup_overrides_are_per_field_and_never_saved() {
+    let temp = Temp::new();
+    drop(RecordStore::initialize(&temp.data(), Limits::default()).unwrap());
+    assert!(config_save_command(&temp.data()).output().unwrap().status.success());
+    let options = ["--request-timeout-ms", "30000", "--max-new-records", "10000"];
+    let mut server = Server::configured(&temp, &options);
+    let runtime = status_cli(&temp.data());
+    assert!(runtime.status.success());
+    assert_eq!(diagnostic_field(&runtime, "request_timeout_ms"), 30_000);
+    assert_eq!(diagnostic_field(&runtime, "max_new_records"), 10_000);
+    let text = fs::read_to_string(&server.log).unwrap();
+    assert!(text.contains("max_diagnostic_records: 8\n"));
+    assert!(text.contains("startup_records_per_step: 1\n"));
+    server.signal("-TERM");
+    assert!(server.wait().success());
+    assert_eq!(saved_config_row(&temp.data()), (500, 7, 8, 1));
+    let mut restarted = Server::start(&temp);
+    let runtime = status_cli(&temp.data());
+    assert!(runtime.status.success());
+    assert_eq!(diagnostic_field(&runtime, "request_timeout_ms"), 500);
+    assert_eq!(diagnostic_field(&runtime, "max_new_records"), 7);
+    restarted.signal("-TERM");
+    assert!(restarted.wait().success());
+    assert_eq!(saved_config_row(&temp.data()), (500, 7, 8, 1));
+}
+
+#[test]
+fn saved_startup_corruption_cannot_be_hidden_by_all_explicit_options() {
+    for damage in ["missing", "value", "history"] {
+        let temp = Temp::new();
+        drop(RecordStore::initialize(&temp.data(), Limits::default()).unwrap());
+        assert!(config_save_command(&temp.data()).output().unwrap().status.success());
+        let conn = rusqlite::Connection::open(temp.data().join("database.sqlite")).unwrap();
+        match damage {
+            "missing" => { conn.execute("DELETE FROM admin_config", []).unwrap(); }
+            "value" => { conn.execute("UPDATE admin_config SET request_timeout_ms=501", []).unwrap(); }
+            _ => { conn.execute("UPDATE history SET reason='changed' WHERE new_state='admin_config_saved_local_only'", []).unwrap(); }
+        }
+        drop(conn);
+        let before = fs::read(temp.data().join("database.sqlite")).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_lngnb"))
+            .args(["admin", "serve", "--data-dir"])
+            .arg(temp.data())
+            .args(["--request-timeout-ms", "30000", "--max-new-records", "10000",
+                "--max-diagnostic-records", "10000", "--startup-records-per-step", "10000"])
+            .output().unwrap();
+        assert_eq!(output.status.code(), Some(3));
+        assert!(output.stdout.is_empty());
+        assert_eq!(fs::read(temp.data().join("database.sqlite")).unwrap(), before);
+        for name in ["admin.sock", "admin-status.sock", "admin-evaluate.sock"] {
+            assert!(!temp.data().join(name).exists());
+        }
+    }
+}
+
+#[test]
+fn saved_startup_split_and_diagnostic_budget_preserve_manual_wait_after_failure() {
+    let temp = Temp::new();
+    let mut writer = RecordStore::initialize(&temp.data(), Limits::default()).unwrap().begin().unwrap();
+    writer.insert(&fixture()).unwrap();
+    writer.insert(&named_fixture("revision")).unwrap();
+    writer.save_admin_config(lngnb::storage::AdminConfig {
+        request_timeout_ms: 500,
+        max_new_records: 7,
+        max_diagnostic_records: 1,
+        startup_records_per_step: 1,
+    }).unwrap();
+    writer.finish().unwrap();
+    let mut server = Server::start(&temp);
+    let output = evaluate_cli(&temp.data());
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert_eq!(server.wait().code(), Some(3));
+    assert_eq!(saved_config_row(&temp.data()), (500, 7, 1, 1));
+    let conn = rusqlite::Connection::open(temp.data().join("database.sqlite")).unwrap();
+    let split: i64 = conn.query_row("SELECT count(*) FROM history WHERE reason='record_inspection_checkpoint' AND old_state LIKE 'records:epoch=%:records=1:bytes=%'",[],|r|r.get(0)).unwrap();
+    assert!(split > 0);
+    let split: i64 = conn.query_row("SELECT count(*) FROM history WHERE new_state='evaluation_input_pending' AND reason LIKE 'evaluation_input_checkpoint:epoch=%:records=1:bytes=%'",[],|r|r.get(0)).unwrap();
+    assert!(split > 0);
+    drop(conn);
+    assert_review(&temp, true);
+    for explicit in [false, true] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_lngnb"));
+        command.args(["admin", "serve", "--data-dir"]).arg(temp.data());
+        if explicit { command.args(["--max-diagnostic-records", "10000"]); }
+        let retry = command.output().unwrap();
+        assert_eq!(retry.status.code(), Some(3));
+        assert!(retry.stdout.is_empty());
+        assert_review(&temp, true);
+        assert_eq!(saved_config_row(&temp.data()), (500, 7, 1, 1));
     }
 }
