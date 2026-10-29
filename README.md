@@ -87,7 +87,7 @@ cargo build --locked --offline --release
 ./target/release/lngnb admin serve --data-dir /path/to/existing-data
 ```
 
-既存の正常停止領域を明示します。同じ排他のまま分割起動検査・保存Record/Blob照合・管理用親評価を完了してからsocketを開きます。起動中も一般配信はありません。手動確認待ち・未完了検査・予算不足・既存socket名を成功にせず、socketの自動採用・削除、初期化、復旧解除はしません。起動検査のbytes・時間等の予算変更と設定永続化はまだ提供しません。Record検査の分割件数は次のoptionで指定できます。
+既存の正常停止領域を明示します。同じ排他のまま分割起動検査・保存Record/Blob照合・管理用親評価を完了してからsocketを開きます。起動中も一般配信はありません。手動確認待ち・未完了検査・予算不足・既存socket名を成功にせず、socketの自動採用・削除、初期化、復旧解除はしません。起動検査のbytes・時間等の予算変更と、保存設定の起動時適用はまだ提供しません。Record検査の分割件数は次のoptionで指定できます。
 
 この起動の受理側予算を明示できます。
 

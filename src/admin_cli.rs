@@ -25,7 +25,12 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
     let [action, rest @ ..] = args else {
         return Err(usage());
     };
-    if action != "probe" && action != "status" && action != "evaluate" && action != "serve" && action != "config-save" {
+    if action != "probe"
+        && action != "status"
+        && action != "evaluate"
+        && action != "serve"
+        && action != "config-save"
+    {
         return Err(usage());
     }
     let mut data = None;
@@ -42,14 +47,19 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
         }
         match option.to_str() {
             Some("--data-dir") if data.is_none() => data = Some(PathBuf::from(value)),
-            Some("--request-timeout-ms") if (action == "serve" || action == "config-save") && timeout.is_none() => {
+            Some("--request-timeout-ms")
+                if (action == "serve" || action == "config-save") && timeout.is_none() =>
+            {
                 timeout = Some(number(value).ok_or_else(usage)?);
             }
-            Some("--max-new-records") if (action == "serve" || action == "config-save") && records.is_none() => {
+            Some("--max-new-records")
+                if (action == "serve" || action == "config-save") && records.is_none() =>
+            {
                 records = Some(number(value).ok_or_else(usage)?);
             }
             Some("--max-diagnostic-records")
-                if (action == "serve" || action == "config-save") && diagnostic_records.is_none() =>
+                if (action == "serve" || action == "config-save")
+                    && diagnostic_records.is_none() =>
             {
                 diagnostic_records = Some(number(value).ok_or_else(usage)?);
             }
@@ -61,7 +71,12 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
             _ => return Err(usage()),
         }
     }
-    if action == "config-save" && (timeout.is_none() || records.is_none() || diagnostic_records.is_none() || startup_records.is_none()) {
+    if action == "config-save"
+        && (timeout.is_none()
+            || records.is_none()
+            || diagnostic_records.is_none()
+            || startup_records.is_none())
+    {
         return Err(usage());
     }
     let action = if action == "probe" {
@@ -72,10 +87,14 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
         Action::Status
     } else {
         let config = Config::checked(timeout, records)
-                .and_then(|c| c.with_diagnostic_records(diagnostic_records))
-                .and_then(|c| c.with_startup_records(startup_records))
-                .ok_or_else(usage)?;
-        if action == "config-save" { Action::SaveConfig(config) } else { Action::Serve(config) }
+            .and_then(|c| c.with_diagnostic_records(diagnostic_records))
+            .and_then(|c| c.with_startup_records(startup_records))
+            .ok_or_else(usage)?;
+        if action == "config-save" {
+            Action::SaveConfig(config)
+        } else {
+            Action::Serve(config)
+        }
     };
     Ok(Command {
         data: data.ok_or_else(usage)?,
@@ -150,16 +169,28 @@ pub fn run(command: Command, output: &mut impl Write) -> Result<(), Error> {
     client::probe(&command.data, Duration::from_secs(30)).map_err(|_| Error::Connection)?;
     report(output)
 }
-fn save_config(path: &std::path::Path, config: Config, output: &mut impl Write) -> Result<(), Error> {
+fn save_config(
+    path: &std::path::Path,
+    config: Config,
+    output: &mut impl Write,
+) -> Result<(), Error> {
     use lngnb::storage::{EvaluationLimits, Limits, LocalStartup, LocalStartupBudget};
-    let mut startup = LocalStartup::open(path, Limits::default()).map_err(|_| Error::ConfigUnconfirmed)?;
+    let mut startup =
+        LocalStartup::open(path, Limits::default()).map_err(|_| Error::ConfigUnconfirmed)?;
     if startup.needs_review() {
         return Err(Error::ConfigUnconfirmed);
     }
-    while !startup.step(EvaluationLimits::default(), LocalStartupBudget::default())
-        .map_err(|_| Error::ConfigUnconfirmed)?.checks_complete() {}
-    let mut writer = startup.into_writer().map_err(|_| Error::ConfigUnconfirmed)?;
-    writer.save_admin_config(config.saved_values()).map_err(|_| Error::ConfigUnconfirmed)?;
+    while !startup
+        .step(EvaluationLimits::default(), LocalStartupBudget::default())
+        .map_err(|_| Error::ConfigUnconfirmed)?
+        .checks_complete()
+    {}
+    let mut writer = startup
+        .into_writer()
+        .map_err(|_| Error::ConfigUnconfirmed)?;
+    writer
+        .save_admin_config(config.saved_values())
+        .map_err(|_| Error::ConfigUnconfirmed)?;
     writer.finish().map_err(|_| Error::ConfigUnconfirmed)?;
     config_report(config, output)
 }
@@ -172,7 +203,10 @@ fn config_report(config: Config, output: &mut impl Write) -> Result<(), Error> {
         config.max_diagnostic_records,
         config.startup_records_per_step
     );
-    output.write_all(text.as_bytes()).and_then(|()| output.flush()).map_err(|_| Error::ConfigOutput)
+    output
+        .write_all(text.as_bytes())
+        .and_then(|()| output.flush())
+        .map_err(|_| Error::ConfigOutput)
 }
 
 fn report(output: &mut impl Write) -> Result<(), Error> {
@@ -472,11 +506,24 @@ mod config_tests {
     #[test]
     fn saving_requires_all_four_explicit_canonical_unique_values() {
         let good: Vec<OsString> = [
-            "config-save", "--data-dir", "data", "--request-timeout-ms", "500",
-            "--max-new-records", "7", "--max-diagnostic-records", "8",
-            "--startup-records-per-step", "1",
-        ].map(Into::into).to_vec();
-        assert!(matches!(parse(&good).unwrap().action, Action::SaveConfig(_)));
+            "config-save",
+            "--data-dir",
+            "data",
+            "--request-timeout-ms",
+            "500",
+            "--max-new-records",
+            "7",
+            "--max-diagnostic-records",
+            "8",
+            "--startup-records-per-step",
+            "1",
+        ]
+        .map(Into::into)
+        .to_vec();
+        assert!(matches!(
+            parse(&good).unwrap().action,
+            Action::SaveConfig(_)
+        ));
         for option in [3, 5, 7, 9] {
             let mut missing = good.clone();
             missing.drain(option..option + 2);
@@ -498,11 +545,19 @@ mod config_tests {
     fn saved_report_distinguishes_output_failure_from_unconfirmed_storage() {
         let mut output = Vec::new();
         config_report(Config::default(), &mut output).unwrap();
-        assert!(String::from_utf8(output).unwrap().contains("保存値は起動へ適用していません"));
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("保存値は起動へ適用していません")
+        );
         struct Sink(bool);
         impl Write for Sink {
             fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                if self.0 { Ok(bytes.len()) } else { Err(std::io::Error::other("private")) }
+                if self.0 {
+                    Ok(bytes.len())
+                } else {
+                    Err(std::io::Error::other("private"))
+                }
             }
             fn flush(&mut self) -> std::io::Result<()> {
                 Err(std::io::Error::other("private"))
@@ -514,6 +569,10 @@ mod config_tests {
             assert!(!error.to_string().contains("private"));
         }
         assert_eq!(Error::ConfigUnconfirmed.exit_code(), 3);
-        assert!(Error::ConfigUnconfirmed.to_string().contains("旧値または新値"));
+        assert!(
+            Error::ConfigUnconfirmed
+                .to_string()
+                .contains("旧値または新値")
+        );
     }
 }

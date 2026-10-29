@@ -1105,10 +1105,19 @@ fn invalid_later_startup_record_never_opens_socket_or_clears_manual_review() {
 
 fn config_save_command(data: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_lngnb"));
-    command.args(["admin", "config-save", "--data-dir"]).arg(data).args([
-        "--request-timeout-ms", "500", "--max-new-records", "7",
-        "--max-diagnostic-records", "8", "--startup-records-per-step", "1",
-    ]);
+    command
+        .args(["admin", "config-save", "--data-dir"])
+        .arg(data)
+        .args([
+            "--request-timeout-ms",
+            "500",
+            "--max-new-records",
+            "7",
+            "--max-diagnostic-records",
+            "8",
+            "--startup-records-per-step",
+            "1",
+        ]);
     command
 }
 fn saved_config_row(data: &Path) -> (i64, i64, i64, i64) {
@@ -1119,19 +1128,36 @@ fn saved_config_row(data: &Path) -> (i64, i64, i64, i64) {
 #[test]
 fn config_save_persists_explicit_values_without_applying_them_on_serve() {
     let temp = Temp::new();
-    let mut writer = RecordStore::initialize(&temp.data(), Limits::default()).unwrap().begin().unwrap();
+    let mut writer = RecordStore::initialize(&temp.data(), Limits::default())
+        .unwrap()
+        .begin()
+        .unwrap();
     writer.insert(&fixture()).unwrap();
     writer.finish().unwrap();
     for _ in 0..2 {
         let output = config_save_command(&temp.data()).output().unwrap();
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         assert!(String::from_utf8_lossy(&output.stdout).contains("保存値は起動へ適用していません"));
         assert_eq!(saved_config_row(&temp.data()), (500, 7, 8, 1));
         let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
-        assert_eq!(store.startup_state().unwrap(), lngnb::storage::StartupState::Clean);
-        assert_eq!(store.record(fixture().id()).unwrap().unwrap().bytes(), fixture().bytes());
+        assert_eq!(
+            store.startup_state().unwrap(),
+            lngnb::storage::StartupState::Clean
+        );
+        assert_eq!(
+            store.record(fixture().id()).unwrap().unwrap().bytes(),
+            fixture().bytes()
+        );
     }
-    let candidate = Command::new(env!("CARGO_BIN_EXE_lngnb")).args(["config", "show", "--data-dir"]).arg(temp.data()).output().unwrap();
+    let candidate = Command::new(env!("CARGO_BIN_EXE_lngnb"))
+        .args(["config", "show", "--data-dir"])
+        .arg(temp.data())
+        .output()
+        .unwrap();
     assert!(candidate.status.success());
     assert!(String::from_utf8_lossy(&candidate.stdout).contains("未保存・未適用"));
     let mut server = Server::start(&temp);
@@ -1147,14 +1173,21 @@ fn config_save_persists_explicit_values_without_applying_them_on_serve() {
 fn config_save_invalid_or_incomplete_arguments_never_touch_the_area() {
     let temp = Temp::new();
     for initialized in [false, true] {
-        if initialized { drop(RecordStore::initialize(&temp.data(), Limits::default()).unwrap()); }
+        if initialized {
+            drop(RecordStore::initialize(&temp.data(), Limits::default()).unwrap());
+        }
         for arguments in [
             vec![],
             vec!["--request-timeout-ms", "500"],
             vec!["--request-timeout-ms", "private"],
             vec!["--request-timeout-ms", "500", "--request-timeout-ms", "500"],
         ] {
-            let output = Command::new(env!("CARGO_BIN_EXE_lngnb")).args(["admin", "config-save", "--data-dir"]).arg(temp.data()).args(arguments).output().unwrap();
+            let output = Command::new(env!("CARGO_BIN_EXE_lngnb"))
+                .args(["admin", "config-save", "--data-dir"])
+                .arg(temp.data())
+                .args(arguments)
+                .output()
+                .unwrap();
             assert_eq!(output.status.code(), Some(2));
             assert!(output.stdout.is_empty());
             assert!(!String::from_utf8_lossy(&output.stderr).contains("private"));
@@ -1162,7 +1195,9 @@ fn config_save_invalid_or_incomplete_arguments_never_touch_the_area() {
                 let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
                 assert_eq!(store.generation().unwrap(), 0);
                 assert_eq!(store.saved_admin_config().unwrap(), None);
-            } else { assert!(!temp.data().exists()); }
+            } else {
+                assert!(!temp.data().exists());
+            }
         }
     }
 }
@@ -1174,15 +1209,23 @@ fn config_save_rejects_active_lock_and_manual_review_without_changing_values() {
     assert_eq!(output.status.code(), Some(3));
     assert_eq!(store.saved_admin_config().unwrap(), None);
     let mut writer = store.begin().unwrap();
-    writer.save_admin_config(lngnb::storage::AdminConfig {
-        request_timeout_ms: 700, max_new_records: 9, max_diagnostic_records: 10, startup_records_per_step: 2,
-    }).unwrap();
+    writer
+        .save_admin_config(lngnb::storage::AdminConfig {
+            request_timeout_ms: 700,
+            max_new_records: 9,
+            max_diagnostic_records: 10,
+            startup_records_per_step: 2,
+        })
+        .unwrap();
     drop(writer);
     let output = config_save_command(&temp.data()).output().unwrap();
     assert_eq!(output.status.code(), Some(3));
     assert_eq!(saved_config_row(&temp.data()), (700, 9, 10, 2));
     let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
-    assert_eq!(store.startup_state().unwrap(), lngnb::storage::StartupState::NeedsReview);
+    assert_eq!(
+        store.startup_state().unwrap(),
+        lngnb::storage::StartupState::NeedsReview
+    );
     assert!(!temp.data().join("admin.sock").exists());
 }
 #[test]
@@ -1192,9 +1235,15 @@ fn config_save_failure_preserves_old_or_committed_new_values_and_blocks_restart(
         drop(RecordStore::initialize(&temp.data(), Limits::default()).unwrap());
         let conn = rusqlite::Connection::open(temp.data().join("database.sqlite")).unwrap();
         let sql = match failure {
-            "setting" => "CREATE TRIGGER deny_settings BEFORE UPDATE ON admin_config BEGIN SELECT RAISE(ABORT,'test'); END;",
-            "history" => "CREATE TRIGGER deny_settings BEFORE INSERT ON history WHEN NEW.new_state='admin_config_saved_local_only' BEGIN SELECT RAISE(ABORT,'test'); END;",
-            _ => "CREATE TRIGGER deny_settings BEFORE UPDATE ON storage_state WHEN NEW.state='clean' BEGIN SELECT RAISE(ABORT,'test'); END;",
+            "setting" => {
+                "CREATE TRIGGER deny_settings BEFORE UPDATE ON admin_config BEGIN SELECT RAISE(ABORT,'test'); END;"
+            }
+            "history" => {
+                "CREATE TRIGGER deny_settings BEFORE INSERT ON history WHEN NEW.new_state='admin_config_saved_local_only' BEGIN SELECT RAISE(ABORT,'test'); END;"
+            }
+            _ => {
+                "CREATE TRIGGER deny_settings BEFORE UPDATE ON storage_state WHEN NEW.state='clean' BEGIN SELECT RAISE(ABORT,'test'); END;"
+            }
         };
         conn.execute_batch(sql).unwrap();
         drop(conn);
@@ -1202,8 +1251,14 @@ fn config_save_failure_preserves_old_or_committed_new_values_and_blocks_restart(
         assert_eq!(output.status.code(), Some(3));
         assert!(output.stdout.is_empty());
         let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
-        assert_eq!(store.saved_admin_config().unwrap().is_some(), failure == "finish");
-        assert_eq!(store.startup_state().unwrap(), lngnb::storage::StartupState::NeedsReview);
+        assert_eq!(
+            store.saved_admin_config().unwrap().is_some(),
+            failure == "finish"
+        );
+        assert_eq!(
+            store.startup_state().unwrap(),
+            lngnb::storage::StartupState::NeedsReview
+        );
         drop(store);
         let retry = config_save_command(&temp.data()).output().unwrap();
         assert_eq!(retry.status.code(), Some(3));
@@ -1214,12 +1269,18 @@ fn config_save_failure_preserves_old_or_committed_new_values_and_blocks_restart(
 fn config_save_output_failure_does_not_undo_confirmed_settings() {
     let temp = Temp::new();
     drop(RecordStore::initialize(&temp.data(), Limits::default()).unwrap());
-    let output = config_save_command(&temp.data()).stdout(fs::File::options().write(true).open("/dev/full").unwrap()).output().unwrap();
+    let output = config_save_command(&temp.data())
+        .stdout(fs::File::options().write(true).open("/dev/full").unwrap())
+        .output()
+        .unwrap();
     assert_eq!(output.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&output.stderr).contains("正常終了後"));
     assert_eq!(saved_config_row(&temp.data()), (500, 7, 8, 1));
     let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
-    assert_eq!(store.startup_state().unwrap(), lngnb::storage::StartupState::Clean);
+    assert_eq!(
+        store.startup_state().unwrap(),
+        lngnb::storage::StartupState::Clean
+    );
 }
 
 #[test]
