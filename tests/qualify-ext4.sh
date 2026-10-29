@@ -59,3 +59,6 @@ cargo test --locked --offline --test record_cli startup_blob_byte_budget_ -- --t
 
 # 起動Blobの対象数分割・未保持対象の計上を再実行する。
 cargo test --locked --offline --test record_cli startup_blob_target_budget_ -- --test-threads=1
+
+# 起動時依存入力の辺数分割・一Revision未満の不足を再実行する。
+cargo test --locked --offline --test record_cli startup_edge_budget_ -- --test-threads=1
