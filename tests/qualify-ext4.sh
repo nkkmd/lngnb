@@ -62,3 +62,6 @@ cargo test --locked --offline --test record_cli startup_blob_target_budget_ -- -
 
 # 起動時依存入力の辺数分割・一Revision未満の不足を再実行する。
 cargo test --locked --offline --test record_cli startup_edge_budget_ -- --test-threads=1
+
+# 起動時親評価の件数分割・次checkpoint保存失敗を再実行する。
+cargo test --locked --offline --test record_cli startup_evaluation_budget_ -- --test-threads=1
