@@ -318,7 +318,9 @@ mod tests {
     fn startup_record_edge_budget_is_bounded_and_does_not_change_other_budgets_or_saved_values() {
         let defaults = LocalStartupBudget::default();
         for value in [1, 100_000] {
-            let config = Config::default().with_startup_record_edges(Some(value)).unwrap();
+            let config = Config::default()
+                .with_startup_record_edges(Some(value))
+                .unwrap();
             let budget = config.startup_budget();
             assert_eq!(budget.records.edges, value);
             assert_eq!(budget.records.records, defaults.records.records);
@@ -329,11 +331,30 @@ mod tests {
             assert_eq!(config.saved_values(), Config::default().saved_values());
         }
         for value in [0, 100_001, u64::MAX] {
-            assert!(Config::default().with_startup_record_edges(Some(value)).is_none());
+            assert!(
+                Config::default()
+                    .with_startup_record_edges(Some(value))
+                    .is_none()
+            );
         }
         let saved = Config::default().saved_values();
-        assert_eq!(Overrides::default().resolve(Some(saved)).unwrap().startup_record_edges_per_step, 100_000);
-        assert_eq!(Overrides { startup_record_edges_per_step: Some(1), ..Overrides::default() }.resolve(Some(saved)).unwrap().startup_record_edges_per_step, 1);
+        assert_eq!(
+            Overrides::default()
+                .resolve(Some(saved))
+                .unwrap()
+                .startup_record_edges_per_step,
+            100_000
+        );
+        assert_eq!(
+            Overrides {
+                startup_record_edges_per_step: Some(1),
+                ..Overrides::default()
+            }
+            .resolve(Some(saved))
+            .unwrap()
+            .startup_record_edges_per_step,
+            1
+        );
     }
 
     #[test]

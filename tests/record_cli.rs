@@ -571,7 +571,12 @@ fn invalid_runtime_options_fail_before_creating_or_changing_data() {
             vec!["--startup-record-edges-per-step", "100001"],
             vec!["--startup-record-edges-per-step", "private"],
             vec!["--startup-record-edges-per-step", "01"],
-            vec!["--startup-record-edges-per-step", "1", "--startup-record-edges-per-step", "2"],
+            vec![
+                "--startup-record-edges-per-step",
+                "1",
+                "--startup-record-edges-per-step",
+                "2",
+            ],
             vec!["--startup-blob-targets-per-step", "10001"],
             vec!["--startup-blob-targets-per-step", "private"],
             vec!["--startup-blob-targets-per-step", "01"],
@@ -2105,35 +2110,62 @@ fn startup_blob_target_budget_counts_unheld_payloads_even_with_zero_hash_bytes()
 fn parent_revision(parents: &[lngnb::id::Id], payload: &[u8]) -> LocalRecord {
     use lngnb::cbor::Value;
     let mut body = blob_revision(payload).body().clone();
-    let mut ids = parents.iter().map(|id|id.bytes).collect::<Vec<_>>();
+    let mut ids = parents.iter().map(|id| id.bytes).collect::<Vec<_>>();
     ids.sort();
-    let Value::Map(fields) = &mut body else { panic!("body map") };
-    fields.iter_mut().find(|(key,_)|key=="parents").unwrap().1 =
-        Value::Array(ids.into_iter().map(|id|Value::Bytes(id.to_vec())).collect());
+    let Value::Map(fields) = &mut body else {
+        panic!("body map")
+    };
+    fields
+        .iter_mut()
+        .find(|(key, _)| key == "parents")
+        .unwrap()
+        .1 = Value::Array(
+        ids.into_iter()
+            .map(|id| Value::Bytes(id.to_vec()))
+            .collect(),
+    );
     fixture_sign(body)
 }
 fn startup_edge_records(temp: &Temp, wide: bool) -> Vec<LocalRecord> {
     let root = blob_revision(b"edge root");
-    let left = if wide { blob_revision(b"edge second root") } else { parent_revision(&[root.id()],b"edge left") };
-    let leaf = if wide { parent_revision(&[root.id(),left.id()],b"edge merge") } else { parent_revision(&[root.id()],b"edge right") };
-    let records = vec![fixture(),root,left,leaf];
-    let mut writer = RecordStore::initialize(&temp.data(), Limits::default()).unwrap().begin().unwrap();
-    for record in &records { writer.insert(record).unwrap(); }
-    writer.save_admin_config(lngnb::storage::AdminConfig {
-        request_timeout_ms: 500, max_new_records: 7, max_diagnostic_records: 8, startup_records_per_step: 10_000,
-    }).unwrap();
+    let left = if wide {
+        blob_revision(b"edge second root")
+    } else {
+        parent_revision(&[root.id()], b"edge left")
+    };
+    let leaf = if wide {
+        parent_revision(&[root.id(), left.id()], b"edge merge")
+    } else {
+        parent_revision(&[root.id()], b"edge right")
+    };
+    let records = vec![fixture(), root, left, leaf];
+    let mut writer = RecordStore::initialize(&temp.data(), Limits::default())
+        .unwrap()
+        .begin()
+        .unwrap();
+    for record in &records {
+        writer.insert(record).unwrap();
+    }
+    writer
+        .save_admin_config(lngnb::storage::AdminConfig {
+            request_timeout_ms: 500,
+            max_new_records: 7,
+            max_diagnostic_records: 8,
+            startup_records_per_step: 10_000,
+        })
+        .unwrap();
     writer.finish().unwrap();
     records
 }
 #[test]
 fn startup_edge_budget_splits_dependency_input_without_reducing_total_graph_or_saving() {
     let temp = Temp::new();
-    let records = startup_edge_records(&temp,false);
+    let records = startup_edge_records(&temp, false);
     let mut server = Server::configured(&temp, &["--startup-record-edges-per-step", "1"]);
     let diagnostic = evaluate_cli(&temp.data());
     assert!(diagnostic.status.success());
-    assert_eq!(diagnostic_field(&diagnostic,"records"),4);
-    assert_eq!(diagnostic_field(&diagnostic,"diagnostic_invalid"),0);
+    assert_eq!(diagnostic_field(&diagnostic, "records"), 4);
+    assert_eq!(diagnostic_field(&diagnostic, "diagnostic_invalid"), 0);
     server.signal("-TERM");
     assert!(server.wait().success());
     let text = fs::read_to_string(&server.log).unwrap();
@@ -2141,41 +2173,65 @@ fn startup_edge_budget_splits_dependency_input_without_reducing_total_graph_or_s
     assert!(text.contains("startup_records_per_step: 10000\n"));
     let conn = rusqlite::Connection::open(temp.data().join("database.sqlite")).unwrap();
     let split: i64 = conn.query_row("SELECT count(*) FROM history WHERE new_state='evaluation_input_pending' AND reason LIKE 'evaluation_input_checkpoint:epoch=%:records=%:bytes=%:edges=1:digest=%'",[],|r|r.get(0)).unwrap();
-    assert!(split>0);
+    assert!(split > 0);
     drop(conn);
-    let store = RecordStore::open(&temp.data(),Limits::default()).unwrap();
-    for record in &records { assert_eq!(store.record(record.id()).unwrap().unwrap().bytes(),record.bytes()); }
+    let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
+    for record in &records {
+        assert_eq!(
+            store.record(record.id()).unwrap().unwrap().bytes(),
+            record.bytes()
+        );
+    }
     drop(store);
-    assert_eq!(saved_config_row(&temp.data()),(500,7,8,10_000));
+    assert_eq!(saved_config_row(&temp.data()), (500, 7, 8, 10_000));
     let mut restarted = Server::start(&temp);
     restarted.signal("-TERM");
     assert!(restarted.wait().success());
-    assert!(fs::read_to_string(&restarted.log).unwrap().contains("startup_record_edges_per_step: 100000\n"));
-    assert_eq!(saved_config_row(&temp.data()),(500,7,8,10_000));
+    assert!(
+        fs::read_to_string(&restarted.log)
+            .unwrap()
+            .contains("startup_record_edges_per_step: 100000\n")
+    );
+    assert_eq!(saved_config_row(&temp.data()), (500, 7, 8, 10_000));
 }
 #[test]
 fn startup_edge_budget_below_one_revision_preserves_records_without_invalidating_them() {
     let temp = Temp::new();
-    let records = startup_edge_records(&temp,true);
+    let records = startup_edge_records(&temp, true);
     let output = Command::new(env!("CARGO_BIN_EXE_lngnb"))
-        .args(["admin", "serve", "--data-dir"]).arg(temp.data())
-        .args(["--startup-record-edges-per-step", "1"]).output().unwrap();
-    assert_eq!(output.status.code(),Some(3));
+        .args(["admin", "serve", "--data-dir"])
+        .arg(temp.data())
+        .args(["--startup-record-edges-per-step", "1"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3));
     assert!(output.stdout.is_empty());
     assert!(!String::from_utf8_lossy(&output.stderr).contains("署名不正"));
-    for name in ["admin.sock","admin-status.sock","admin-evaluate.sock"] { assert!(!temp.data().join(name).exists()); }
+    for name in ["admin.sock", "admin-status.sock", "admin-evaluate.sock"] {
+        assert!(!temp.data().join(name).exists());
+    }
     let conn = rusqlite::Connection::open(temp.data().join("database.sqlite")).unwrap();
-    let invalid: i64 = conn.query_row("SELECT count(*) FROM known_invalid",[],|r|r.get(0)).unwrap();
-    assert_eq!(invalid,0);
+    let invalid: i64 = conn
+        .query_row("SELECT count(*) FROM known_invalid", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(invalid, 0);
     drop(conn);
-    assert_review(&temp,true);
+    assert_review(&temp, true);
     let retry = Command::new(env!("CARGO_BIN_EXE_lngnb"))
-        .args(["admin", "serve", "--data-dir"]).arg(temp.data()).output().unwrap();
-    assert_eq!(retry.status.code(),Some(3));
+        .args(["admin", "serve", "--data-dir"])
+        .arg(temp.data())
+        .output()
+        .unwrap();
+    assert_eq!(retry.status.code(), Some(3));
     assert!(retry.stdout.is_empty());
-    assert_review(&temp,true);
-    let store = RecordStore::open(&temp.data(),Limits::default()).unwrap();
-    for record in &records { assert_eq!(store.record(record.id()).unwrap().unwrap().bytes(),record.bytes()); }
+    assert_review(&temp, true);
+    let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
+    for record in &records {
+        assert_eq!(
+            store.record(record.id()).unwrap().unwrap().bytes(),
+            record.bytes()
+        );
+    }
     drop(store);
-    assert_eq!(saved_config_row(&temp.data()),(500,7,8,10_000));
+    assert_eq!(saved_config_row(&temp.data()), (500, 7, 8, 10_000));
 }
