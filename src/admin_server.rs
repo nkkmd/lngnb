@@ -23,6 +23,7 @@ pub struct Config {
     startup_records_per_step: u64,
     startup_record_bytes_per_step: u64,
     startup_blob_bytes_per_step: u64,
+    startup_blob_targets_per_step: u64,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -33,6 +34,7 @@ impl Default for Config {
             startup_records_per_step: 10_000,
             startup_record_bytes_per_step: 64 * 1024 * 1024,
             startup_blob_bytes_per_step: 64 * 1024 * 1024,
+            startup_blob_targets_per_step: 10_000,
         }
     }
 }
@@ -63,6 +65,7 @@ impl Config {
             startup_records_per_step: defaults.startup_records_per_step,
             startup_record_bytes_per_step: defaults.startup_record_bytes_per_step,
             startup_blob_bytes_per_step: defaults.startup_blob_bytes_per_step,
+            startup_blob_targets_per_step: defaults.startup_blob_targets_per_step,
         })
     }
     pub fn with_diagnostic_records(mut self, value: Option<u64>) -> Option<Self> {
@@ -97,6 +100,14 @@ impl Config {
         self.startup_blob_bytes_per_step = value;
         Some(self)
     }
+    pub fn with_startup_blob_targets(mut self, value: Option<u64>) -> Option<Self> {
+        let value = value.unwrap_or(self.startup_blob_targets_per_step);
+        if value == 0 || value > 10_000 {
+            return None;
+        }
+        self.startup_blob_targets_per_step = value;
+        Some(self)
+    }
     fn startup_budget(self) -> LocalStartupBudget {
         let mut budget = LocalStartupBudget::default();
         budget.inspection.records = self.startup_records_per_step;
@@ -105,6 +116,8 @@ impl Config {
         budget.records.bytes = self.startup_record_bytes_per_step;
         budget.inspection.blob_bytes = self.startup_blob_bytes_per_step;
         budget.blobs.bytes = self.startup_blob_bytes_per_step;
+        budget.inspection.blob_files = self.startup_blob_targets_per_step;
+        budget.blobs.targets = self.startup_blob_targets_per_step;
         budget
     }
 }
@@ -118,6 +131,7 @@ pub struct Overrides {
     pub startup_records_per_step: Option<u64>,
     pub startup_record_bytes_per_step: Option<u64>,
     pub startup_blob_bytes_per_step: Option<u64>,
+    pub startup_blob_targets_per_step: Option<u64>,
 }
 impl Overrides {
     pub fn resolve(self, saved: Option<lngnb::storage::AdminConfig>) -> Option<Config> {
@@ -137,7 +151,8 @@ impl Overrides {
                 .or(saved.map(|c| c.startup_records_per_step)),
         )?
         .with_startup_record_bytes(self.startup_record_bytes_per_step)?
-        .with_startup_blob_bytes(self.startup_blob_bytes_per_step)
+        .with_startup_blob_bytes(self.startup_blob_bytes_per_step)?
+        .with_startup_blob_targets(self.startup_blob_targets_per_step)
     }
 }
 
@@ -232,13 +247,14 @@ fn serve(
         .enable_evaluation_with_record_limit(config.max_diagnostic_records)
         .map_err(|_| Error::Unconfirmed)?;
     let ready = format!(
-        "管理受理側のローカル起動検査を完了し、管理socketを開きました。公開・復旧完了の判定ではありません。\nrequest_timeout_ms: {}\nmax_new_records: {}\nmax_diagnostic_records: {}\nstartup_records_per_step: {}\nstartup_record_bytes_per_step: {}\nstartup_blob_bytes_per_step: {}\n起動引数・保存値・既定値の順で選んだ設定を適用しました。起動引数は保存していません。Record/Blobのbyte予算はこの起動だけの指定で、保存対象外です。\n",
+        "管理受理側のローカル起動検査を完了し、管理socketを開きました。公開・復旧完了の判定ではありません。\nrequest_timeout_ms: {}\nmax_new_records: {}\nmax_diagnostic_records: {}\nstartup_records_per_step: {}\nstartup_record_bytes_per_step: {}\nstartup_blob_bytes_per_step: {}\nstartup_blob_targets_per_step: {}\n起動引数・保存値・既定値の順で選んだ設定を適用しました。起動引数は保存していません。Record/Blobのbyte予算とBlob対象数はこの起動だけの指定で、保存対象外です。\n",
         config.timeout_ms,
         config.max_new_records,
         config.max_diagnostic_records,
         config.startup_records_per_step,
         config.startup_record_bytes_per_step,
-        config.startup_blob_bytes_per_step
+        config.startup_blob_bytes_per_step,
+        config.startup_blob_targets_per_step
     );
     output
         .write_all(ready.as_bytes())
@@ -282,6 +298,28 @@ fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_blob_target_budget_is_bounded_and_separate_from_bytes_and_saved_values() {
+        let defaults = LocalStartupBudget::default();
+        for value in [1, 10_000] {
+            let config = Config::default().with_startup_blob_targets(Some(value)).unwrap();
+            let budget = config.startup_budget();
+            assert_eq!(budget.inspection.blob_files, value);
+            assert_eq!(budget.blobs.targets, value);
+            assert_eq!(budget.inspection.records, defaults.inspection.records);
+            assert_eq!(budget.inspection.blob_bytes, defaults.inspection.blob_bytes);
+            assert_eq!(budget.blobs.bytes, defaults.blobs.bytes);
+            assert_eq!(budget.blobs.elapsed, defaults.blobs.elapsed);
+            assert_eq!(config.saved_values(), Config::default().saved_values());
+        }
+        for value in [0, 10_001, u64::MAX] {
+            assert!(Config::default().with_startup_blob_targets(Some(value)).is_none());
+        }
+        let saved = Config::default().saved_values();
+        assert_eq!(Overrides::default().resolve(Some(saved)).unwrap().startup_blob_targets_per_step, 10_000);
+        assert_eq!(Overrides { startup_blob_targets_per_step: Some(1), ..Overrides::default() }.resolve(Some(saved)).unwrap().startup_blob_targets_per_step, 1);
+    }
 
     #[test]
     fn startup_blob_byte_budget_is_bounded_and_does_not_change_other_budgets_or_saved_values() {

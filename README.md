@@ -97,7 +97,7 @@ cargo build --locked --offline --release
 ./target/release/lngnb admin serve --data-dir /path/to/existing-data
 ```
 
-既存の正常停止領域を明示します。同じ排他のまま分割起動検査・保存Record/Blob照合・管理用親評価を完了してからsocketを開きます。起動中も一般配信はありません。手動確認待ち・未完了検査・予算不足・既存socket名を成功にせず、socketの自動採用・削除、初期化、復旧解除はしません。起動検査のBlob件数/対象数・辺・時間・SQL等の予算変更はまだ提供しません。Record検査の分割件数は次のoptionで指定できます。
+既存の正常停止領域を明示します。同じ排他のまま分割起動検査・保存Record/Blob照合・管理用親評価を完了してからsocketを開きます。起動中も一般配信はありません。手動確認待ち・未完了検査・予算不足・既存socket名を成功にせず、socketの自動採用・削除、初期化、復旧解除はしません。起動検査の辺・時間・SQL等の予算変更はまだ提供しません。Record検査の分割件数は次のoptionで指定できます。
 
 この起動の受理側予算を明示できます。
 
@@ -113,11 +113,15 @@ cargo build --locked --offline --release
 
 `--startup-record-bytes-per-step`は、Record局所検査と依存入力収集の各stepで扱うRecordのbyte予算（1〜67,108,864 bytes、既定64 MiB）です。件数予算と併用し、どちらかに達した正常なstep境界では同じ排他/cursorで次stepへ進みます。検査対象の総byte数やRecord形式の上限、Blob検査・辺・時間・SQL予算は変更しません。単一Recordも収まらなければ検査を飛ばさず、socket/起動完了表示前に終了3で保全停止します。小さい処理予算の不足は署名不正ではなく、設定変更や次回の省略でも手動待ちは解除しません。
 
-このbyte予算だけは起動引数専用で、`admin config-save/config-show`の保存対象4項目へは追加しません。省略時は64 MiBへ戻り、起動完了時に`startup_record_bytes_per_step`を表示します。`config-save/probe/status/evaluate/config-show`への指定は領域接触前に終了2です。
+このRecord byte予算は起動引数専用で、`admin config-save/config-show`の保存対象4項目へは追加しません。省略時は64 MiBへ戻り、起動完了時に`startup_record_bytes_per_step`を表示します。`config-save/probe/status/evaluate/config-show`への指定は領域接触前に終了2です。
 
 `--startup-blob-bytes-per-step`は、物理Blob検査と本文評価入力の各stepで全体hashを確認するbyte予算（1〜67,108,864 bytes、既定64 MiB）です。Blob間のstep境界で分割し、同じ排他と既存の検査台帳で全対象を終えるまでsocket/起動完了を出しません。一つのBlob内部を途中まで検査して完了にせず、一件も収まらなければ終了3で保全停止します。保持本文の欠損・破損を検出した場合も正常起動にせず、既存ファイルを採用・削除・修復しません。
 
 このBlob byte予算も起動引数専用で、保存対象4項目には追加しません。省略時は64 MiBへ戻り、適用値を`startup_blob_bytes_per_step`として起動完了時に表示します。Record・Blob件数/対象数・辺・時間・SQL・全体量・受付/診断予算は変更せず、不足や破損後の設定変更・省略で手動待ちを解除しません。`config-save/probe/status/evaluate/config-show`への指定は領域接触前に終了2です。
+
+`--startup-blob-targets-per-step`は、物理Blob検査の一覧項目数と本文評価入力の対象数を、それぞれのstepで1〜10,000（既定10,000）に指定します。物理検査ではBlob・途中ファイル・欠損等の一覧項目を数え、本文評価では未保持・失敗観測だけのBlobも一対象として数えます。hashするbytesが0でも対象数には計上します。段階間で件数が同じとは限らず、全資料のBlob総数の上限や検査省略数ではありません。
+
+byte予算と併用して同じ排他/台帳で全対象を検査し、全段階完了後だけ`startup_blob_targets_per_step`を表示します。起動引数専用で保存4項目へ追加せず、正常再起動で省略すれば10,000へ戻ります。Record・byte・辺・時間・SQL・全体量・受付/診断予算は変えず、設定変更・省略で手動待ちを解除しません。他の管理操作への指定は接触前に終了2です。
 
 指定した予算の適用値をsocketの起動表示に続けて出力します。保存対象4項目は、項目ごとに起動引数→検査済み保存値→既定値の順で選びます。明示引数は自動保存せず、次回の省略時は保存値（未保存なら既定値）へ戻ります。不正な保存値・履歴不一致・読取り失敗は、明示引数や既定値で覆わず受付前に終了3です。同じ排他のまま設定読込みから全起動検査を行い、手動確認待ちは解除しません。既存の`config show`は候補表示のままです。ASCIIの先頭0なし正整数だけを受け付け、0・上限超過・重複指定・符号・空白・小数・不明optionは領域へ触る前に終了2で拒否します。これらのoptionは`admin probe/status/evaluate`には指定できません。通信期限切れや新規件数上限超過は既存の保全停止（終了3）となり、既に保存したRecordを削除せず、手動確認待ちを自動解除しません。値の変更や診断だけを復旧完了とは扱いません。
 

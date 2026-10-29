@@ -30,7 +30,7 @@ const HELP: &str = "lngnb — 分散図書館・知識基盤（開発初期段�
   lngnb admin evaluate --data-dir PATH
   lngnb admin config-show --data-dir PATH
   lngnb admin config-save --data-dir PATH --request-timeout-ms N --max-new-records N --max-diagnostic-records N --startup-records-per-step N
-  lngnb admin serve --data-dir PATH [--request-timeout-ms N] [--max-new-records N] [--max-diagnostic-records N] [--startup-records-per-step N] [--startup-record-bytes-per-step N] [--startup-blob-bytes-per-step N]
+  lngnb admin serve --data-dir PATH [--request-timeout-ms N] [--max-new-records N] [--max-diagnostic-records N] [--startup-records-per-step N] [--startup-record-bytes-per-step N] [--startup-blob-bytes-per-step N] [--startup-blob-targets-per-step N]
   lngnb record submit --data-dir PATH --record PATH
   lngnb document create --data-dir PATH --key-dir PATH --name NAME --expect-key-id KEY_ID --payload PATH --metadata PATH [--media-type TYPE] [--max-payload-bytes N]
   lngnb key create --key-dir PATH --name NAME
@@ -72,7 +72,9 @@ admin serve は前面で管理受理側だけを起動します。SIGINT/SIGTERM
 起動時のRecord局所検査と依存入力収集は --startup-records-per-step で一段階の1〜10000件（既定10000）へ分割できます。
 --startup-record-bytes-per-step は両Record段階の一stepのbyte予算（1〜67108864、既定67108864）です。
 --startup-blob-bytes-per-step は物理Blob検査と本文評価入力の各stepのhash byte予算（1〜67108864、既定67108864）です。
-Record/Blobのbyte予算は保存対象外で、省略時は既定へ戻ります。一件も収まらなければ受付前に保全停止します。
+--startup-blob-targets-per-step は物理Blob一覧と本文評価入力の各stepの対象数（1〜10000、既定10000）です。
+未保持Blob等も本文評価の一対象として数えます。
+Record/Blobのbyte予算とBlob対象数は保存対象外で、省略時は既定へ戻ります。一件も収まらなければ受付前に保全停止します。
 保存対象4項目は項目ごとに起動引数→検査済み保存値→既定値を選び、適用値を起動時に表示します。引数は自動保存しません。
 不正保存値を明示引数で補わず、全検査の完了前にはsocketを開きません。
 不正通信・保存障害・応答喪失では正常停止にせず、領域とsocketを保持します。
