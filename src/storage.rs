@@ -545,7 +545,11 @@ fn check_format(conn: &Connection, budget: SqlInspectionBudget) -> Result<()> {
     Ok(())
 }
 fn configure(conn: &Connection) -> Result<()> {
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA read_uncommitted=OFF; PRAGMA trusted_schema=OFF; PRAGMA cache_size=-4096; PRAGMA mmap_size=0;")?;
+    conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+    configure_local(conn)
+}
+fn configure_local(conn: &Connection) -> Result<()> {
+    conn.execute_batch("PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA read_uncommitted=OFF; PRAGMA trusted_schema=OFF; PRAGMA cache_size=-4096; PRAGMA mmap_size=0;")?;
     let journal: String = conn.pragma_query_value(None, "journal_mode", |r| r.get(0))?;
     if !journal.eq_ignore_ascii_case("wal") {
         return Err(StorageError::UnsupportedFormat);

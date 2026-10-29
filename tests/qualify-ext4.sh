@@ -47,3 +47,6 @@ cargo test --locked --offline --test record_cli config_save_ -- --test-threads=1
 
 # 保存設定の起動適用・破損拒否・手動待ち維持も再実行する。
 cargo test --locked --offline --test record_cli saved_startup_ -- --test-threads=1
+
+# 停止中保存設定の読取り・拒否・出力失敗を再実行する。
+cargo test --locked --offline --test record_cli config_show_ -- --test-threads=1

@@ -16,13 +16,14 @@ enum Action {
     Probe,
     Status,
     Evaluate,
+    ShowConfig,
     Serve(Overrides),
     SaveConfig(Config),
 }
 pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
     let usage = || {
         AppError::Usage(
-            "admin probe/status/evaluate/serve/config-save の操作・明示領域・設定値を確認してください",
+            "admin probe/status/evaluate/serve/config-save/config-show の操作・明示領域・設定値を確認してください",
         )
     };
     let [action, rest @ ..] = args else {
@@ -33,6 +34,7 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
         && action != "evaluate"
         && action != "serve"
         && action != "config-save"
+        && action != "config-show"
     {
         return Err(usage());
     }
@@ -88,6 +90,8 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
         Action::Evaluate
     } else if action == "status" {
         Action::Status
+    } else if action == "config-show" {
+        Action::ShowConfig
     } else {
         let config = Config::checked(timeout, records)
             .and_then(|c| c.with_diagnostic_records(diagnostic_records))
@@ -128,6 +132,8 @@ pub enum Error {
     Server(super::admin_server::Error),
     ConfigUnconfirmed,
     ConfigOutput,
+    ConfigRead,
+    ConfigReadOutput,
 }
 impl Error {
     pub fn exit_code(&self) -> u8 {
@@ -144,6 +150,8 @@ impl fmt::Display for Error {
             return e.fmt(f);
         }
         f.write_str(match self {
+            Self::ConfigRead => "保存設定を取得・照合できません。領域を保全して確認してください。設定の補完・修復・起動・IPC接続・手動待ち解除は行いません。",
+            Self::ConfigReadOutput => "保存設定の照合後、結果出力に失敗しました。設定や手動確認待ちは変更していません。起動時適用・公開・復旧完了の判定ではありません。",
             Self::ConfigUnconfirmed => "設定保存操作の正常終了を確認できません。旧値または新値の保存済み・未確定の可能性があります。領域を保全し、再実行・再初期化・手動待ち解除をせず確認してください。",
             Self::ConfigOutput => "設定保存とローカル保存sessionの正常終了後、結果出力に失敗しました。保存値は起動へ適用していません。再保存せず確認してください。",
             Self::Evaluation => "保存・評価診断を取得・照合できません。部分件数・健全性は不明です。受理側が保全停止した可能性があるため領域とsocketを保持して確認してください。自動再送・直接DB読込み・残存物整理・再開は行いません。",
@@ -158,6 +166,11 @@ impl fmt::Display for Error {
 }
 impl std::error::Error for Error {}
 pub fn run(command: Command, output: &mut impl Write) -> Result<(), Error> {
+    if command.action == Action::ShowConfig {
+        let saved = lngnb::storage::RecordStore::read_saved_admin_config(&command.data)
+            .map_err(|_| Error::ConfigRead)?;
+        return saved_config_report(saved, output);
+    }
     if let Action::SaveConfig(config) = command.action {
         return save_config(&command.data, config, output);
     }
@@ -176,6 +189,28 @@ pub fn run(command: Command, output: &mut impl Write) -> Result<(), Error> {
     }
     client::probe(&command.data, Duration::from_secs(30)).map_err(|_| Error::Connection)?;
     report(output)
+}
+fn saved_config_report(
+    saved: Option<lngnb::storage::AdminConfig>,
+    output: &mut impl Write,
+) -> Result<(), Error> {
+    let mut text = "停止中の管理受理側の保存設定（現在の起動時適用値ではありません）。\n".to_owned();
+    if let Some(config) = saved {
+        text.push_str(&format!(
+            "saved: true\nrequest_timeout_ms: {}\nmax_new_records: {}\nmax_diagnostic_records: {}\nstartup_records_per_step: {}\n",
+            config.request_timeout_ms,
+            config.max_new_records,
+            config.max_diagnostic_records,
+            config.startup_records_per_step
+        ));
+    } else {
+        text.push_str("saved: false\n未保存です。既定値では補完していません。\n");
+    }
+    text.push_str("設定・履歴・起動検査cursor・手動確認待ちは変更していません。起動・全資料検査・公開・復旧確認の操作ではありません。\n");
+    output
+        .write_all(text.as_bytes())
+        .and_then(|()| output.flush())
+        .map_err(|_| Error::ConfigReadOutput)
 }
 fn save_config(
     path: &std::path::Path,
@@ -508,6 +543,52 @@ mod evaluation_tests {
 #[cfg(test)]
 mod config_tests {
     use super::*;
+
+    #[test]
+    fn config_show_requires_only_one_explicit_path_without_runtime_options() {
+        let args: Vec<OsString> = ["config-show", "--data-dir", "資料 space"].map(Into::into).to_vec();
+        assert_eq!(parse(&args).unwrap().action, Action::ShowConfig);
+        for extra in [
+            vec!["--request-timeout-ms", "1"],
+            vec!["--max-new-records", "1"],
+            vec!["--max-diagnostic-records", "1"],
+            vec!["--startup-records-per-step", "1"],
+            vec!["--data-dir", "private"],
+            vec!["--unknown", "private"],
+        ] {
+            let mut invalid = args.clone();
+            invalid.extend(extra.into_iter().map(OsString::from));
+            let error = parse(&invalid).unwrap_err();
+            assert_eq!(error.exit_code(), 2);
+            assert!(!error.to_string().contains("private"));
+        }
+        assert_eq!(parse(&["config-show".into()]).unwrap_err().exit_code(), 2);
+    }
+
+    #[test]
+    fn config_show_reports_unsaved_without_defaults_and_rejects_output_failure() {
+        let mut output = Vec::new();
+        saved_config_report(None, &mut output).unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.contains("saved: false"));
+        assert!(!text.contains("request_timeout_ms:"));
+        assert!(text.contains("現在の起動時適用値ではありません"));
+        struct Sink(bool);
+        impl Write for Sink {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.0 { Ok(bytes.len()) } else { Err(std::io::Error::other("private")) }
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Err(std::io::Error::other("private")) }
+        }
+        for flush in [false, true] {
+            let error = saved_config_report(Some(Config::default().saved_values()), &mut Sink(flush)).unwrap_err();
+            assert!(matches!(error, Error::ConfigReadOutput));
+            assert_eq!(error.exit_code(), 1);
+            assert!(!error.to_string().contains("private"));
+        }
+        assert_eq!(Error::ConfigRead.exit_code(), 1);
+        assert!(std::error::Error::source(&Error::ConfigRead).is_none());
+    }
 
     #[test]
     fn saving_requires_all_four_explicit_canonical_unique_values() {

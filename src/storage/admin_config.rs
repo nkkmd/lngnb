@@ -69,6 +69,28 @@ pub(super) fn load(conn: &Connection) -> Result<Option<AdminConfig>> {
     Ok(Some(config))
 }
 impl RecordStore {
+    /// 停止中の保存値だけをread-only接続・同一排他・同一snapshotで照合する。
+    /// 起動検査、設定補完、履歴/cursor/起動印の更新、正常停止/手動解除をしない。
+    /// SQLiteのWAL/SHM補助I/Oまで全ファイル不変とは保証しない。
+    pub fn read_saved_admin_config(path: &Path) -> Result<Option<AdminConfig>> {
+        let dir = directory(path)?;
+        check_area(&dir)?;
+        check_files(&dir)?;
+        let _lock = lock(&dir, false)?;
+        let mut conn = connection(&dir, true)?;
+        conn.execute_batch("PRAGMA query_only=ON;")?;
+        configure_local(&conn)?;
+        let query_only: i64 = conn.pragma_query_value(None, "query_only", |r| r.get(0))?;
+        if query_only != 1 {
+            return Err(StorageError::UnsupportedFormat);
+        }
+        let tx = conn.transaction()?;
+        check_format(&tx, SqlInspectionBudget::default())?;
+        let config = load(&tx)?;
+        tx.commit()?;
+        conn.close().map_err(|(_, e)| StorageError::Sql(e))?;
+        Ok(config)
+    }
     /// 保存値だけを返す。未保存はNone。起動への適用や既定値補完をしない。
     pub fn saved_admin_config(&self) -> Result<Option<AdminConfig>> {
         load(&self.conn)
@@ -134,6 +156,37 @@ mod tests {
             max_diagnostic_records: 500,
             startup_records_per_step: 1,
         }
+    }
+    #[test]
+    fn readonly_config_preserves_all_logical_state_and_manual_wait() {
+        let temp = Temp::new();
+        drop(temp.store());
+        let conn = Connection::open(temp.data().join(DB)).unwrap();
+        let before = super::super::tests::logical_snapshot(&conn);
+        assert_eq!(RecordStore::read_saved_admin_config(&temp.data()).unwrap(), None);
+        assert_eq!(super::super::tests::logical_snapshot(&conn), before);
+        drop(conn);
+        let mut writer = RecordStore::open(&temp.data(), Limits::default()).unwrap().begin().unwrap();
+        writer.save_admin_config(config()).unwrap();
+        drop(writer);
+        let conn = Connection::open(temp.data().join(DB)).unwrap();
+        let before = super::super::tests::logical_snapshot(&conn);
+        assert_eq!(RecordStore::read_saved_admin_config(&temp.data()).unwrap(), Some(config()));
+        assert_eq!(super::super::tests::logical_snapshot(&conn), before);
+        assert_eq!(state(&conn).unwrap(), StartupState::NeedsReview);
+        assert!(LocalStartup::open(&temp.data(), Limits::default()).unwrap().needs_review());
+    }
+    #[test]
+    fn readonly_config_rejects_lock_conflict_and_does_not_scan_records() {
+        let temp = Temp::new();
+        let store = temp.store();
+        assert!(matches!(RecordStore::read_saved_admin_config(&temp.data()), Err(StorageError::Busy)));
+        drop(store);
+        let conn = Connection::open(temp.data().join(DB)).unwrap();
+        conn.execute("INSERT INTO records(id,bytes) VALUES(?1,?2)", params![&[255u8;32][..], b"invalid".as_slice()]).unwrap();
+        let before = super::super::tests::logical_snapshot(&conn);
+        assert_eq!(RecordStore::read_saved_admin_config(&temp.data()).unwrap(), None);
+        assert_eq!(super::super::tests::logical_snapshot(&conn), before);
     }
     #[test]
     fn explicit_save_survives_reopen_without_becoming_runtime_configuration() {
