@@ -26,6 +26,7 @@ pub struct Config {
     startup_blob_targets_per_step: u64,
     startup_record_edges_per_step: u64,
     startup_evaluation_records_per_step: u64,
+    sql_inspection_callbacks: u64,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -39,6 +40,7 @@ impl Default for Config {
             startup_blob_targets_per_step: 10_000,
             startup_record_edges_per_step: 100_000,
             startup_evaluation_records_per_step: 32,
+            sql_inspection_callbacks: 100_000,
         }
     }
 }
@@ -72,6 +74,7 @@ impl Config {
             startup_blob_targets_per_step: defaults.startup_blob_targets_per_step,
             startup_record_edges_per_step: defaults.startup_record_edges_per_step,
             startup_evaluation_records_per_step: defaults.startup_evaluation_records_per_step,
+            sql_inspection_callbacks: defaults.sql_inspection_callbacks,
         })
     }
     pub fn with_diagnostic_records(mut self, value: Option<u64>) -> Option<Self> {
@@ -130,6 +133,14 @@ impl Config {
         self.startup_evaluation_records_per_step = value;
         Some(self)
     }
+    pub fn with_sql_inspection_callbacks(mut self, value: Option<u64>) -> Option<Self> {
+        let value = value.unwrap_or(self.sql_inspection_callbacks);
+        if value == 0 || value > 100_000 {
+            return None;
+        }
+        self.sql_inspection_callbacks = value;
+        Some(self)
+    }
     fn startup_budget(self) -> LocalStartupBudget {
         let mut budget = LocalStartupBudget::default();
         budget.inspection.records = self.startup_records_per_step;
@@ -158,8 +169,17 @@ pub struct Overrides {
     pub startup_blob_targets_per_step: Option<u64>,
     pub startup_record_edges_per_step: Option<u64>,
     pub startup_evaluation_records_per_step: Option<u64>,
+    pub sql_inspection_callbacks: Option<u64>,
 }
 impl Overrides {
+    // 設定読込み前から同じ接続/排他/保存sessionへ渡す。writer取得時に戻さない。
+    fn storage_limits(self) -> Limits {
+        let mut limits = Limits::default();
+        limits.sql_inspection.callbacks = self
+            .sql_inspection_callbacks
+            .unwrap_or(limits.sql_inspection.callbacks);
+        limits
+    }
     pub fn resolve(self, saved: Option<lngnb::storage::AdminConfig>) -> Option<Config> {
         if saved.is_some_and(|c| !c.is_valid()) {
             return None;
@@ -180,7 +200,8 @@ impl Overrides {
         .with_startup_blob_bytes(self.startup_blob_bytes_per_step)?
         .with_startup_blob_targets(self.startup_blob_targets_per_step)?
         .with_startup_record_edges(self.startup_record_edges_per_step)?
-        .with_startup_evaluation_records(self.startup_evaluation_records_per_step)
+        .with_startup_evaluation_records(self.startup_evaluation_records_per_step)?
+        .with_sql_inspection_callbacks(self.sql_inspection_callbacks)
     }
 }
 
@@ -244,9 +265,12 @@ fn serve(
     stop: &AtomicBool,
     output: &mut impl Write,
 ) -> Result<(), Error> {
-    let (mut startup, saved) =
-        LocalStartup::open_with_admin_config(path, Limits::default(), overrides.max_new_records)
-            .map_err(|_| Error::Unconfirmed)?;
+    let (mut startup, saved) = LocalStartup::open_with_admin_config(
+        path,
+        overrides.storage_limits(),
+        overrides.max_new_records,
+    )
+    .map_err(|_| Error::Unconfirmed)?;
     let config = overrides.resolve(saved).ok_or(Error::Unconfirmed)?;
     if startup.needs_review() {
         return Err(Error::Unconfirmed);
@@ -275,7 +299,7 @@ fn serve(
         .enable_evaluation_with_record_limit(config.max_diagnostic_records)
         .map_err(|_| Error::Unconfirmed)?;
     let ready = format!(
-        "管理受理側のローカル起動検査を完了し、管理socketを開きました。公開・復旧完了の判定ではありません。\nrequest_timeout_ms: {}\nmax_new_records: {}\nmax_diagnostic_records: {}\nstartup_records_per_step: {}\nstartup_record_bytes_per_step: {}\nstartup_blob_bytes_per_step: {}\nstartup_blob_targets_per_step: {}\nstartup_record_edges_per_step: {}\nstartup_evaluation_records_per_step: {}\n起動引数・保存値・既定値の順で選んだ設定を適用しました。起動引数は保存していません。Record/Blobのbyte予算・Blob対象数・Record辺数・親評価件数はこの起動だけの指定で、保存対象外です。\n",
+        "管理受理側のローカル起動検査を完了し、管理socketを開きました。公開・復旧完了の判定ではありません。\nrequest_timeout_ms: {}\nmax_new_records: {}\nmax_diagnostic_records: {}\nstartup_records_per_step: {}\nstartup_record_bytes_per_step: {}\nstartup_blob_bytes_per_step: {}\nstartup_blob_targets_per_step: {}\nstartup_record_edges_per_step: {}\nstartup_evaluation_records_per_step: {}\nsql_inspection_callbacks: {}\n起動引数・保存値・既定値の順で選んだ設定を適用しました。起動引数は保存していません。Record/Blobのbyte予算・Blob対象数・Record辺数・親評価件数はこの起動だけの指定で、保存対象外です。SQL照合callback予算は起動後の保存sessionにも適用し、保存対象外です。\n",
         config.timeout_ms,
         config.max_new_records,
         config.max_diagnostic_records,
@@ -284,7 +308,8 @@ fn serve(
         config.startup_blob_bytes_per_step,
         config.startup_blob_targets_per_step,
         config.startup_record_edges_per_step,
-        config.startup_evaluation_records_per_step
+        config.startup_evaluation_records_per_step,
+        config.sql_inspection_callbacks
     );
     output
         .write_all(ready.as_bytes())
@@ -328,6 +353,52 @@ fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sql_callback_budget_is_resolved_before_open_without_changing_time_or_saved_values() {
+        let defaults = Limits::default();
+        assert_eq!(
+            Config::default().sql_inspection_callbacks,
+            defaults.sql_inspection.callbacks
+        );
+        for value in [1, 100_000] {
+            let overrides = Overrides {
+                sql_inspection_callbacks: Some(value),
+                ..Overrides::default()
+            };
+            let limits = overrides.storage_limits();
+            let config = overrides
+                .resolve(Some(Config::default().saved_values()))
+                .unwrap();
+            assert_eq!(limits.sql_inspection.callbacks, value);
+            assert_eq!(config.sql_inspection_callbacks, value);
+            assert_eq!(
+                limits.sql_inspection.elapsed,
+                defaults.sql_inspection.elapsed
+            );
+            assert_eq!(limits.scan_records, defaults.scan_records);
+            assert_eq!(limits.session_bytes, defaults.session_bytes);
+            assert_eq!(
+                config.startup_budget().evaluation.nodes,
+                LocalStartupBudget::default().evaluation.nodes
+            );
+            assert_eq!(config.saved_values(), Config::default().saved_values());
+        }
+        for value in [0, 100_001, u64::MAX] {
+            assert!(
+                Config::default()
+                    .with_sql_inspection_callbacks(Some(value))
+                    .is_none()
+            );
+        }
+        assert_eq!(
+            Overrides::default()
+                .storage_limits()
+                .sql_inspection
+                .callbacks,
+            100_000
+        );
+    }
 
     #[test]
     fn startup_evaluation_budget_only_tightens_new_assessment_count_without_saving() {

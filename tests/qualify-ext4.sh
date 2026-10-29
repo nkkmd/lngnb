@@ -65,3 +65,6 @@ cargo test --locked --offline --test record_cli startup_edge_budget_ -- --test-t
 
 # 起動時親評価の件数分割・次checkpoint保存失敗を再実行する。
 cargo test --locked --offline --test record_cli startup_evaluation_budget_ -- --test-threads=1
+
+# 保存sessionのSQL callback予算・起動前拒否/手動待ち維持を再実行する。
+cargo test --locked --offline --test record_cli sql_callback_budget_ -- --test-threads=1

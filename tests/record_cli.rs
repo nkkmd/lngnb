@@ -569,6 +569,16 @@ fn invalid_runtime_options_fail_before_creating_or_changing_data() {
             vec!["--startup-blob-targets-per-step", "0"],
             vec!["--startup-record-edges-per-step", "0"],
             vec!["--startup-evaluation-records-per-step", "0"],
+            vec!["--sql-inspection-callbacks", "0"],
+            vec!["--sql-inspection-callbacks", "100001"],
+            vec!["--sql-inspection-callbacks", "private"],
+            vec!["--sql-inspection-callbacks", "01"],
+            vec![
+                "--sql-inspection-callbacks",
+                "1",
+                "--sql-inspection-callbacks",
+                "2",
+            ],
             vec!["--startup-evaluation-records-per-step", "33"],
             vec!["--startup-evaluation-records-per-step", "private"],
             vec!["--startup-evaluation-records-per-step", "01"],
@@ -2344,4 +2354,127 @@ fn startup_evaluation_budget_keeps_first_checkpoint_and_manual_wait_when_next_sa
     }
     drop(store);
     assert_eq!(saved_config_row(&temp.data()), (500, 7, 8, 10_000));
+}
+
+#[test]
+fn sql_callback_budget_accepts_runtime_records_and_returns_to_default_without_saving() {
+    let temp = Temp::new();
+    startup_edge_records(&temp, false);
+    let record = blob_revision(b"SQL budget runtime record");
+    fs::write(temp.input(), record.bytes()).unwrap();
+    let mut server = Server::configured(&temp, &["--sql-inspection-callbacks", "50000"]);
+    let submitted = cli(&temp.data(), &temp.input());
+    assert!(submitted.status.success());
+    let runtime = status_cli(&temp.data());
+    assert!(runtime.status.success());
+    assert_eq!(diagnostic_field(&runtime, "session_new_records"), 1);
+    let diagnostic = evaluate_cli(&temp.data());
+    assert!(diagnostic.status.success());
+    assert_eq!(diagnostic_field(&diagnostic, "records"), 5);
+    server.signal("-TERM");
+    assert!(server.wait().success());
+    assert!(
+        fs::read_to_string(&server.log)
+            .unwrap()
+            .contains("sql_inspection_callbacks: 50000\n")
+    );
+    assert_eq!(saved_config_row(&temp.data()), (500, 7, 8, 10_000));
+    let mut restarted = Server::start(&temp);
+    restarted.signal("-TERM");
+    assert!(restarted.wait().success());
+    assert!(
+        fs::read_to_string(&restarted.log)
+            .unwrap()
+            .contains("sql_inspection_callbacks: 100000\n")
+    );
+    let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
+    assert_eq!(
+        store.record(record.id()).unwrap().unwrap().bytes(),
+        record.bytes()
+    );
+    drop(store);
+    assert_eq!(saved_config_row(&temp.data()), (500, 7, 8, 10_000));
+}
+#[test]
+fn sql_callback_budget_stops_large_ledger_before_running_without_repairing_or_clearing_manual_wait()
+{
+    let temp = Temp::new();
+    let mut writer = RecordStore::initialize(&temp.data(), Limits::default())
+        .unwrap()
+        .begin()
+        .unwrap();
+    writer.insert(&fixture()).unwrap();
+    for _ in 0..48 {
+        writer
+            .stage_blob(
+                lngnb::id::blob_id(b"bounded SQL callback ledger"),
+                std::io::Cursor::new(b"bounded SQL callback ledger"),
+                86400,
+                lngnb::storage::TemporaryLimits::default(),
+            )
+            .unwrap();
+    }
+    writer
+        .save_admin_config(lngnb::storage::AdminConfig {
+            request_timeout_ms: 500,
+            max_new_records: 7,
+            max_diagnostic_records: 8,
+            startup_records_per_step: 10_000,
+        })
+        .unwrap();
+    writer.finish().unwrap();
+    let before = fs::read(temp.data().join("database.sqlite")).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_lngnb"))
+        .args(["admin", "serve", "--data-dir"])
+        .arg(temp.data())
+        .args(["--sql-inspection-callbacks", "1"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    assert!(output.stdout.is_empty());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("署名不正"));
+    assert_eq!(
+        fs::read(temp.data().join("database.sqlite")).unwrap(),
+        before
+    );
+    for name in ["admin.sock", "admin-status.sock", "admin-evaluate.sock"] {
+        assert!(!temp.data().join(name).exists());
+    }
+    let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
+    assert_eq!(
+        store.startup_state().unwrap(),
+        lngnb::storage::StartupState::Clean
+    );
+    drop(store);
+    let mut server = Server::start(&temp);
+    server.signal("-TERM");
+    assert!(server.wait().success());
+    let conn = rusqlite::Connection::open(temp.data().join("database.sqlite")).unwrap();
+    let holds: i64 = conn
+        .query_row("SELECT count(*) FROM temporary_blob_holds", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(holds, 48);
+    drop(conn);
+    drop(
+        RecordStore::open(&temp.data(), Limits::default())
+            .unwrap()
+            .begin()
+            .unwrap(),
+    );
+    for explicit in [false, true] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_lngnb"));
+        command
+            .args(["admin", "serve", "--data-dir"])
+            .arg(temp.data());
+        if explicit {
+            command.args(["--sql-inspection-callbacks", "100000"]);
+        }
+        let retry = command.output().unwrap();
+        assert_eq!(retry.status.code(), Some(3));
+        assert!(retry.stdout.is_empty());
+        assert_review(&temp, true);
+        assert_eq!(saved_config_row(&temp.data()), (500, 7, 8, 10_000));
+    }
 }
