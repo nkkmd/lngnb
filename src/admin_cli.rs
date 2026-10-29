@@ -50,6 +50,7 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
     let mut startup_evaluation_records = None;
     let mut sql_inspection_callbacks = None;
     let mut sql_inspection_timeout_ms = None;
+    let mut startup_inspection_timeout_ms = None;
     for pair in rest.chunks(2) {
         let [option, value] = pair else {
             return Err(usage());
@@ -115,6 +116,11 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
             {
                 sql_inspection_timeout_ms = Some(number(value).ok_or_else(usage)?);
             }
+            Some("--startup-inspection-timeout-ms")
+                if action == "serve" && startup_inspection_timeout_ms.is_none() =>
+            {
+                startup_inspection_timeout_ms = Some(number(value).ok_or_else(usage)?);
+            }
             _ => return Err(usage()),
         }
     }
@@ -145,6 +151,7 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
             .and_then(|c| c.with_startup_evaluation_records(startup_evaluation_records))
             .and_then(|c| c.with_sql_inspection_callbacks(sql_inspection_callbacks))
             .and_then(|c| c.with_sql_inspection_timeout(sql_inspection_timeout_ms))
+            .and_then(|c| c.with_startup_inspection_timeout(startup_inspection_timeout_ms))
             .ok_or_else(usage)?;
         if action == "config-save" {
             Action::SaveConfig(config)
@@ -161,6 +168,7 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
                 startup_evaluation_records_per_step: startup_evaluation_records,
                 sql_inspection_callbacks,
                 sql_inspection_timeout_ms,
+                startup_inspection_timeout_ms,
             })
         }
     };
@@ -449,6 +457,8 @@ mod tests {
             "50000",
             "--sql-inspection-timeout-ms",
             "30000",
+            "--startup-inspection-timeout-ms",
+            "20000",
         ]
         .map(Into::into)
         .to_vec();
@@ -468,6 +478,7 @@ mod tests {
                 startup_evaluation_records_per_step: Some(4),
                 sql_inspection_callbacks: Some(50_000),
                 sql_inspection_timeout_ms: Some(30_000),
+                startup_inspection_timeout_ms: Some(20_000),
             })
         );
         for (option, max) in [
@@ -482,6 +493,7 @@ mod tests {
             ("--startup-evaluation-records-per-step", "33"),
             ("--sql-inspection-callbacks", "100001"),
             ("--sql-inspection-timeout-ms", "60001"),
+            ("--startup-inspection-timeout-ms", "60001"),
         ] {
             for bad in [
                 "0",
@@ -729,6 +741,9 @@ mod config_tests {
         assert_eq!(parse(&extra).unwrap_err().exit_code(), 2);
         let mut extra = good.clone();
         extra.extend(["--sql-inspection-timeout-ms".into(), "1".into()]);
+        assert_eq!(parse(&extra).unwrap_err().exit_code(), 2);
+        let mut extra = good.clone();
+        extra.extend(["--startup-inspection-timeout-ms".into(), "1".into()]);
         assert_eq!(parse(&extra).unwrap_err().exit_code(), 2);
         for option in [3, 5, 7, 9] {
             let mut missing = good.clone();

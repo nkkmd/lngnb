@@ -71,3 +71,6 @@ cargo test --locked --offline --test record_cli sql_callback_budget_ -- --test-t
 
 # SQL時間予算の起動/実受理・非保存・手動待ち維持も再実行する。
 cargo test --locked --offline --test record_cli sql_time_budget_ -- --test-threads=1
+
+# 起動局所/物理検査のstep時間指定・分割完了・非保存・手動待ち維持を再実行する。
+cargo test --locked --offline --test record_cli startup_inspection_time_budget_ -- --test-threads=1
