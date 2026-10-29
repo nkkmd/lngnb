@@ -569,6 +569,11 @@ fn invalid_runtime_options_fail_before_creating_or_changing_data() {
             vec!["--startup-blob-targets-per-step", "0"],
             vec!["--startup-record-edges-per-step", "0"],
             vec!["--startup-evaluation-records-per-step", "0"],
+            vec!["--sql-inspection-timeout-ms", "0"],
+            vec!["--sql-inspection-timeout-ms", "60001"],
+            vec!["--sql-inspection-timeout-ms", "private"],
+            vec!["--sql-inspection-timeout-ms", "01"],
+            vec!["--sql-inspection-timeout-ms", "1", "--sql-inspection-timeout-ms", "2"],
             vec!["--sql-inspection-callbacks", "0"],
             vec!["--sql-inspection-callbacks", "100001"],
             vec!["--sql-inspection-callbacks", "private"],
@@ -2471,6 +2476,50 @@ fn sql_callback_budget_stops_large_ledger_before_running_without_repairing_or_cl
         if explicit {
             command.args(["--sql-inspection-callbacks", "100000"]);
         }
+        let retry = command.output().unwrap();
+        assert_eq!(retry.status.code(), Some(3));
+        assert!(retry.stdout.is_empty());
+        assert_review(&temp, true);
+        assert_eq!(saved_config_row(&temp.data()), (500, 7, 8, 10_000));
+    }
+}
+
+#[test]
+fn sql_time_budget_is_used_for_runtime_without_saving_or_clearing_manual_wait() {
+    let temp = Temp::new();
+    startup_edge_records(&temp, false);
+    let record = blob_revision(b"SQL time budget runtime record");
+    fs::write(temp.input(), record.bytes()).unwrap();
+    let mut server = Server::configured(&temp, &[
+        "--sql-inspection-timeout-ms", "30000",
+        "--sql-inspection-callbacks", "50000",
+    ]);
+    assert!(cli(&temp.data(), &temp.input()).status.success());
+    let runtime = status_cli(&temp.data());
+    assert!(runtime.status.success());
+    assert_eq!(diagnostic_field(&runtime, "session_new_records"), 1);
+    let diagnostic = evaluate_cli(&temp.data());
+    assert!(diagnostic.status.success());
+    assert_eq!(diagnostic_field(&diagnostic, "records"), 5);
+    server.signal("-TERM");
+    assert!(server.wait().success());
+    let ready = fs::read_to_string(&server.log).unwrap();
+    assert!(ready.contains("sql_inspection_timeout_ms: 30000\n"));
+    assert!(ready.contains("sql_inspection_callbacks: 50000\n"));
+    assert_eq!(saved_config_row(&temp.data()), (500, 7, 8, 10_000));
+    let mut restarted = Server::start(&temp);
+    restarted.signal("-TERM");
+    assert!(restarted.wait().success());
+    let ready = fs::read_to_string(&restarted.log).unwrap();
+    assert!(ready.contains("sql_inspection_timeout_ms: 60000\n"));
+    assert!(ready.contains("sql_inspection_callbacks: 100000\n"));
+    let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
+    assert_eq!(store.record(record.id()).unwrap().unwrap().bytes(), record.bytes());
+    drop(store.begin().unwrap());
+    for explicit in [false, true] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_lngnb"));
+        command.args(["admin", "serve", "--data-dir"]).arg(temp.data());
+        if explicit { command.args(["--sql-inspection-timeout-ms", "30000"]); }
         let retry = command.output().unwrap();
         assert_eq!(retry.status.code(), Some(3));
         assert!(retry.stdout.is_empty());
