@@ -573,7 +573,12 @@ fn invalid_runtime_options_fail_before_creating_or_changing_data() {
             vec!["--sql-inspection-timeout-ms", "60001"],
             vec!["--sql-inspection-timeout-ms", "private"],
             vec!["--sql-inspection-timeout-ms", "01"],
-            vec!["--sql-inspection-timeout-ms", "1", "--sql-inspection-timeout-ms", "2"],
+            vec![
+                "--sql-inspection-timeout-ms",
+                "1",
+                "--sql-inspection-timeout-ms",
+                "2",
+            ],
             vec!["--sql-inspection-callbacks", "0"],
             vec!["--sql-inspection-callbacks", "100001"],
             vec!["--sql-inspection-callbacks", "private"],
@@ -2490,10 +2495,15 @@ fn sql_time_budget_is_used_for_runtime_without_saving_or_clearing_manual_wait() 
     startup_edge_records(&temp, false);
     let record = blob_revision(b"SQL time budget runtime record");
     fs::write(temp.input(), record.bytes()).unwrap();
-    let mut server = Server::configured(&temp, &[
-        "--sql-inspection-timeout-ms", "30000",
-        "--sql-inspection-callbacks", "50000",
-    ]);
+    let mut server = Server::configured(
+        &temp,
+        &[
+            "--sql-inspection-timeout-ms",
+            "30000",
+            "--sql-inspection-callbacks",
+            "50000",
+        ],
+    );
     assert!(cli(&temp.data(), &temp.input()).status.success());
     let runtime = status_cli(&temp.data());
     assert!(runtime.status.success());
@@ -2514,12 +2524,19 @@ fn sql_time_budget_is_used_for_runtime_without_saving_or_clearing_manual_wait() 
     assert!(ready.contains("sql_inspection_timeout_ms: 60000\n"));
     assert!(ready.contains("sql_inspection_callbacks: 100000\n"));
     let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
-    assert_eq!(store.record(record.id()).unwrap().unwrap().bytes(), record.bytes());
+    assert_eq!(
+        store.record(record.id()).unwrap().unwrap().bytes(),
+        record.bytes()
+    );
     drop(store.begin().unwrap());
     for explicit in [false, true] {
         let mut command = Command::new(env!("CARGO_BIN_EXE_lngnb"));
-        command.args(["admin", "serve", "--data-dir"]).arg(temp.data());
-        if explicit { command.args(["--sql-inspection-timeout-ms", "30000"]); }
+        command
+            .args(["admin", "serve", "--data-dir"])
+            .arg(temp.data());
+        if explicit {
+            command.args(["--sql-inspection-timeout-ms", "30000"]);
+        }
         let retry = command.output().unwrap();
         assert_eq!(retry.status.code(), Some(3));
         assert!(retry.stdout.is_empty());

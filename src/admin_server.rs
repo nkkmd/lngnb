@@ -190,7 +190,8 @@ impl Overrides {
         limits.sql_inspection.callbacks = self
             .sql_inspection_callbacks
             .unwrap_or(limits.sql_inspection.callbacks);
-        limits.sql_inspection.elapsed = self.sql_inspection_timeout_ms
+        limits.sql_inspection.elapsed = self
+            .sql_inspection_timeout_ms
             .map(Duration::from_millis)
             .unwrap_or(limits.sql_inspection.elapsed);
         limits
@@ -374,7 +375,10 @@ mod tests {
     #[test]
     fn sql_time_budget_is_resolved_before_open_without_changing_other_limits_or_saving() {
         let defaults = Limits::default();
-        assert_eq!(Duration::from_millis(Config::default().sql_inspection_timeout_ms), defaults.sql_inspection.elapsed);
+        assert_eq!(
+            Duration::from_millis(Config::default().sql_inspection_timeout_ms),
+            defaults.sql_inspection.elapsed
+        );
         for value in [1, 30_000, 60_000] {
             let overrides = Overrides {
                 sql_inspection_timeout_ms: Some(value),
@@ -382,7 +386,9 @@ mod tests {
                 ..Overrides::default()
             };
             let limits = overrides.storage_limits();
-            let config = overrides.resolve(Some(Config::default().saved_values())).unwrap();
+            let config = overrides
+                .resolve(Some(Config::default().saved_values()))
+                .unwrap();
             assert_eq!(limits.sql_inspection.elapsed, Duration::from_millis(value));
             assert_eq!(config.sql_inspection_timeout_ms, value);
             assert_eq!(limits.sql_inspection.callbacks, 50_000);
@@ -398,9 +404,16 @@ mod tests {
             assert_eq!(config.saved_values(), Config::default().saved_values());
         }
         for value in [0, 60_001, u64::MAX] {
-            assert!(Config::default().with_sql_inspection_timeout(Some(value)).is_none());
+            assert!(
+                Config::default()
+                    .with_sql_inspection_timeout(Some(value))
+                    .is_none()
+            );
         }
-        assert_eq!(Overrides::default().storage_limits().sql_inspection.elapsed, defaults.sql_inspection.elapsed);
+        assert_eq!(
+            Overrides::default().storage_limits().sql_inspection.elapsed,
+            defaults.sql_inspection.elapsed
+        );
     }
 
     #[test]
