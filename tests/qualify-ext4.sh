@@ -77,3 +77,6 @@ cargo test --locked --offline --test record_cli startup_inspection_time_budget_ 
 
 # 起動依存入力のstep時間指定・収集完了・非保存・手動待ち維持。
 cargo test --locked --offline --test record_cli startup_record_input_time_budget_ -- --test-threads=1
+
+# 本文評価入力のstep時間指定・分割完了・非保存・手動待ち維持。
+cargo test --locked --offline --test record_cli startup_blob_input_time_budget_ -- --test-threads=1
