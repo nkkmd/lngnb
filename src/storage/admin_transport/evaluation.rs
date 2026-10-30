@@ -76,7 +76,8 @@ impl Listener {
     pub fn enable_evaluation(&mut self) -> Result<()> {
         self.enable_evaluation_with_record_limit(10_000)
     }
-    /// このendpointの全件評価予算を固定する。既定上限の引下げだけを許し、稼働中に変更しない。
+    /// endpoint作成時の全件評価予算。既定上限の引下げだけを許す。
+    /// 作成後の変更は保存確定を伴うchange_admin_configだけで行う。
     pub fn enable_evaluation_with_record_limit(&mut self, records: u64) -> Result<()> {
         if records == 0 || records > 10_000 {
             return Err(Error::Policy);

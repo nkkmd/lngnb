@@ -1,4 +1,4 @@
-//! ローカルCLIと認証済みIPCの完成署名Record保存を共通化する。
+//! ローカルCLIと受理側の完成署名Record・管理設定保存を共通化する。
 //! 局所検査・保存確定は、親評価/本文保持/pin/公開/正常停止とは別。
 use super::{
     Capacity, EvaluationLimits, PayloadStatus, RecordStore, RecordWriter, Result, StartupState,
@@ -41,6 +41,26 @@ pub fn store_record(writer: &mut RecordWriter, record: &LocalRecord) -> Result<R
         record_id: record.id(),
         inserted: writer.insert(record)?,
     })
+}
+
+/// 全4項目を明示した検査済み要求。内部型でありIPCのwire形式ではない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfigRequest(super::AdminConfig);
+impl ConfigRequest {
+    pub fn check(config: super::AdminConfig) -> Result<Self> {
+        if !config.is_valid() {
+            return Err(super::StorageError::BudgetExceeded);
+        }
+        Ok(Self(config))
+    }
+    pub fn values(self) -> super::AdminConfig {
+        self.0
+    }
+    /// 保存確定だけ。実行時への適用・正常停止・手動待ち解除は行わない。
+    pub fn save(self, writer: &mut RecordWriter) -> Result<super::AdminConfig> {
+        writer.save_admin_config(self.0)?;
+        Ok(self.0)
+    }
 }
 
 /// 排他中のローカル診断。全件の管理用評価に成功した場合だけ返す。
