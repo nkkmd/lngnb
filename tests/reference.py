@@ -9,7 +9,7 @@ import sys
 
 import cbor2
 from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 assert importlib.metadata.version("cbor2") == "5.6.5"
@@ -93,6 +93,57 @@ for case in json.load(sys.stdin):
         assert body["metadata"]["information_type"] == {"namespace": "lngnb", "code": 0}
         assert body["metadata"]["resource_type"] == "lngnb:unspecified"
         assert "origins" not in body
+    if "derived_creation" in case:
+        creation = case["derived_creation"]
+
+        def checked_record(raw_hex):
+            raw = bytes.fromhex(raw_hex)
+            record = cbor2.loads(raw)
+            assert cbor2.dumps(record, canonical=True) == raw
+            sig = record["signature"]
+            pub = sig["public_key_bytes"]
+            assert sig["algorithm"] == "ed25519"
+            assert sig["key_id"] == hashlib.sha256(DK + pub).digest()
+            Ed25519PublicKey.from_public_bytes(pub).verify(
+                sig["signature_bytes"], DS + cbor2.dumps(record["body"], canonical=True))
+            assert record["body"]["profile_id"] == "lngnb-library-core-1"
+            return record, hashlib.sha256(DR + raw).digest()
+
+        genesis, genesis_id = checked_record(creation["genesis"])
+        assert genesis["body"]["record_kind"] == "genesis"
+        assert genesis["body"]["publisher_public_key"] == public
+        assert genesis["signature"]["public_key_bytes"] == public
+        assert body["knowledge_id"] == genesis["body"]["knowledge_id"]
+        expected_origins = []
+        assert 1 <= len(creation["sources"]) <= 128
+        for source in creation["sources"]:
+            sg, sg_id = checked_record(source["genesis"])
+            sr, sr_id = checked_record(source["revision"])
+            assert sg["body"]["record_kind"] == "genesis"
+            assert sr["body"]["record_kind"] == "revision"
+            assert sg["body"]["publisher_public_key"] == sg["signature"]["public_key_bytes"]
+            assert sr["signature"]["public_key_bytes"] == sg["body"]["publisher_public_key"]
+            assert sr["body"]["knowledge_id"] == sg["body"]["knowledge_id"]
+            assert sr["body"]["genesis_record_id"] == sg_id
+            assert body["knowledge_id"] != sg["body"]["knowledge_id"]
+            expected_origins.append({"knowledge_id": sg["body"]["knowledge_id"],
+                                     "genesis_record_id": sg_id, "revision_record_id": sr_id})
+        expected_origins.sort(key=lambda ref: cbor2.dumps(ref, canonical=True))
+        assert len({cbor2.dumps(ref, canonical=True) for ref in expected_origins}) == len(expected_origins)
+        if body["record_kind"] == "revision":
+            assert body["genesis_record_id"] == genesis_id
+            assert body["parents"] == []
+            assert body["origins"] == expected_origins
+            payload = bytes.fromhex(creation["payload"])
+            assert body["payload"] == {
+                "blob_id": hashlib.sha256(b"lngnb:blob:1\0" + payload).digest(),
+                "byte_length": len(payload), "media_type": "application/octet-stream"}
+            assert body["metadata"] == {"titles": {"ja": "e\u0301 é"},
+                                        "information_type": {"namespace": "lngnb", "code": 0},
+                                        "resource_type": "lngnb:unspecified"}
+        else:
+            assert body == genesis["body"]
+            assert "origins" not in body
     digest = hashlib.sha256(DR + encoded).digest()
     ids.append("rc1_" + base64.b32encode(digest).decode("ascii").lower().rstrip("="))
 json.dump(ids, sys.stdout)
