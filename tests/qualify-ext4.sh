@@ -94,3 +94,6 @@ cargo test --locked --offline --lib storage::admin_transport::client::tests::con
 
 # 稼働中設定変更CLI・前面受理側の保存/反映/異常時保全を再実行する。
 cargo test --locked --offline --test record_cli config_change_ -- --test-threads=1
+
+# 停止中設定保存の共通管理処理・保存/正常停止失敗時の保全。
+cargo test --locked --offline --lib storage::management::tests::stopped_config_ -- --test-threads=1

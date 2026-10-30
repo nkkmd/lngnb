@@ -56,6 +56,26 @@ impl ConfigRequest {
     pub fn values(self) -> super::AdminConfig {
         self.0
     }
+    /// 停止中の正常領域で、既定予算の全起動検査・保存・正常終了までを行う。
+    /// 同じ排他を終始保持し、稼働中IPCへ切り替えない。設定値は今回の検査に適用しない。
+    /// 途中失敗では保存済みの可能性があり、正常終了や手動待ち解除を推測しない。
+    pub fn save_stopped(self, path: &std::path::Path) -> Result<super::AdminConfig> {
+        let mut startup = super::LocalStartup::open(path, super::Limits::default())?;
+        if startup.needs_review() {
+            return Err(super::StorageError::NeedsReview);
+        }
+        while !startup
+            .step(
+                EvaluationLimits::default(),
+                super::LocalStartupBudget::default(),
+            )?
+            .checks_complete()
+        {}
+        let mut writer = startup.into_writer()?;
+        let saved = self.save(&mut writer)?;
+        writer.finish()?;
+        Ok(saved)
+    }
     /// 保存確定だけ。実行時への適用・正常停止・手動待ち解除は行わない。
     pub fn save(self, writer: &mut RecordWriter) -> Result<super::AdminConfig> {
         writer.save_admin_config(self.0)?;
