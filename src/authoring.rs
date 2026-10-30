@@ -1,4 +1,4 @@
-//! A2/A3/A11: 新規資料と明示したGenesis・親からRevisionを署名する内部基盤。
+//! A2/A3/A11: 新規資料・改訂・明示した固定由来を持つ派生の署名基盤。
 //! 完成Recordだけを返す。CLI・本文I/O・永続保存・pin・公開には接続しない。
 use crate::{
     cbor::{self, Value},
@@ -185,6 +185,34 @@ pub fn create_initial(
         Id::random_knowledge().map_err(|_| CreationError::RandomUnavailable)
     })
 }
+/// 派生元として明示する局所検査済みGenesisとRevision。
+/// 全祖先・本文保持・pin・公開・原発行者の承認を表さない。
+#[derive(Clone, Copy)]
+pub struct DerivationSource<'a> {
+    pub genesis: &'a LocalRecord,
+    pub revision: &'a LocalRecord,
+}
+
+/// 明示した元版（1〜128件）の完全固定参照を付し、新Knowledgeの初版を作る。
+/// 元版の発行鍵は元Genesisと照合する。派生先の鍵との一致は要求しない。
+/// 元の親・本文・metadata・由来を継承せず、参照先を取得・保存・評価しない。
+/// この作成経路は完全固定参照だけを扱う。A2.5の短い参照の受理規則は変えない。
+pub fn create_derived(
+    key: &UnlockedKey,
+    sources: &[DerivationSource<'_>],
+    payload: &[u8],
+    metadata_input: Value,
+    media_type: Option<&str>,
+    budget: CreationBudget,
+) -> Result<InitialRecords> {
+    if sources.is_empty() {
+        return Err(CreationError::InvalidInput);
+    }
+    create_with_sources(key, sources, payload, metadata_input, media_type, budget, || {
+        Id::random_knowledge().map_err(|_| CreationError::RandomUnavailable)
+    })
+}
+
 fn create_with(
     key: &UnlockedKey,
     payload: &[u8],
@@ -193,6 +221,20 @@ fn create_with(
     budget: CreationBudget,
     knowledge: impl FnOnce() -> Result<Id>,
 ) -> Result<InitialRecords> {
+    create_with_sources(key, &[], payload, metadata_input, media_type, budget, knowledge)
+}
+fn create_with_sources(
+    key: &UnlockedKey,
+    sources: &[DerivationSource<'_>],
+    payload: &[u8],
+    metadata_input: Value,
+    media_type: Option<&str>,
+    budget: CreationBudget,
+    knowledge: impl FnOnce() -> Result<Id>,
+) -> Result<InitialRecords> {
+    if sources.len() > 128 {
+        return Err(CreationError::InvalidInput);
+    }
     if payload.len() > budget.max_payload_bytes {
         return Err(CreationError::PayloadLimit);
     }
@@ -202,8 +244,28 @@ fn create_with(
     }
     let length = i64::try_from(payload.len()).map_err(|_| CreationError::PayloadLimit)?;
     let metadata = metadata(metadata_input)?;
+    // 件数確認後、署名済みRecordを複製せず三IDだけを組み立てる。
+    let mut origins = Vec::with_capacity(sources.len());
+    for source in sources {
+        source.revision.check_genesis(source.genesis)
+            .map_err(|_| CreationError::InvalidInput)?;
+        let origin = map(vec![
+            ("knowledge_id", bytes(&source.genesis.identity().knowledge)),
+            ("genesis_record_id", bytes(&source.genesis.id().bytes)),
+            ("revision_record_id", bytes(&source.revision.id().bytes)),
+        ]);
+        let encoded = cbor::encode(&origin).map_err(|_| CreationError::InvalidInput)?;
+        origins.push((encoded, origin));
+    }
+    // A2.5は親の生ID順とは別の、参照map全体の符号化bytes順。
+    origins.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    if origins.windows(2).any(|w| w[0].0 == w[1].0) {
+        return Err(CreationError::InvalidInput);
+    }
     let knowledge = knowledge()?;
-    if knowledge.kind != Kind::Knowledge {
+    if knowledge.kind != Kind::Knowledge
+        || sources.iter().any(|s| s.genesis.identity().knowledge == knowledge.bytes)
+    {
         return Err(CreationError::InvalidInput);
     }
     let genesis = key
@@ -214,8 +276,7 @@ fn create_with(
             ("publisher_public_key", bytes(&key.public_key())),
         ]))
         .map_err(|_| CreationError::SigningFailed)?;
-    let revision = key
-        .sign_record(map(vec![
+    let mut fields = vec![
             ("profile_id", text(PROFILE)),
             ("record_kind", text("revision")),
             ("knowledge_id", bytes(&knowledge.bytes)),
@@ -230,7 +291,11 @@ fn create_with(
                 ]),
             ),
             ("metadata", metadata),
-        ]))
+    ];
+    if !origins.is_empty() {
+        fields.push(("origins", Value::Array(origins.into_iter().map(|(_, v)| v).collect())));
+    }
+    let revision = key.sign_record(map(fields))
         .map_err(|_| CreationError::InvalidInput)?;
     revision
         .check_genesis(&genesis)
@@ -986,4 +1051,165 @@ mod tests {
         let ids: Vec<String> = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(ids, vec![merged.id().to_string()]);
     }
+    fn foreign_source() -> (LocalRecord, LocalRecord) {
+        // 公開試験seedのみ。実運用への流用禁止。
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[1; 32]);
+        let genesis = LocalRecord::sign(map(vec![
+            ("profile_id", text(PROFILE)), ("record_kind", text("genesis")),
+            ("knowledge_id", bytes(&[3; 32])),
+            ("publisher_public_key", bytes(&signing.verifying_key().to_bytes())),
+        ]), &signing).unwrap();
+        let f = a13();
+        let mut body = LocalRecord::check(
+            &unhex(f["revision"]["envelope_cbor_hex"].as_str().unwrap()), None
+        ).unwrap().body().clone();
+        let Value::Map(fields) = &mut body else { unreachable!() };
+        for (name, value) in fields {
+            match name.as_str() {
+                "knowledge_id" => *value = bytes(&[3; 32]),
+                "genesis_record_id" => *value = bytes(&genesis.id().bytes),
+                // 未取得の祖先と本文は、この局所由来照合の必須依存にしない。
+                "parents" => *value = Value::Array(vec![bytes(&[9; 32])]),
+                _ => (),
+            }
+        }
+        let revision = LocalRecord::sign(body, &signing).unwrap();
+        (genesis, revision)
+    }
+    fn derive(key: &UnlockedKey, sources: &[DerivationSource<'_>]) -> InitialRecords {
+        create_derived(key, sources, b"", Value::Map(vec![]), None, CreationBudget::default()).unwrap()
+    }
+    #[test]
+    fn derived_new_knowledge_uses_own_key_and_never_inherits_source_fields() {
+        let key = key();
+        let (g, r) = foreign_source();
+        let original = (g.bytes().to_vec(), r.bytes().to_vec());
+        let source = DerivationSource { genesis: &g, revision: &r };
+        let derived = derive(&key, &[source]);
+        let again = derive(&key, &[source]);
+        assert_ne!(derived.genesis().id(), again.genesis().id());
+        assert_ne!(derived.genesis().identity().knowledge, g.identity().knowledge);
+        assert_eq!(derived.genesis().identity().public, key.public_key());
+        assert_ne!(derived.genesis().identity().public, g.identity().public);
+        derived.revision().check_genesis(derived.genesis()).unwrap();
+        assert!(derived.revision().check_genesis(&g).is_err());
+        assert!(derived.revision().parents().unwrap().is_empty());
+        let body = derived.revision().body();
+        assert_eq!(get(get(body, "payload"), "byte_length"), &Value::Int(0));
+        assert_eq!(get(get(body, "payload"), "blob_id"), &bytes(&id::blob_id(b"").bytes));
+        assert_eq!(get(get(body, "payload"), "media_type"), &text(""));
+        assert!(!contains(get(body, "metadata"), "titles"));
+        assert_eq!(get(body, "origins"), &Value::Array(vec![map(vec![
+            ("knowledge_id", bytes(&g.identity().knowledge)),
+            ("genesis_record_id", bytes(&g.id().bytes)),
+            ("revision_record_id", bytes(&r.id().bytes)),
+        ])]));
+        let next = derive(&key, &[DerivationSource {
+            genesis: derived.genesis(), revision: derived.revision(),
+        }]);
+        let Value::Array(origins) = get(next.revision().body(), "origins") else { unreachable!() };
+        assert_eq!(origins.len(), 1);
+        assert_eq!(get(&origins[0], "revision_record_id"), &bytes(&derived.revision().id().bytes));
+        let revised = revise(&key, derived.genesis(), &[derived.revision()], b"revision");
+        assert!(!contains(revised.body(), "origins"));
+        assert_eq!(g.bytes(), original.0);
+        assert_eq!(r.bytes(), original.1);
+    }
+    #[test]
+    fn derived_origin_order_is_canonical_and_does_not_change_signed_inputs() {
+        let key = key();
+        let (g, r) = foreign_source();
+        let other = create_initial(&key, b"other", Value::Map(vec![]), None, CreationBudget::default()).unwrap();
+        let a = DerivationSource { genesis: &g, revision: &r };
+        let b = DerivationSource { genesis: other.genesis(), revision: other.revision() };
+        let fixed = || Ok(Id { kind: Kind::Knowledge, bytes: [7; 32] });
+        let x = create_with_sources(&key, &[a, b], b"new", Value::Map(vec![]), None, CreationBudget::default(), fixed).unwrap();
+        let y = create_with_sources(&key, &[b, a], b"new", Value::Map(vec![]), None, CreationBudget::default(), fixed).unwrap();
+        assert_eq!(x.genesis().bytes(), y.genesis().bytes());
+        assert_eq!(x.revision().bytes(), y.revision().bytes());
+        let Value::Array(origins) = get(x.revision().body(), "origins") else { unreachable!() };
+        let encoded: Vec<_> = origins.iter().map(|v| cbor::encode(v).unwrap()).collect();
+        assert!(encoded[0] < encoded[1]);
+        assert!(!contains(other.revision().body(), "origins"));
+    }
+    #[test]
+    fn derived_rejects_empty_duplicate_wrong_kind_binding_key_and_id_collision() {
+        let key = key();
+        let (g, r) = foreign_source();
+        let initial = create_initial(&key, b"", Value::Map(vec![]), None, CreationBudget::default()).unwrap();
+        let wrong_key = key.sign_record(r.body().clone()).unwrap();
+        let mut wrong_body = r.body().clone();
+        let Value::Map(fields) = &mut wrong_body else { unreachable!() };
+        fields.iter_mut().find(|(k, _)| k == "genesis_record_id").unwrap().1 = bytes(&initial.genesis().id().bytes);
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[1; 32]);
+        let wrong_genesis = LocalRecord::sign(wrong_body, &signing).unwrap();
+        let source = DerivationSource { genesis: &g, revision: &r };
+        for sources in [
+            vec![], vec![source, source], vec![source; 129],
+            vec![DerivationSource { genesis: &r, revision: &r }],
+            vec![DerivationSource { genesis: &g, revision: &g }],
+            vec![DerivationSource { genesis: initial.genesis(), revision: &r }],
+            vec![DerivationSource { genesis: &g, revision: &wrong_key }],
+            vec![DerivationSource { genesis: &g, revision: &wrong_genesis }],
+        ] {
+            assert_eq!(create_derived(&key, &sources, b"", Value::Map(vec![]), None, CreationBudget::default()).unwrap_err(), CreationError::InvalidInput);
+        }
+        for kind in [Kind::Knowledge, Kind::Record] {
+            assert_eq!(create_with_sources(&key, &[source], b"", Value::Map(vec![]), None, CreationBudget::default(), || Ok(Id {
+                kind, bytes: g.identity().knowledge,
+            })).unwrap_err(), CreationError::InvalidInput);
+        }
+        assert_eq!(create_with_sources(&key, &[source], b"", Value::Map(vec![]), None, CreationBudget::default(), || Err(CreationError::RandomUnavailable)).unwrap_err(), CreationError::RandomUnavailable);
+        // 重複/過大/不一致は乱数生成より先に拒否する。
+        for sources in [vec![source, source], vec![source; 129], vec![DerivationSource { genesis: &g, revision: &wrong_key }]] {
+            assert_eq!(create_with_sources(&key, &sources, b"", Value::Map(vec![]), None, CreationBudget::default(), || panic!("invalid source before randomness")).unwrap_err(), CreationError::InvalidInput);
+        }
+    }
+    #[test]
+    fn derived_source_count_and_payload_metadata_media_boundaries() {
+        let key = key();
+        let initial = create_initial(&key, b"base", Value::Map(vec![]), None, CreationBudget::default()).unwrap();
+        let revisions: Vec<_> = (0..128u32).map(|n| revise(&key, initial.genesis(), &[], &n.to_be_bytes())).collect();
+        let sources: Vec<_> = revisions.iter().map(|revision| DerivationSource { genesis: initial.genesis(), revision }).collect();
+        let max = derive(&key, &sources);
+        let Value::Array(origins) = get(max.revision().body(), "origins") else { unreachable!() };
+        assert_eq!(origins.len(), 128);
+        let source = &sources[..1];
+        let budget = CreationBudget { max_payload_bytes: 2 };
+        let media = format!("a/{}", "b".repeat(253));
+        for payload in [b"".as_slice(), b"a".as_slice(), b"ab".as_slice()] {
+            create_derived(&key, source, payload, Value::Map(vec![]), Some(&media), budget).unwrap();
+        }
+        assert_eq!(create_derived(&key, source, b"abc", Value::Map(vec![]), None, budget).unwrap_err(), CreationError::PayloadLimit);
+        for meta in [Value::Null, map(vec![("titles", map(vec![("JA", text("a")), ("ja", text("b"))]))]), map(vec![("extensions", map(vec![("x", text(&"x".repeat(MAX_METADATA_BYTES)))]))])] {
+            assert_eq!(create_derived(&key, source, b"", meta, None, budget).unwrap_err(), CreationError::InvalidInput);
+        }
+        for media in [format!("{media}b"), "Text/Plain".into()] {
+            assert_eq!(create_derived(&key, source, b"", Value::Map(vec![]), Some(&media), budget).unwrap_err(), CreationError::InvalidInput);
+        }
+    }
+    #[test]
+    fn independent_python_checks_derived_origin_bindings_and_new_publisher() {
+        let key = key();
+        let (g, r) = foreign_source();
+        let f = a13();
+        let g0 = LocalRecord::check(&unhex(f["genesis"]["envelope_cbor_hex"].as_str().unwrap()), None).unwrap();
+        let r0 = LocalRecord::check(&unhex(f["revision"]["envelope_cbor_hex"].as_str().unwrap()), None).unwrap();
+        let payload = b"derived payload\x00\xff\n";
+        let sources = [DerivationSource { genesis: &g, revision: &r }, DerivationSource { genesis: &g0, revision: &r0 }];
+        let result = create_derived(&key, &sources, payload, map(vec![("titles", map(vec![("JA", text("e\u{301} é"))]))]), Some("application/octet-stream"), CreationBudget::default()).unwrap();
+        let cases: Vec<_> = [result.genesis(), result.revision()].iter().map(|record| serde_json::json!({
+            "seed": f["seed_hex"], "body": hex(&cbor::encode(record.body()).unwrap()), "envelope": hex(record.bytes()),
+            "derived_creation": { "genesis": hex(result.genesis().bytes()), "payload": hex(payload),
+                "sources": sources.iter().map(|s| serde_json::json!({"genesis": hex(s.genesis.bytes()), "revision": hex(s.revision.bytes())})).collect::<Vec<_>>() }
+        })).collect();
+        let mut child = Command::new(std::env::var_os("LNGNB_REFERENCE_PYTHON").expect("independent checker required"))
+            .arg("tests/reference.py").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        child.stdin.take().unwrap().write_all(serde_json::to_string(&cases).unwrap().as_bytes()).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "independent derivation check failed (details suppressed)");
+        let ids: Vec<String> = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(ids, vec![result.genesis().id().to_string(), result.revision().id().to_string()]);
+    }
+
 }
