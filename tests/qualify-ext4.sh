@@ -80,3 +80,7 @@ cargo test --locked --offline --test record_cli startup_record_input_time_budget
 
 # 本文評価入力のstep時間指定・分割完了・非保存・手動待ち維持。
 cargo test --locked --offline --test record_cli startup_blob_input_time_budget_ -- --test-threads=1
+
+# 親評価のstep期限不足/進捗保全とCLIの時間指定・非保存・手動待ち維持。
+cargo test --locked --offline --lib storage::startup::tests::parent_evaluation_deadline_preserves_checkpoints_and_other_phases -- --exact --test-threads=1
+cargo test --locked --offline --test record_cli startup_parent_time_budget_ -- --test-threads=1
