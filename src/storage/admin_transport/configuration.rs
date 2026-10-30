@@ -152,7 +152,11 @@ mod tests {
         assert_eq!(writer.store.limits.session_records, 10_000);
         assert_eq!(logical_snapshot(&writer.store.conn), before);
         assert!(writer.failed);
-        writer.store.conn.execute_batch("DROP TRIGGER reject_config").unwrap();
+        writer
+            .store
+            .conn
+            .execute_batch("DROP TRIGGER reject_config")
+            .unwrap();
         assert_eq!(
             listener.change_admin_config(ConfigRequest::check(values()).unwrap()),
             Err(Error::SessionFailed)

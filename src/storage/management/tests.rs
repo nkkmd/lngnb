@@ -257,7 +257,10 @@ fn checked_config_save_is_shared_without_applying_session_values_or_clearing_man
     }
     let counters = (writer.records, writer.bytes);
     assert_eq!(
-        ConfigRequest::check(config).unwrap().save(&mut writer).unwrap(),
+        ConfigRequest::check(config)
+            .unwrap()
+            .save(&mut writer)
+            .unwrap(),
         config
     );
     assert_eq!((writer.records, writer.bytes), counters);
