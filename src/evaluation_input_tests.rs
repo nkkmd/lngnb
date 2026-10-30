@@ -507,10 +507,25 @@ fn per_job_and_total_limits_do_not_erase_committed_input_progress() {
         [], |r| r.get(0),
     ).unwrap();
     for (limits, work) in [
-        (l, EvaluationInputBudget { elapsed: Duration::ZERO, ..d }),
-        (EvaluationLimits { elapsed: Duration::ZERO, ..l }, d),
+        (
+            l,
+            EvaluationInputBudget {
+                elapsed: Duration::ZERO,
+                ..d
+            },
+        ),
+        (
+            EvaluationLimits {
+                elapsed: Duration::ZERO,
+                ..l
+            },
+            d,
+        ),
     ] {
-        assert!(matches!(job.prepare(limits, work), Err(StorageError::BudgetExceeded)));
+        assert!(matches!(
+            job.prepare(limits, work),
+            Err(StorageError::BudgetExceeded)
+        ));
         let after: String = job.writer.store.conn.query_row(
             "SELECT quote(cursor)||':'||records||':'||bytes||':'||edges||':'||complete||':'||quote(digest)||':'||checkpoint_generation FROM evaluation_input",
             [], |r| r.get(0),
