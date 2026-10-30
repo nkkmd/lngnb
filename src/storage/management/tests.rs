@@ -309,7 +309,10 @@ fn stopped_config_checks_all_records_before_saving_without_applying_new_limits()
     assert_eq!(store.startup_state().unwrap(), StartupState::Clean);
     assert_eq!(store.saved_admin_config().unwrap(), Some(config));
     // 今回の全検査には、新しい件数1を適用しない。2件を検査・評価してから保存する。
-    assert_eq!(store.diagnose(EvaluationLimits::default()).unwrap().records, 2);
+    assert_eq!(
+        store.diagnose(EvaluationLimits::default()).unwrap().records,
+        2
+    );
     let records: i64 = store.conn.query_row(
         "SELECT count(*) FROM history WHERE new_state='evaluation_input_complete' AND reason LIKE 'evaluation_input_checkpoint:epoch=%:records=2:bytes=%'",
         [], |r| r.get(0)).unwrap();
