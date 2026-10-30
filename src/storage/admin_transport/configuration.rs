@@ -1,5 +1,5 @@
 //! R24/R27/R28/R30: 同じwriter中で設定を保存し、成功後だけ次操作へ適用する内部基盤。
-//! 専用IPCと内部clientを提供する。製品CLIからの起動・呼出しはまだ接続しない。
+//! 専用IPCとclientを提供し、前面受理側と明示的な稼働中変更CLIから使用する。
 use super::*;
 use crate::storage::{AdminConfig, management::ConfigRequest};
 

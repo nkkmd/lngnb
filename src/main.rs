@@ -30,6 +30,7 @@ const HELP: &str = "lngnb — 分散図書館・知識基盤（開発初期段�
   lngnb admin evaluate --data-dir PATH
   lngnb admin config-show --data-dir PATH
   lngnb admin config-save --data-dir PATH --request-timeout-ms N --max-new-records N --max-diagnostic-records N --startup-records-per-step N
+  lngnb admin config-change --data-dir PATH --request-timeout-ms N --max-new-records N --max-diagnostic-records N --startup-records-per-step N
   lngnb admin serve --data-dir PATH [--request-timeout-ms N] [--max-new-records N] [--max-diagnostic-records N] [--startup-records-per-step N] [--startup-record-bytes-per-step N] [--startup-blob-bytes-per-step N] [--startup-blob-targets-per-step N] [--startup-record-edges-per-step N] [--startup-evaluation-records-per-step N] [--sql-inspection-callbacks N] [--sql-inspection-timeout-ms N] [--startup-inspection-timeout-ms N] [--startup-record-input-timeout-ms N] [--startup-blob-input-timeout-ms N] [--startup-evaluation-timeout-ms N]
   lngnb record submit --data-dir PATH --record PATH
   lngnb document create --data-dir PATH --key-dir PATH --name NAME --expect-key-id KEY_ID --payload PATH --metadata PATH [--media-type TYPE] [--max-payload-bytes N]
@@ -104,6 +105,8 @@ admin config-show は停止中の保存値だけを照合・表示します。�
 admin config-save は停止中の正常領域へ4項目すべてを明示保存します。保存値は次のadmin serveで読み込みます。
 保存失敗・正常停止未確認は終了3、保存/正常停止後の出力失敗は1です。
 稼働中は排他競合で拒否し、IPCへ切り替えません。手動待ち・既存不正設定を自動解除・補完しません。
+admin config-change は稼働中の専用socketへ4項目すべてを明示して保存・次操作へ反映します。起動分割件数は次回起動用です。
+送信前の失敗は終了1、送信開始後の確定不明は3、保存/適用確認後の出力失敗は1です。自動再送・直接DB保存・旧endpoint接続はしません。
 全管理状態・製品リレー起動は未実装です。
 改訂・派生・pin・公開・リレー起動・復旧確認CLIは未実装です。
 ";

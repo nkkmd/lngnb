@@ -91,3 +91,6 @@ cargo test --locked --offline --lib storage::admin_transport::configuration::tes
 
 # 設定専用IPCの固定形式/保全/応答喪失とclientの非降格。
 cargo test --locked --offline --lib storage::admin_transport::client::tests::config_client_never_falls_back_or_confirms_mismatched_and_lost_responses -- --exact --test-threads=1
+
+# 稼働中設定変更CLI・前面受理側の保存/反映/異常時保全を再実行する。
+cargo test --locked --offline --test record_cli config_change_ -- --test-threads=1

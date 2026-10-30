@@ -1,7 +1,7 @@
 //! 前面の管理受理側。公開HTTP・秘密鍵・自動復旧を扱わない。
 use lngnb::storage::{
     EvaluationLimits, Limits, LocalStartup, LocalStartupBudget,
-    admin_transport::{Error as TransportError, Listener},
+    admin_transport::{ConfigError, Error as TransportError, Listener},
 };
 use std::{
     fmt,
@@ -283,10 +283,11 @@ pub enum Error {
     Signal,
     Unconfirmed,
     StoppedOutput,
+    ConfigResponseLost,
 }
 impl Error {
     pub fn exit_code(&self) -> u8 {
-        if matches!(self, Self::Unconfirmed) {
+        if matches!(self, Self::Unconfirmed | Self::ConfigResponseLost) {
             3
         } else {
             1
@@ -296,6 +297,7 @@ impl Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
+            Self::ConfigResponseLost => "設定の保存・次操作への適用後、応答に失敗したため保全停止しました。領域と残存socketを保全し、再送せず確認してください。正常停止・復旧完了とは扱いません。",
             Self::Signal => "終了signalの設定に失敗しました。受理側を起動していません。",
             Self::Unconfirmed => "管理受理側の正常終了を確認できません。保存済み・未確定の可能性があります。領域と残っているsocketを保全し、再送・再初期化・socket削除を繰り返さず確認してください。正常停止・復旧完了とは扱いません。",
             Self::StoppedOutput => "管理受理側の受付停止・ローカル保存sessionの正常終了後、結果出力に失敗しました。公開・復旧完了の判定ではありません。",
@@ -371,6 +373,9 @@ fn serve(
     listener
         .enable_evaluation_with_record_limit(config.max_diagnostic_records)
         .map_err(|_| Error::Unconfirmed)?;
+    listener
+        .enable_configuration()
+        .map_err(|_| Error::Unconfirmed)?;
     let ready = format!(
         "管理受理側のローカル起動検査を完了し、管理socketを開きました。公開・復旧完了の判定ではありません。\nrequest_timeout_ms: {}\nmax_new_records: {}\nmax_diagnostic_records: {}\nstartup_records_per_step: {}\nstartup_record_bytes_per_step: {}\nstartup_blob_bytes_per_step: {}\nstartup_blob_targets_per_step: {}\nstartup_record_edges_per_step: {}\nstartup_evaluation_records_per_step: {}\nsql_inspection_callbacks: {}\nsql_inspection_timeout_ms: {}\nstartup_inspection_timeout_ms: {}\nstartup_record_input_timeout_ms: {}\nstartup_blob_input_timeout_ms: {}\nstartup_evaluation_timeout_ms: {}\n起動引数・保存値・既定値の順で選んだ設定を適用しました。起動引数は保存していません。Record/Blobのbyte予算・Blob対象数・Record辺数・親評価件数・局所/物理検査・依存/本文評価入力・親評価のstep時間予算はこの起動だけの指定で、保存対象外です。SQL照合callback/時間予算は起動後の保存sessionにも適用し、保存対象外です。\n",
         config.timeout_ms,
@@ -403,6 +408,15 @@ fn serve(
         listener
             .serve_evaluation_if_pending()
             .map_err(|_| Error::Unconfirmed)?;
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        listener
+            .serve_configuration_if_pending()
+            .map_err(|error| match error {
+                ConfigError::ResponseLost(_) => Error::ConfigResponseLost,
+                ConfigError::Transport(_) => Error::Unconfirmed,
+            })?;
         if stop.load(Ordering::SeqCst) {
             break;
         }
