@@ -168,6 +168,38 @@ fn multiple_targets_resume_under_a_smaller_byte_budget_and_parent_steps_do_not_r
         assert_eq!((p.checked_targets, p.total_targets), (n, 5));
         assert_eq!(p.checks_complete, n == 5);
         assert!(!p.storage_fault);
+        if n == 1 {
+            let before = crate::storage::tests::logical_snapshot(&job.writer.store.conn);
+            let hashes = HASHES.with(|v| v.get());
+            let limits = EvaluationLimits::default();
+            let work = EvaluationBlobBudget::default();
+            for (limits, work) in [
+                (
+                    limits,
+                    EvaluationBlobBudget {
+                        elapsed: Duration::ZERO,
+                        ..work
+                    },
+                ),
+                (
+                    EvaluationLimits {
+                        elapsed: Duration::ZERO,
+                        ..limits
+                    },
+                    work,
+                ),
+            ] {
+                assert!(matches!(
+                    job.prepare_blobs(limits, work),
+                    Err(StorageError::BudgetExceeded)
+                ));
+                assert_eq!(
+                    crate::storage::tests::logical_snapshot(&job.writer.store.conn),
+                    before
+                );
+                assert_eq!(HASHES.with(|v| v.get()), hashes);
+            }
+        }
         if !p.checks_complete {
             assert!(matches!(
                 job.step(EvaluationLimits::default(), EvaluationStepBudget::default()),
