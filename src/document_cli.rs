@@ -222,7 +222,7 @@ pub fn run(command: Command, output: &mut impl Write) -> Result<(), Error> {
     }
     signals.check_cancelled().map_err(Error::Input)?;
     let (payload, metadata) = input.into_parts();
-    let (genesis, revision, is_initial) = if let Some((genesis, parents)) = selected {
+    let (genesis, revision, is_initial, parent_ids) = if let Some((genesis, parents)) = selected {
         let refs: Vec<_> = parents.iter().collect();
         let revision = authoring::create_revision(
             &key,
@@ -234,13 +234,18 @@ pub fn run(command: Command, output: &mut impl Write) -> Result<(), Error> {
             budget,
         )
         .map_err(Error::Creation)?;
-        (genesis, revision, false)
+        (
+            genesis,
+            revision,
+            false,
+            parents.iter().map(LocalRecord::id).collect::<Vec<_>>(),
+        )
     } else {
         let pair =
             authoring::create_initial(&key, &payload, metadata, command.media.as_deref(), budget)
                 .map_err(Error::Creation)?;
         let (genesis, revision) = pair.into_parts();
-        (genesis, revision, true)
+        (genesis, revision, true, vec![])
     };
     drop(key);
     drop(terminal);
@@ -255,6 +260,7 @@ pub fn run(command: Command, output: &mut impl Write) -> Result<(), Error> {
         &payload,
         command.max_payload,
         is_initial,
+        &parent_ids,
     )?;
     report(&text, output)
 }
@@ -299,6 +305,7 @@ fn save(
     payload: &[u8],
     max_payload: usize,
     is_initial: bool,
+    parent_ids: &[Id],
 ) -> Result<(), Error> {
     let limits = Limits {
         max_blob_bytes: max_payload as u64,
@@ -326,16 +333,7 @@ fn save(
     }
     let mut writer = startup.into_writer()?;
     if !is_initial {
-        for id in std::iter::once(genesis.id()).chain(
-            revision
-                .parents()
-                .map_err(|_| StorageError::Corrupt)?
-                .into_iter()
-                .map(|bytes| Id {
-                    kind: Kind::Record,
-                    bytes,
-                }),
-        ) {
+        for id in std::iter::once(genesis.id()).chain(parent_ids.iter().copied()) {
             if writer.record(id)?.is_none() {
                 return Err(Error::SelectionMissing);
             }
