@@ -31,6 +31,7 @@ pub struct Config {
     startup_inspection_timeout_ms: u64,
     startup_record_input_timeout_ms: u64,
     startup_blob_input_timeout_ms: u64,
+    startup_evaluation_timeout_ms: u64,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -49,6 +50,7 @@ impl Default for Config {
             startup_inspection_timeout_ms: 60_000,
             startup_record_input_timeout_ms: 60_000,
             startup_blob_input_timeout_ms: 60_000,
+            startup_evaluation_timeout_ms: 60_000,
         }
     }
 }
@@ -87,6 +89,7 @@ impl Config {
             startup_inspection_timeout_ms: defaults.startup_inspection_timeout_ms,
             startup_record_input_timeout_ms: defaults.startup_record_input_timeout_ms,
             startup_blob_input_timeout_ms: defaults.startup_blob_input_timeout_ms,
+            startup_evaluation_timeout_ms: defaults.startup_evaluation_timeout_ms,
         })
     }
     pub fn with_diagnostic_records(mut self, value: Option<u64>) -> Option<Self> {
@@ -185,6 +188,14 @@ impl Config {
         self.startup_blob_input_timeout_ms = value;
         Some(self)
     }
+    pub fn with_startup_evaluation_timeout(mut self, value: Option<u64>) -> Option<Self> {
+        let value = value.unwrap_or(self.startup_evaluation_timeout_ms);
+        if value == 0 || value > 60_000 {
+            return None;
+        }
+        self.startup_evaluation_timeout_ms = value;
+        Some(self)
+    }
     fn startup_budget(self) -> LocalStartupBudget {
         let mut budget = LocalStartupBudget::default();
         budget.inspection.elapsed = Duration::from_millis(self.startup_inspection_timeout_ms);
@@ -200,6 +211,7 @@ impl Config {
         budget.blobs.elapsed = Duration::from_millis(self.startup_blob_input_timeout_ms);
         budget.records.edges = self.startup_record_edges_per_step;
         budget.evaluation.nodes = self.startup_evaluation_records_per_step;
+        budget.evaluation_elapsed = Some(Duration::from_millis(self.startup_evaluation_timeout_ms));
         budget
     }
 }
@@ -221,6 +233,7 @@ pub struct Overrides {
     pub startup_inspection_timeout_ms: Option<u64>,
     pub startup_record_input_timeout_ms: Option<u64>,
     pub startup_blob_input_timeout_ms: Option<u64>,
+    pub startup_evaluation_timeout_ms: Option<u64>,
 }
 impl Overrides {
     // 設定読込み前から同じ接続/排他/保存sessionへ渡す。writer取得時に戻さない。
@@ -260,7 +273,8 @@ impl Overrides {
         .with_sql_inspection_timeout(self.sql_inspection_timeout_ms)?
         .with_startup_inspection_timeout(self.startup_inspection_timeout_ms)?
         .with_startup_record_input_timeout(self.startup_record_input_timeout_ms)?
-        .with_startup_blob_input_timeout(self.startup_blob_input_timeout_ms)
+        .with_startup_blob_input_timeout(self.startup_blob_input_timeout_ms)?
+        .with_startup_evaluation_timeout(self.startup_evaluation_timeout_ms)
     }
 }
 
@@ -358,7 +372,7 @@ fn serve(
         .enable_evaluation_with_record_limit(config.max_diagnostic_records)
         .map_err(|_| Error::Unconfirmed)?;
     let ready = format!(
-        "管理受理側のローカル起動検査を完了し、管理socketを開きました。公開・復旧完了の判定ではありません。\nrequest_timeout_ms: {}\nmax_new_records: {}\nmax_diagnostic_records: {}\nstartup_records_per_step: {}\nstartup_record_bytes_per_step: {}\nstartup_blob_bytes_per_step: {}\nstartup_blob_targets_per_step: {}\nstartup_record_edges_per_step: {}\nstartup_evaluation_records_per_step: {}\nsql_inspection_callbacks: {}\nsql_inspection_timeout_ms: {}\nstartup_inspection_timeout_ms: {}\nstartup_record_input_timeout_ms: {}\nstartup_blob_input_timeout_ms: {}\n起動引数・保存値・既定値の順で選んだ設定を適用しました。起動引数は保存していません。Record/Blobのbyte予算・Blob対象数・Record辺数・親評価件数・局所/物理検査・依存/本文評価入力のstep時間予算はこの起動だけの指定で、保存対象外です。SQL照合callback/時間予算は起動後の保存sessionにも適用し、保存対象外です。\n",
+        "管理受理側のローカル起動検査を完了し、管理socketを開きました。公開・復旧完了の判定ではありません。\nrequest_timeout_ms: {}\nmax_new_records: {}\nmax_diagnostic_records: {}\nstartup_records_per_step: {}\nstartup_record_bytes_per_step: {}\nstartup_blob_bytes_per_step: {}\nstartup_blob_targets_per_step: {}\nstartup_record_edges_per_step: {}\nstartup_evaluation_records_per_step: {}\nsql_inspection_callbacks: {}\nsql_inspection_timeout_ms: {}\nstartup_inspection_timeout_ms: {}\nstartup_record_input_timeout_ms: {}\nstartup_blob_input_timeout_ms: {}\nstartup_evaluation_timeout_ms: {}\n起動引数・保存値・既定値の順で選んだ設定を適用しました。起動引数は保存していません。Record/Blobのbyte予算・Blob対象数・Record辺数・親評価件数・局所/物理検査・依存/本文評価入力・親評価のstep時間予算はこの起動だけの指定で、保存対象外です。SQL照合callback/時間予算は起動後の保存sessionにも適用し、保存対象外です。\n",
         config.timeout_ms,
         config.max_new_records,
         config.max_diagnostic_records,
@@ -372,7 +386,8 @@ fn serve(
         config.sql_inspection_timeout_ms,
         config.startup_inspection_timeout_ms,
         config.startup_record_input_timeout_ms,
-        config.startup_blob_input_timeout_ms
+        config.startup_blob_input_timeout_ms,
+        config.startup_evaluation_timeout_ms
     );
     output
         .write_all(ready.as_bytes())
@@ -416,6 +431,57 @@ fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_evaluation_time_is_scoped_to_parent_evaluation() {
+        let defaults = LocalStartupBudget::default();
+        assert!(defaults.evaluation_elapsed.is_none());
+        assert_eq!(
+            Config::default().startup_budget().evaluation_elapsed,
+            Some(EvaluationLimits::default().elapsed)
+        );
+        for value in [1, 30_000, 60_000] {
+            let overrides = Overrides {
+                startup_evaluation_timeout_ms: Some(value),
+                ..Overrides::default()
+            };
+            let config = overrides
+                .resolve(Some(Config::default().saved_values()))
+                .unwrap();
+            let budget = config.startup_budget();
+            assert_eq!(config.startup_evaluation_timeout_ms, value);
+            assert_eq!(
+                budget.evaluation_elapsed,
+                Some(Duration::from_millis(value))
+            );
+            assert_eq!(budget.blobs.elapsed, defaults.blobs.elapsed);
+            assert_eq!(budget.records.elapsed, defaults.records.elapsed);
+            assert_eq!(budget.inspection.elapsed, defaults.inspection.elapsed);
+            assert_eq!(budget.inspection.records, defaults.inspection.records);
+            assert_eq!(budget.inspection.bytes, defaults.inspection.bytes);
+            assert_eq!(budget.inspection.blob_files, defaults.inspection.blob_files);
+            assert_eq!(budget.inspection.blob_bytes, defaults.inspection.blob_bytes);
+            assert_eq!(budget.evaluation.nodes, defaults.evaluation.nodes);
+            let limits = overrides.storage_limits();
+            let expected = Limits::default();
+            assert_eq!(
+                limits.sql_inspection.elapsed,
+                expected.sql_inspection.elapsed
+            );
+            assert_eq!(
+                limits.sql_inspection.callbacks,
+                expected.sql_inspection.callbacks
+            );
+            assert_eq!(config.saved_values(), Config::default().saved_values());
+        }
+        for value in [0, 60_001, u64::MAX] {
+            assert!(
+                Config::default()
+                    .with_startup_evaluation_timeout(Some(value))
+                    .is_none()
+            );
+        }
+    }
 
     #[test]
     fn startup_blob_input_time_only_tightens_payload_preparation() {

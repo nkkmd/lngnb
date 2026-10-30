@@ -820,6 +820,7 @@ fn split_startup(t: &Temp) -> (LocalStartup, EvaluationSnapshot) {
             ..EvaluationBlobBudget::default()
         },
         evaluation: EvaluationStepBudget { nodes: 1 },
+        evaluation_elapsed: None,
     };
     for _ in 0..100 {
         if let LocalStartupProgress::Evaluation(p) =

@@ -97,7 +97,7 @@ cargo build --locked --offline --release
 ./target/release/lngnb admin serve --data-dir /path/to/existing-data
 ```
 
-既存の正常停止領域を明示します。同じ排他のまま分割起動検査・保存Record/Blob照合・管理用親評価を完了してからsocketを開きます。起動中も一般配信はありません。手動確認待ち・未完了検査・予算不足・既存socket名を成功にせず、socketの自動採用・削除、初期化、復旧解除はしません。親評価の時間予算の変更はまだ提供しません。Record検査の分割件数は次のoptionで指定できます。
+既存の正常停止領域を明示します。同じ排他のまま分割起動検査・保存Record/Blob照合・管理用親評価を完了してからsocketを開きます。起動中も一般配信はありません。手動確認待ち・未完了検査・予算不足・既存socket名を成功にせず、socketの自動採用・削除、初期化、復旧解除はしません。段階ごとの予算は次のoptionで指定できます。Record検査の分割件数は次のoptionで指定できます。
 
 この起動の受理側予算を明示できます。
 
@@ -144,6 +144,10 @@ byte予算と併用して同じ排他/台帳で全対象を検査し、全段階
 `--startup-blob-input-timeout-ms`は、本文評価入力の各stepの時間予算（1〜60,000 ms、既定60,000）です。`EvaluationBlobBudget.elapsed`へ渡し、`EvaluationLimits.elapsed`との短い方を使います。収集済みRecord入力・既知根拠・保存済み本文検査台帳の照合、参照一覧生成/stat確認、新しい対象の全体hash検査、保存前の根拠/実体照合を含みます。時間予算はhashだけの期限ではなく、対象数/byte予算による正常な未完了stepだけを同じ排他と台帳で継続します。期限不足では以前の確定進捗を保全し、受付前に終了3で停止します。
 
 物理Blob起動検査や親評価（依存順序構築を含む）、起動全体の累積期限ではありません。段階前後の共通file状態照合やOS I/O・一Blobのhash・保存を強制中断する実時間保証、SQL監視/handler追加はありません。保存4項目・他予算・候補表示は維持します。全検査/socket準備後に`startup_blob_input_timeout_ms`を表示し、正常再起動の省略時は60,000へ戻ります。他操作/不正/重複指定は接触前終了2、失敗後の変更/省略で手動待ちを解除しません。
+
+`--startup-evaluation-timeout-ms`は、親評価の各stepの時間予算（1〜60,000 ms、既定60,000）です。保存済み評価台帳・入力cacheの照合、依存順序構築、新しいRecord判定、結果符号化・保存前の根拠照合を含み、新規判定だけの期限ではありません。起動の親評価段階だけで`EvaluationLimits.elapsed`との短い方を使い、局所/物理検査・依存入力・本文評価入力、保存sessionのSQL予算、稼働中診断/受付予算は変更しません。
+
+件数による正常な未完了stepは同じ排他/台帳で続けます。期限不足は受付前に終了3で保全停止し、以前の確定checkpointと一次データを維持します。起動全体の累積期限や、段階前後の共通file状態照合・OS I/O・一件の判定・保存を強制中断する実時間保証ではありません。新しいSQL監視/handlerや保存対象は追加しません。全検査/socket準備後に`startup_evaluation_timeout_ms`を表示し、正常再起動の省略時は60,000へ戻ります。不正/重複/他操作指定は接触前終了2、設定変更/省略で手動待ちは解除しません。
 
 `--sql-inspection-callbacks`は、既存のSQL読取り照合群ごとの進捗callback上限（1〜100,000、既定100,000）です。SQLiteが概ね1,000 VM命令ごとに呼ぶcallbackを数えます。正確な命令数・行数・実時間の上限ではなく、短いSQLではcallbackが来ない場合もあります。全SQLを監視する設定ではなく、保存・commit・rollbackへ中断handlerを追加しません。このcallback指定ではSQL時間予算やOSのI/O待ち、Record/Blob/親評価等の処理予算は変えません。
 

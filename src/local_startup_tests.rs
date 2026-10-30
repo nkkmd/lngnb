@@ -89,6 +89,7 @@ fn split() -> LocalStartupBudget {
             ..EvaluationBlobBudget::default()
         },
         evaluation: EvaluationStepBudget { nodes: 1 },
+        evaluation_elapsed: None,
     }
 }
 fn drive(s: &mut LocalStartup) -> EvaluationSnapshot {
@@ -557,4 +558,80 @@ fn completed_manual_startup_connects_to_explicit_recovery_without_auto_unlock() 
             .unwrap(),
         1
     );
+}
+
+#[test]
+fn parent_evaluation_deadline_preserves_checkpoints_and_other_phases() {
+    for clean in [true, false] {
+        let t = Temp::new();
+        let records = populate(&t, false, clean);
+        let mut startup = open(&t);
+        let expired = LocalStartupBudget {
+            evaluation_elapsed: Some(std::time::Duration::ZERO),
+            ..split()
+        };
+        // 親評価の期限0でも、その前の三段階は通常予算のまま全件検査する。
+        for _ in 0..200 {
+            if matches!(
+                startup.stage.as_ref(),
+                Some(Stage::Evaluation(_, Phase::Evaluation))
+            ) {
+                break;
+            }
+            let progress = startup.step(EvaluationLimits::default(), expired).unwrap();
+            assert!(!progress.checks_complete());
+        }
+        assert!(matches!(
+            startup.stage.as_ref(),
+            Some(Stage::Evaluation(_, Phase::Evaluation))
+        ));
+        assert!(RecordStore::open(&t.data(), Limits::default()).is_err());
+        let defaults = EvaluationLimits::default();
+        for checkpoint in 0..2 {
+            let before = crate::storage::tests::logical_snapshot(&raw(&t));
+            for (limits, budget) in [
+                (defaults, expired),
+                (
+                    EvaluationLimits {
+                        elapsed: std::time::Duration::ZERO,
+                        ..defaults
+                    },
+                    split(),
+                ),
+            ] {
+                assert!(matches!(
+                    startup.step(limits, budget),
+                    Err(StorageError::BudgetExceeded)
+                ));
+                assert_eq!(crate::storage::tests::logical_snapshot(&raw(&t)), before);
+                assert_eq!(startup.needs_review(), !clean);
+                assert_eq!(raw_state(&t), StartupState::NeedsReview);
+            }
+            if checkpoint == 0 {
+                let progress = startup.step(defaults, split()).unwrap();
+                assert!(matches!(
+                    progress,
+                    LocalStartupProgress::Evaluation(p) if p.processed == 1 && !p.processed_complete
+                ));
+            }
+        }
+        drive(&mut startup);
+        if clean {
+            startup.into_writer().unwrap().finish().unwrap();
+        } else {
+            assert!(matches!(
+                startup.into_writer(),
+                Err(StorageError::NeedsReview)
+            ));
+        }
+        let store = store(&t);
+        assert_eq!(store.startup_state().unwrap() == StartupState::Clean, clean);
+        for record in records {
+            assert_eq!(
+                store.record(record.id()).unwrap().unwrap().bytes(),
+                record.bytes()
+            );
+        }
+        assert_eq!(std::fs::read(path(&t)).unwrap(), bytes());
+    }
 }

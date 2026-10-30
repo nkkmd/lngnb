@@ -8,6 +8,8 @@ pub struct LocalStartupBudget {
     pub records: EvaluationInputBudget,
     pub blobs: EvaluationBlobBudget,
     pub evaluation: EvaluationStepBudget,
+    /// 親評価stepの準備から保存前照合まで。未指定なら呼出し元のEvaluationLimitsを維持。
+    pub evaluation_elapsed: Option<std::time::Duration>,
 }
 #[derive(Debug)]
 pub enum LocalStartupProgress {
@@ -182,6 +184,13 @@ impl LocalStartup {
                         LocalStartupProgress::Blobs(p)
                     }
                     Phase::Evaluation => {
+                        let limits = EvaluationLimits {
+                            elapsed: budget
+                                .evaluation_elapsed
+                                .map(|elapsed| limits.elapsed.min(elapsed))
+                                .unwrap_or(limits.elapsed),
+                            ..limits
+                        };
                         LocalStartupProgress::Evaluation(job.step(limits, budget.evaluation)?)
                     }
                 };

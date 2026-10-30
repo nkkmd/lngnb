@@ -53,6 +53,7 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
     let mut startup_inspection_timeout_ms = None;
     let mut startup_record_input_timeout_ms = None;
     let mut startup_blob_input_timeout_ms = None;
+    let mut startup_evaluation_timeout_ms = None;
     for pair in rest.chunks(2) {
         let [option, value] = pair else {
             return Err(usage());
@@ -133,6 +134,11 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
             {
                 startup_blob_input_timeout_ms = Some(number(value).ok_or_else(usage)?);
             }
+            Some("--startup-evaluation-timeout-ms")
+                if action == "serve" && startup_evaluation_timeout_ms.is_none() =>
+            {
+                startup_evaluation_timeout_ms = Some(number(value).ok_or_else(usage)?);
+            }
             _ => return Err(usage()),
         }
     }
@@ -166,6 +172,7 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
             .and_then(|c| c.with_startup_inspection_timeout(startup_inspection_timeout_ms))
             .and_then(|c| c.with_startup_record_input_timeout(startup_record_input_timeout_ms))
             .and_then(|c| c.with_startup_blob_input_timeout(startup_blob_input_timeout_ms))
+            .and_then(|c| c.with_startup_evaluation_timeout(startup_evaluation_timeout_ms))
             .ok_or_else(usage)?;
         if action == "config-save" {
             Action::SaveConfig(config)
@@ -185,6 +192,7 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
                 startup_inspection_timeout_ms,
                 startup_record_input_timeout_ms,
                 startup_blob_input_timeout_ms,
+                startup_evaluation_timeout_ms,
             })
         }
     };
@@ -479,6 +487,8 @@ mod tests {
             "25000",
             "--startup-blob-input-timeout-ms",
             "15000",
+            "--startup-evaluation-timeout-ms",
+            "35000",
         ]
         .map(Into::into)
         .to_vec();
@@ -501,6 +511,7 @@ mod tests {
                 startup_inspection_timeout_ms: Some(20_000),
                 startup_record_input_timeout_ms: Some(25_000),
                 startup_blob_input_timeout_ms: Some(15_000),
+                startup_evaluation_timeout_ms: Some(35_000),
             })
         );
         for (option, max) in [
@@ -518,6 +529,7 @@ mod tests {
             ("--startup-inspection-timeout-ms", "60001"),
             ("--startup-record-input-timeout-ms", "60001"),
             ("--startup-blob-input-timeout-ms", "60001"),
+            ("--startup-evaluation-timeout-ms", "60001"),
         ] {
             for bad in [
                 "0",
@@ -774,6 +786,9 @@ mod config_tests {
         assert_eq!(parse(&extra).unwrap_err().exit_code(), 2);
         let mut extra = good.clone();
         extra.extend(["--startup-blob-input-timeout-ms".into(), "1".into()]);
+        assert_eq!(parse(&extra).unwrap_err().exit_code(), 2);
+        let mut extra = good.clone();
+        extra.extend(["--startup-evaluation-timeout-ms".into(), "1".into()]);
         assert_eq!(parse(&extra).unwrap_err().exit_code(), 2);
         for option in [3, 5, 7, 9] {
             let mut missing = good.clone();
