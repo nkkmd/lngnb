@@ -166,16 +166,38 @@ fn bounded(
 /// 完成Recordの通常fileを既存と同じNOFOLLOW/単一link/変更照合で読む。
 /// 最大2 MiB。署名・構造は呼出し側でLocalRecord.checkを行う。
 pub fn read_record_file(path: &Path) -> Result<Vec<u8>> {
+    read_record_file_limited(path, cbor::MAX_RECORD, || false)
+}
+
+/// 一Recordの規範上限と呼出し側の残り入力予算の小さい方で読む。
+/// 予算不足はRecordLimit。構造・署名不正を意味しない。
+pub fn read_record_file_limited(
+    path: &Path,
+    remaining: usize,
+    mut cancelled: impl FnMut() -> bool,
+) -> Result<Vec<u8>> {
+    if cancelled() {
+        return Err(InputError::Cancelled);
+    }
     let mut file = open_regular(path)?;
     let before = file.metadata().map_err(|_| InputError::Io)?;
     let bytes = bounded(
         &mut file,
         before.len(),
-        cbor::MAX_RECORD,
+        remaining.min(cbor::MAX_RECORD),
         InputError::RecordLimit,
-        &mut |_| Ok(()),
+        &mut |_| {
+            if cancelled() {
+                Err(InputError::Cancelled)
+            } else {
+                Ok(())
+            }
+        },
     )?;
     unchanged(&file, &before)?;
+    if cancelled() {
+        return Err(InputError::Cancelled);
+    }
     Ok(bytes)
 }
 
@@ -287,6 +309,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn record_remaining_budget_and_cancellation_preserve_input() {
+        let t = Temp::new();
+        let path = t.file("record", b"abc");
+        for n in [0, 2] {
+            assert_eq!(
+                read_record_file_limited(&path, n, || false).unwrap_err(),
+                InputError::RecordLimit
+            );
+        }
+        assert_eq!(
+            read_record_file_limited(&path, 3, || false).unwrap(),
+            b"abc"
+        );
+        assert_eq!(
+            read_record_file_limited(&path, 4, || false).unwrap(),
+            b"abc"
+        );
+        let mut calls = 0;
+        assert_eq!(
+            read_record_file_limited(&path, 3, || {
+                calls += 1;
+                calls == 2
+            })
+            .unwrap_err(),
+            InputError::Cancelled
+        );
+        assert_eq!(stdfs::read(&path).unwrap(), b"abc");
+    }
     #[test]
     fn completed_record_input_keeps_exact_bytes_and_rejects_one_byte_over_limit() {
         let t = Temp::new();
