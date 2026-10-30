@@ -19,11 +19,12 @@ enum Action {
     ShowConfig,
     Serve(Overrides),
     SaveConfig(Config),
+    ChangeConfig(Config),
 }
 pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
     let usage = || {
         AppError::Usage(
-            "admin probe/status/evaluate/serve/config-save/config-show の操作・明示領域・設定値を確認してください",
+            "admin probe/status/evaluate/serve/config-save/config-show/config-change の操作・明示領域・設定値を確認してください",
         )
     };
     let [action, rest @ ..] = args else {
@@ -35,9 +36,11 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
         && action != "serve"
         && action != "config-save"
         && action != "config-show"
+        && action != "config-change"
     {
         return Err(usage());
     }
+    let accepts_config = action == "serve" || action == "config-save" || action == "config-change";
     let mut data = None;
     let mut timeout = None;
     let mut records = None;
@@ -64,23 +67,22 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
         match option.to_str() {
             Some("--data-dir") if data.is_none() => data = Some(PathBuf::from(value)),
             Some("--request-timeout-ms")
-                if (action == "serve" || action == "config-save") && timeout.is_none() =>
+                if accepts_config && timeout.is_none() =>
             {
                 timeout = Some(number(value).ok_or_else(usage)?);
             }
             Some("--max-new-records")
-                if (action == "serve" || action == "config-save") && records.is_none() =>
+                if accepts_config && records.is_none() =>
             {
                 records = Some(number(value).ok_or_else(usage)?);
             }
             Some("--max-diagnostic-records")
-                if (action == "serve" || action == "config-save")
-                    && diagnostic_records.is_none() =>
+                if accepts_config && diagnostic_records.is_none() =>
             {
                 diagnostic_records = Some(number(value).ok_or_else(usage)?);
             }
             Some("--startup-records-per-step")
-                if (action == "serve" || action == "config-save") && startup_records.is_none() =>
+                if accepts_config && startup_records.is_none() =>
             {
                 startup_records = Some(number(value).ok_or_else(usage)?);
             }
@@ -142,7 +144,7 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
             _ => return Err(usage()),
         }
     }
-    if action == "config-save"
+    if (action == "config-save" || action == "config-change")
         && (timeout.is_none()
             || records.is_none()
             || diagnostic_records.is_none()
@@ -176,6 +178,8 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
             .ok_or_else(usage)?;
         if action == "config-save" {
             Action::SaveConfig(config)
+        } else if action == "config-change" {
+            Action::ChangeConfig(config)
         } else {
             Action::Serve(Overrides {
                 timeout_ms: timeout,
@@ -222,12 +226,15 @@ pub enum Error {
     ConfigOutput,
     ConfigRead,
     ConfigReadOutput,
+    ChangeConnection,
+    ChangeUnknown,
+    ChangeOutput,
 }
 impl Error {
     pub fn exit_code(&self) -> u8 {
         match self {
             Self::Server(e) => e.exit_code(),
-            Self::ConfigUnconfirmed => 3,
+            Self::ConfigUnconfirmed | Self::ChangeUnknown => 3,
             _ => 1,
         }
     }
@@ -238,6 +245,9 @@ impl fmt::Display for Error {
             return e.fmt(f);
         }
         f.write_str(match self {
+            Self::ChangeConnection => "設定変更の送信前に接続・認証を確認できません。自動再送・直接DB保存・旧endpointへの接続は行いません。領域とsocketを保全して確認してください。",
+            Self::ChangeUnknown => "設定変更の送信開始後、保存・適用を確認できません（確定不明）。保存済みの可能性があります。領域とsocketを保全し、再送・直接DB保存・socket削除・手動待ち解除をせず確認してください。",
+            Self::ChangeOutput => "設定の保存・次操作への適用を確認後、結果出力に失敗しました。起動分割件数は次回起動用です。再送せず確認してください。正常停止・復旧完了の判定ではありません。",
             Self::ConfigRead => "保存設定を取得・照合できません。領域を保全して確認してください。設定の補完・修復・起動・IPC接続・手動待ち解除は行いません。",
             Self::ConfigReadOutput => "保存設定の照合後、結果出力に失敗しました。設定や手動確認待ちは変更していません。起動時適用・公開・復旧完了の判定ではありません。",
             Self::ConfigUnconfirmed => "設定保存操作の正常終了を確認できません。旧値または新値の保存済み・未確定の可能性があります。領域を保全し、再実行・再初期化・手動待ち解除をせず確認してください。",
@@ -254,6 +264,16 @@ impl fmt::Display for Error {
 }
 impl std::error::Error for Error {}
 pub fn run(command: Command, output: &mut impl Write) -> Result<(), Error> {
+    if let Action::ChangeConfig(config) = command.action {
+        let request = lngnb::storage::management::ConfigRequest::check(config.saved_values())
+            .map_err(|_| Error::ChangeConnection)?;
+        let saved = client::change_config(&command.data, request, Duration::from_secs(30))
+            .map_err(|error| match error {
+                client::Error::OutcomeUnknown => Error::ChangeUnknown,
+                _ => Error::ChangeConnection,
+            })?;
+        return changed_config_report(saved, output);
+    }
     if command.action == Action::ShowConfig {
         let saved = lngnb::storage::RecordStore::read_saved_admin_config(&command.data)
             .map_err(|_| Error::ConfigRead)?;
@@ -278,6 +298,23 @@ pub fn run(command: Command, output: &mut impl Write) -> Result<(), Error> {
     client::probe(&command.data, Duration::from_secs(30)).map_err(|_| Error::Connection)?;
     report(output)
 }
+fn changed_config_report(
+    config: lngnb::storage::AdminConfig,
+    output: &mut impl Write,
+) -> Result<(), Error> {
+    let text = format!(
+        "管理受理側4項目の設定保存・次操作への適用を確認しました。\nrequest_timeout_ms: {}\nmax_new_records: {}\nmax_diagnostic_records: {}\nstartup_records_per_step: {}\n起動分割件数は次回起動用です。sessionの消費済み件数・bytesと非保存予算は変更していません。正常停止・全資料検査・公開・復旧完了の判定ではありません。\n",
+        config.request_timeout_ms,
+        config.max_new_records,
+        config.max_diagnostic_records,
+        config.startup_records_per_step
+    );
+    output
+        .write_all(text.as_bytes())
+        .and_then(|()| output.flush())
+        .map_err(|_| Error::ChangeOutput)
+}
+
 fn saved_config_report(
     saved: Option<lngnb::storage::AdminConfig>,
     output: &mut impl Write,
@@ -840,5 +877,71 @@ mod config_tests {
                 .to_string()
                 .contains("旧値または新値")
         );
+    }
+}
+
+#[cfg(test)]
+mod change_tests {
+    use super::*;
+
+    #[test]
+    fn live_change_requires_all_values_and_rejects_startup_only_options() {
+        let good: Vec<OsString> = [
+            "config-change", "--data-dir", "data",
+            "--request-timeout-ms", "5000", "--max-new-records", "7",
+            "--max-diagnostic-records", "8", "--startup-records-per-step", "1",
+        ].map(Into::into).to_vec();
+        assert!(matches!(parse(&good).unwrap().action, Action::ChangeConfig(_)));
+        for option in [3, 5, 7, 9] {
+            let mut missing = good.clone();
+            missing.drain(option..option + 2);
+            assert_eq!(parse(&missing).unwrap_err().exit_code(), 2);
+            let mut duplicate = good.clone();
+            duplicate.extend_from_slice(&good[option..option + 2]);
+            assert_eq!(parse(&duplicate).unwrap_err().exit_code(), 2);
+            for bad in ["0", "30001", "01", "+1", "１", "private"] {
+                let mut invalid = good.clone();
+                invalid[option + 1] = bad.into();
+                assert_eq!(parse(&invalid).unwrap_err().exit_code(), 2);
+            }
+        }
+        for option in [
+            "--startup-record-bytes-per-step", "--startup-blob-bytes-per-step",
+            "--startup-blob-targets-per-step", "--startup-record-edges-per-step",
+            "--startup-evaluation-records-per-step", "--sql-inspection-callbacks",
+            "--sql-inspection-timeout-ms", "--startup-inspection-timeout-ms",
+            "--startup-record-input-timeout-ms", "--startup-blob-input-timeout-ms",
+            "--startup-evaluation-timeout-ms",
+        ] {
+            let mut invalid = good.clone();
+            invalid.extend([option.into(), "1".into()]);
+            assert_eq!(parse(&invalid).unwrap_err().exit_code(), 2);
+        }
+    }
+
+    #[test]
+    fn live_change_reports_confirmed_output_failure_separately_from_unknown_outcome() {
+        struct Sink(bool);
+        impl Write for Sink {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.0 { Ok(bytes.len()) } else { Err(std::io::Error::other("private")) }
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::other("private"))
+            }
+        }
+        let config = Config::default().saved_values();
+        let mut output = Vec::new();
+        changed_config_report(config, &mut output).unwrap();
+        assert!(String::from_utf8(output).unwrap().contains("次回起動用"));
+        for flush in [false, true] {
+            let error = changed_config_report(config, &mut Sink(flush)).unwrap_err();
+            assert!(matches!(error, Error::ChangeOutput));
+            assert_eq!(error.exit_code(), 1);
+            assert!(!error.to_string().contains("private"));
+        }
+        assert_eq!(Error::ChangeUnknown.exit_code(), 3);
+        assert_eq!(Error::ChangeConnection.exit_code(), 1);
+        assert!(std::error::Error::source(&Error::ChangeUnknown).is_none());
     }
 }
