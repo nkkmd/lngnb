@@ -373,7 +373,9 @@ fn serve(
     listener
         .enable_evaluation_with_record_limit(config.max_diagnostic_records)
         .map_err(|_| Error::Unconfirmed)?;
-    listener.enable_configuration().map_err(|_| Error::Unconfirmed)?;
+    listener
+        .enable_configuration()
+        .map_err(|_| Error::Unconfirmed)?;
     let ready = format!(
         "管理受理側のローカル起動検査を完了し、管理socketを開きました。公開・復旧完了の判定ではありません。\nrequest_timeout_ms: {}\nmax_new_records: {}\nmax_diagnostic_records: {}\nstartup_records_per_step: {}\nstartup_record_bytes_per_step: {}\nstartup_blob_bytes_per_step: {}\nstartup_blob_targets_per_step: {}\nstartup_record_edges_per_step: {}\nstartup_evaluation_records_per_step: {}\nsql_inspection_callbacks: {}\nsql_inspection_timeout_ms: {}\nstartup_inspection_timeout_ms: {}\nstartup_record_input_timeout_ms: {}\nstartup_blob_input_timeout_ms: {}\nstartup_evaluation_timeout_ms: {}\n起動引数・保存値・既定値の順で選んだ設定を適用しました。起動引数は保存していません。Record/Blobのbyte予算・Blob対象数・Record辺数・親評価件数・局所/物理検査・依存/本文評価入力・親評価のstep時間予算はこの起動だけの指定で、保存対象外です。SQL照合callback/時間予算は起動後の保存sessionにも適用し、保存対象外です。\n",
         config.timeout_ms,

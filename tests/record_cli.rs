@@ -2909,10 +2909,14 @@ fn config_change_command(data: &Path, records: &str, diagnostics: &str) -> Comma
         .args(["admin", "config-change", "--data-dir"])
         .arg(data)
         .args([
-            "--request-timeout-ms", "5000",
-            "--max-new-records", records,
-            "--max-diagnostic-records", diagnostics,
-            "--startup-records-per-step", "1",
+            "--request-timeout-ms",
+            "5000",
+            "--max-new-records",
+            records,
+            "--max-diagnostic-records",
+            diagnostics,
+            "--startup-records-per-step",
+            "1",
         ]);
     command
 }
@@ -2926,11 +2930,17 @@ fn config_frame(records: u64) -> Vec<u8> {
 fn config_stream(data: &Path) -> std::os::unix::net::UnixStream {
     use std::{os::fd::AsRawFd, os::unix::net::UnixStream};
     let dir = fs::File::open(data).unwrap();
-    let path = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd())).join("admin-config.sock");
+    let path =
+        PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd())).join("admin-config.sock");
     UnixStream::connect(path).unwrap()
 }
 fn assert_four_sockets(data: &Path, present: bool) {
-    for name in ["admin.sock", "admin-status.sock", "admin-evaluate.sock", "admin-config.sock"] {
+    for name in [
+        "admin.sock",
+        "admin-status.sock",
+        "admin-evaluate.sock",
+        "admin-config.sock",
+    ] {
         assert_eq!(data.join(name).exists(), present, "{name}");
     }
 }
@@ -2945,23 +2955,42 @@ fn config_change_saves_applies_preserves_counters_and_uses_next_startup_setting(
     assert_four_sockets(&temp.data(), true);
     assert!(cli(&temp.data(), &temp.input()).status.success());
     let before = status_cli(&temp.data());
-    let changed = config_change_command(&temp.data(), "2", "2").output().unwrap();
+    let changed = config_change_command(&temp.data(), "2", "2")
+        .output()
+        .unwrap();
     assert!(changed.status.success(), "{:?}", changed);
     assert!(String::from_utf8_lossy(&changed.stdout).contains("起動分割件数は次回起動用"));
     let after = status_cli(&temp.data());
-    for field in ["session_new_records", "session_stored_bytes", "max_stored_bytes"] {
-        assert_eq!(diagnostic_field(&before, field), diagnostic_field(&after, field));
+    for field in [
+        "session_new_records",
+        "session_stored_bytes",
+        "max_stored_bytes",
+    ] {
+        assert_eq!(
+            diagnostic_field(&before, field),
+            diagnostic_field(&after, field)
+        );
     }
     assert!(diagnostic_field(&after, "generation") > diagnostic_field(&before, "generation"));
     assert_eq!(diagnostic_field(&after, "request_timeout_ms"), 5000);
     assert_eq!(diagnostic_field(&after, "max_new_records"), 2);
     assert!(RecordStore::open(&temp.data(), Limits::default()).is_err());
     // 停止中操作はIPCへ自動切替しない。
-    assert_eq!(config_save_command(&temp.data()).output().unwrap().status.code(), Some(3));
+    assert_eq!(
+        config_save_command(&temp.data())
+            .output()
+            .unwrap()
+            .status
+            .code(),
+        Some(3)
+    );
     assert!(cli(&temp.data(), &temp.input()).status.success());
     fs::write(temp.input(), named_fixture("revision").bytes()).unwrap();
     assert!(cli(&temp.data(), &temp.input()).status.success());
-    assert_eq!(diagnostic_field(&status_cli(&temp.data()), "session_new_records"), 2);
+    assert_eq!(
+        diagnostic_field(&status_cli(&temp.data()), "session_new_records"),
+        2
+    );
     assert!(evaluate_cli(&temp.data()).status.success());
     server.signal("-TERM");
     assert!(server.wait().success());
@@ -2971,7 +3000,10 @@ fn config_change_saves_applies_preserves_counters_and_uses_next_startup_setting(
     let text = fs::read_to_string(&restarted.log).unwrap();
     assert!(text.contains("startup_records_per_step: 1\n"));
     assert!(text.contains("sql_inspection_callbacks: 100000\n"));
-    assert_eq!(diagnostic_field(&status_cli(&temp.data()), "session_new_records"), 0);
+    assert_eq!(
+        diagnostic_field(&status_cli(&temp.data()), "session_new_records"),
+        0
+    );
     assert!(evaluate_cli(&temp.data()).status.success());
     restarted.signal("-TERM");
     assert!(restarted.wait().success());
@@ -2983,7 +3015,10 @@ fn config_change_saves_applies_preserves_counters_and_uses_next_startup_setting(
     let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
     for kind in ["genesis", "revision"] {
         let record = named_fixture(kind);
-        assert_eq!(store.record(record.id()).unwrap().unwrap().bytes(), record.bytes());
+        assert_eq!(
+            store.record(record.id()).unwrap().unwrap().bytes(),
+            record.bytes()
+        );
     }
 }
 
@@ -2992,7 +3027,13 @@ fn config_change_rejection_or_sql_failure_preserves_settings_records_and_manual_
     for sql_failure in [false, true] {
         let temp = Temp::new();
         drop(RecordStore::initialize(&temp.data(), Limits::default()).unwrap());
-        assert!(config_save_command(&temp.data()).output().unwrap().status.success());
+        assert!(
+            config_save_command(&temp.data())
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
         let mut server = Server::start(&temp);
         for kind in ["genesis", "revision"] {
             fs::write(temp.input(), named_fixture(kind).bytes()).unwrap();
@@ -3003,7 +3044,8 @@ fn config_change_rejection_or_sql_failure_preserves_settings_records_and_manual_
             conn.execute_batch("CREATE TRIGGER deny_live_config BEFORE INSERT ON history WHEN NEW.new_state='admin_config_saved_local_only' BEGIN SELECT RAISE(ABORT,'test'); END;").unwrap();
         }
         let output = config_change_command(&temp.data(), if sql_failure { "7" } else { "1" }, "8")
-            .output().unwrap();
+            .output()
+            .unwrap();
         assert_eq!(output.status.code(), Some(3));
         assert!(output.stdout.is_empty());
         assert_eq!(server.wait().code(), Some(3));
@@ -3038,8 +3080,13 @@ fn config_change_bad_frame_and_response_loss_preserve_unclean_state() {
             assert!(errors.contains("保存・次操作への適用後、応答に失敗"));
             assert_eq!(saved_config_row(&temp.data()), (5000, 7, 8, 1));
         } else {
-            assert!(RecordStore::open(&temp.data(), Limits::default()).unwrap()
-                .saved_admin_config().unwrap().is_none());
+            assert!(
+                RecordStore::open(&temp.data(), Limits::default())
+                    .unwrap()
+                    .saved_admin_config()
+                    .unwrap()
+                    .is_none()
+            );
         }
         assert_review(&temp, false);
     }
@@ -3048,19 +3095,44 @@ fn config_change_bad_frame_and_response_loss_preserve_unclean_state() {
 #[test]
 fn config_change_unavailable_old_or_replaced_endpoint_never_falls_back_or_cleans() {
     let temp = Temp::new();
-    assert_eq!(config_change_command(&temp.data(), "7", "8").output().unwrap().status.code(), Some(1));
+    assert_eq!(
+        config_change_command(&temp.data(), "7", "8")
+            .output()
+            .unwrap()
+            .status
+            .code(),
+        Some(1)
+    );
     assert!(!temp.data().exists());
     let store = RecordStore::initialize(&temp.data(), Limits::default()).unwrap();
-    let mut listener = Listener::bind_writer(store.begin().unwrap(), lngnb::cbor::MAX_RECORD, Duration::from_millis(20)).unwrap();
+    let mut listener = Listener::bind_writer(
+        store.begin().unwrap(),
+        lngnb::cbor::MAX_RECORD,
+        Duration::from_millis(20),
+    )
+    .unwrap();
     listener.enable_status().unwrap();
     listener.enable_evaluation().unwrap();
-    assert_eq!(config_change_command(&temp.data(), "7", "8").output().unwrap().status.code(), Some(1));
-    assert!(matches!(listener.accept(), Err(lngnb::storage::admin_transport::Error::Timeout)));
+    assert_eq!(
+        config_change_command(&temp.data(), "7", "8")
+            .output()
+            .unwrap()
+            .status
+            .code(),
+        Some(1)
+    );
+    assert!(matches!(
+        listener.accept(),
+        Err(lngnb::storage::admin_transport::Error::Timeout)
+    ));
     listener.close_writer().unwrap().finish().unwrap();
     let path = temp.data().join("admin-config.sock");
     fs::write(&path, b"preserve").unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_lngnb"))
-        .args(["admin", "serve", "--data-dir"]).arg(temp.data()).output().unwrap();
+        .args(["admin", "serve", "--data-dir"])
+        .arg(temp.data())
+        .output()
+        .unwrap();
     assert_eq!(output.status.code(), Some(3));
     assert!(output.stdout.is_empty());
     assert_eq!(fs::read(&path).unwrap(), b"preserve");
@@ -3086,8 +3158,11 @@ fn config_change_invalid_arguments_never_touch_data_and_output_failure_is_confir
             drop(RecordStore::initialize(&temp.data(), Limits::default()).unwrap());
         }
         let output = Command::new(env!("CARGO_BIN_EXE_lngnb"))
-            .args(["admin", "config-change", "--data-dir"]).arg(temp.data())
-            .args(["--request-timeout-ms", "private"]).output().unwrap();
+            .args(["admin", "config-change", "--data-dir"])
+            .arg(temp.data())
+            .args(["--request-timeout-ms", "private"])
+            .output()
+            .unwrap();
         assert_eq!(output.status.code(), Some(2));
         assert!(!String::from_utf8_lossy(&output.stderr).contains("private"));
         if initialized {
@@ -3100,10 +3175,15 @@ fn config_change_invalid_arguments_never_touch_data_and_output_failure_is_confir
     }
     let mut server = Server::start(&temp);
     let output = config_change_command(&temp.data(), "7", "8")
-        .stdout(fs::File::options().write(true).open("/dev/full").unwrap()).output().unwrap();
+        .stdout(fs::File::options().write(true).open("/dev/full").unwrap())
+        .output()
+        .unwrap();
     assert_eq!(output.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&output.stderr).contains("保存・次操作への適用を確認後"));
-    assert_eq!(diagnostic_field(&status_cli(&temp.data()), "request_timeout_ms"), 5000);
+    assert_eq!(
+        diagnostic_field(&status_cli(&temp.data()), "request_timeout_ms"),
+        5000
+    );
     server.signal("-TERM");
     assert!(server.wait().success());
     assert_eq!(saved_config_row(&temp.data()), (5000, 7, 8, 1));
@@ -3112,20 +3192,31 @@ fn config_change_invalid_arguments_never_touch_data_and_output_failure_is_confir
 
 #[test]
 fn config_change_client_rejects_bad_mismatched_or_lost_reply_without_database_access() {
-    use std::{io::{Read, Write}, os::fd::AsRawFd, os::unix::net::UnixListener};
+    use std::{
+        io::{Read, Write},
+        os::fd::AsRawFd,
+        os::unix::net::UnixListener,
+    };
     for mode in ["version", "length", "scope", "value", "lost"] {
         let temp = Temp::new();
         drop(RecordStore::initialize(&temp.data(), Limits::default()).unwrap());
         let dir = fs::File::open(temp.data()).unwrap();
-        let path = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd())).join("admin-config.sock");
+        let path =
+            PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd())).join("admin-config.sock");
         let listener = UnixListener::bind(path).unwrap();
-        fs::set_permissions(temp.data().join("admin-config.sock"), fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(
+            temp.data().join("admin-config.sock"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
         let worker = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = [0; 40];
             stream.read_exact(&mut request).unwrap();
             assert_eq!(request.to_vec(), config_frame(7));
-            if mode == "lost" { return; }
+            if mode == "lost" {
+                return;
+            }
             let mut reply = b"LNC\x01\0\0\0\x21".to_vec();
             reply.push(3);
             reply.extend_from_slice(&request[8..]);
@@ -3140,7 +3231,9 @@ fn config_change_client_rejects_bad_mismatched_or_lost_reply_without_database_ac
         });
         // 同じ排他を保持中でもclientはDBを直接開かない。
         let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
-        let output = config_change_command(&temp.data(), "7", "8").output().unwrap();
+        let output = config_change_command(&temp.data(), "7", "8")
+            .output()
+            .unwrap();
         assert_eq!(output.status.code(), Some(3));
         assert!(output.stdout.is_empty());
         assert!(String::from_utf8_lossy(&output.stderr).contains("確定不明"));
@@ -3153,17 +3246,33 @@ fn config_change_client_rejects_bad_mismatched_or_lost_reply_without_database_ac
 #[test]
 fn config_change_applies_diagnostic_limit_without_reducing_startup_or_clearing_review() {
     let temp = Temp::new();
-    let mut writer = RecordStore::initialize(&temp.data(), Limits::default()).unwrap().begin().unwrap();
+    let mut writer = RecordStore::initialize(&temp.data(), Limits::default())
+        .unwrap()
+        .begin()
+        .unwrap();
     writer.insert(&fixture()).unwrap();
     writer.insert(&named_fixture("revision")).unwrap();
     writer.finish().unwrap();
     let mut server = Server::start(&temp);
-    assert!(config_change_command(&temp.data(), "7", "1").output().unwrap().status.success());
+    assert!(
+        config_change_command(&temp.data(), "7", "1")
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
     assert_eq!(evaluate_cli(&temp.data()).status.code(), Some(1));
     assert_eq!(server.wait().code(), Some(3));
     assert_eq!(saved_config_row(&temp.data()), (5000, 7, 1, 1));
     assert_review(&temp, true);
-    assert_eq!(config_change_command(&temp.data(), "7", "8").output().unwrap().status.code(), Some(1));
+    assert_eq!(
+        config_change_command(&temp.data(), "7", "8")
+            .output()
+            .unwrap()
+            .status
+            .code(),
+        Some(1)
+    );
     assert_review(&temp, true);
 }
 

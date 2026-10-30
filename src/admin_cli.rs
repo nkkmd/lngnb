@@ -66,24 +66,16 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
         }
         match option.to_str() {
             Some("--data-dir") if data.is_none() => data = Some(PathBuf::from(value)),
-            Some("--request-timeout-ms")
-                if accepts_config && timeout.is_none() =>
-            {
+            Some("--request-timeout-ms") if accepts_config && timeout.is_none() => {
                 timeout = Some(number(value).ok_or_else(usage)?);
             }
-            Some("--max-new-records")
-                if accepts_config && records.is_none() =>
-            {
+            Some("--max-new-records") if accepts_config && records.is_none() => {
                 records = Some(number(value).ok_or_else(usage)?);
             }
-            Some("--max-diagnostic-records")
-                if accepts_config && diagnostic_records.is_none() =>
-            {
+            Some("--max-diagnostic-records") if accepts_config && diagnostic_records.is_none() => {
                 diagnostic_records = Some(number(value).ok_or_else(usage)?);
             }
-            Some("--startup-records-per-step")
-                if accepts_config && startup_records.is_none() =>
-            {
+            Some("--startup-records-per-step") if accepts_config && startup_records.is_none() => {
                 startup_records = Some(number(value).ok_or_else(usage)?);
             }
             Some("--startup-record-bytes-per-step")
@@ -887,11 +879,24 @@ mod change_tests {
     #[test]
     fn live_change_requires_all_values_and_rejects_startup_only_options() {
         let good: Vec<OsString> = [
-            "config-change", "--data-dir", "data",
-            "--request-timeout-ms", "5000", "--max-new-records", "7",
-            "--max-diagnostic-records", "8", "--startup-records-per-step", "1",
-        ].map(Into::into).to_vec();
-        assert!(matches!(parse(&good).unwrap().action, Action::ChangeConfig(_)));
+            "config-change",
+            "--data-dir",
+            "data",
+            "--request-timeout-ms",
+            "5000",
+            "--max-new-records",
+            "7",
+            "--max-diagnostic-records",
+            "8",
+            "--startup-records-per-step",
+            "1",
+        ]
+        .map(Into::into)
+        .to_vec();
+        assert!(matches!(
+            parse(&good).unwrap().action,
+            Action::ChangeConfig(_)
+        ));
         for option in [3, 5, 7, 9] {
             let mut missing = good.clone();
             missing.drain(option..option + 2);
@@ -906,11 +911,16 @@ mod change_tests {
             }
         }
         for option in [
-            "--startup-record-bytes-per-step", "--startup-blob-bytes-per-step",
-            "--startup-blob-targets-per-step", "--startup-record-edges-per-step",
-            "--startup-evaluation-records-per-step", "--sql-inspection-callbacks",
-            "--sql-inspection-timeout-ms", "--startup-inspection-timeout-ms",
-            "--startup-record-input-timeout-ms", "--startup-blob-input-timeout-ms",
+            "--startup-record-bytes-per-step",
+            "--startup-blob-bytes-per-step",
+            "--startup-blob-targets-per-step",
+            "--startup-record-edges-per-step",
+            "--startup-evaluation-records-per-step",
+            "--sql-inspection-callbacks",
+            "--sql-inspection-timeout-ms",
+            "--startup-inspection-timeout-ms",
+            "--startup-record-input-timeout-ms",
+            "--startup-blob-input-timeout-ms",
             "--startup-evaluation-timeout-ms",
         ] {
             let mut invalid = good.clone();
@@ -924,7 +934,11 @@ mod change_tests {
         struct Sink(bool);
         impl Write for Sink {
             fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                if self.0 { Ok(bytes.len()) } else { Err(std::io::Error::other("private")) }
+                if self.0 {
+                    Ok(bytes.len())
+                } else {
+                    Err(std::io::Error::other("private"))
+                }
             }
             fn flush(&mut self) -> std::io::Result<()> {
                 Err(std::io::Error::other("private"))
