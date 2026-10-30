@@ -187,7 +187,11 @@ pub fn read_record_file_limited(
         remaining.min(cbor::MAX_RECORD),
         InputError::RecordLimit,
         &mut |_| {
-            if cancelled() { Err(InputError::Cancelled) } else { Ok(()) }
+            if cancelled() {
+                Err(InputError::Cancelled)
+            } else {
+                Ok(())
+            }
         },
     )?;
     unchanged(&file, &before)?;
@@ -310,12 +314,28 @@ mod tests {
         let t = Temp::new();
         let path = t.file("record", b"abc");
         for n in [0, 2] {
-            assert_eq!(read_record_file_limited(&path, n, || false).unwrap_err(), InputError::RecordLimit);
+            assert_eq!(
+                read_record_file_limited(&path, n, || false).unwrap_err(),
+                InputError::RecordLimit
+            );
         }
-        assert_eq!(read_record_file_limited(&path, 3, || false).unwrap(), b"abc");
-        assert_eq!(read_record_file_limited(&path, 4, || false).unwrap(), b"abc");
+        assert_eq!(
+            read_record_file_limited(&path, 3, || false).unwrap(),
+            b"abc"
+        );
+        assert_eq!(
+            read_record_file_limited(&path, 4, || false).unwrap(),
+            b"abc"
+        );
         let mut calls = 0;
-        assert_eq!(read_record_file_limited(&path, 3, || { calls += 1; calls == 2 }).unwrap_err(), InputError::Cancelled);
+        assert_eq!(
+            read_record_file_limited(&path, 3, || {
+                calls += 1;
+                calls == 2
+            })
+            .unwrap_err(),
+            InputError::Cancelled
+        );
         assert_eq!(stdfs::read(&path).unwrap(), b"abc");
     }
     #[test]

@@ -3,9 +3,9 @@ use super::AppError;
 use lngnb::{
     authoring::{self, CreationBudget, CreationError},
     authoring_input::{self, InputError},
-    record::{LocalRecord, RecordKind},
     id::{self, Id, Kind},
     keyfile::{KeyDirectory, KeyFileError},
+    record::{LocalRecord, RecordKind},
     secret_terminal::{SecretInputError, SecretTerminal, TerminalSignals},
     storage::{
         EvaluationLimits, Limits, LocalStartup, LocalStartupBudget, StorageError, management,
@@ -21,7 +21,10 @@ use std::{
 #[derive(Debug, PartialEq, Eq)]
 enum Action {
     Create,
-    Revise { genesis: PathBuf, parents: Vec<PathBuf> },
+    Revise {
+        genesis: PathBuf,
+        parents: Vec<PathBuf>,
+    },
 }
 #[derive(Debug, PartialEq, Eq)]
 pub struct Command {
@@ -57,7 +60,9 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
     let mut rest = rest.iter();
     while let Some(option) = rest.next() {
         if option == "--no-parents" {
-            if action != "revise" || no_parents { return Err(usage()); }
+            if action != "revise" || no_parents {
+                return Err(usage());
+            }
             no_parents = true;
             continue;
         }
@@ -66,8 +71,12 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
             return Err(usage());
         }
         match option.to_str() {
-            Some("--genesis") if action == "revise" && genesis.is_none() => genesis = Some(PathBuf::from(value)),
-            Some("--parent") if action == "revise" && parents.len() < 256 => parents.push(PathBuf::from(value)),
+            Some("--genesis") if action == "revise" && genesis.is_none() => {
+                genesis = Some(PathBuf::from(value))
+            }
+            Some("--parent") if action == "revise" && parents.len() < 256 => {
+                parents.push(PathBuf::from(value))
+            }
             Some("--data-dir") if data.is_none() => data = Some(PathBuf::from(value)),
             Some("--key-dir") if keys.is_none() => keys = Some(PathBuf::from(value)),
             Some("--payload") if payload.is_none() => payload = Some(PathBuf::from(value)),
@@ -113,9 +122,16 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
         }
     }
     let action = if action == "revise" {
-        if no_parents != parents.is_empty() { return Err(usage()); }
-        Action::Revise { genesis: genesis.ok_or_else(usage)?, parents }
-    } else { Action::Create };
+        if no_parents != parents.is_empty() {
+            return Err(usage());
+        }
+        Action::Revise {
+            genesis: genesis.ok_or_else(usage)?,
+            parents,
+        }
+    } else {
+        Action::Create
+    };
     Ok(Command {
         action,
         data: data.ok_or_else(usage)?,
@@ -165,7 +181,9 @@ impl fmt::Display for Error {
 }
 impl std::error::Error for Error {}
 impl From<StorageError> for Error {
-    fn from(error: StorageError) -> Self { Self::Storage(error) }
+    fn from(error: StorageError) -> Self {
+        Self::Storage(error)
+    }
 }
 
 pub fn run(command: Command, output: &mut impl Write) -> Result<(), Error> {
@@ -180,7 +198,9 @@ pub fn run(command: Command, output: &mut impl Write) -> Result<(), Error> {
         .map_err(Error::File)?;
     let selected = match &command.action {
         Action::Create => None,
-        Action::Revise { genesis, parents } => Some(read_revision_selection(genesis, parents, &signals)?),
+        Action::Revise { genesis, parents } => {
+            Some(read_revision_selection(genesis, parents, &signals)?)
+        }
     };
     let mut directory = KeyDirectory::open(&command.keys).map_err(Error::Key)?;
     if directory
@@ -204,12 +224,21 @@ pub fn run(command: Command, output: &mut impl Write) -> Result<(), Error> {
     let (payload, metadata) = input.into_parts();
     let (genesis, revision, is_initial) = if let Some((genesis, parents)) = selected {
         let refs: Vec<_> = parents.iter().collect();
-        let revision = authoring::create_revision(&key, &genesis, &refs, &payload, metadata, command.media.as_deref(), budget)
-            .map_err(Error::Creation)?;
+        let revision = authoring::create_revision(
+            &key,
+            &genesis,
+            &refs,
+            &payload,
+            metadata,
+            command.media.as_deref(),
+            budget,
+        )
+        .map_err(Error::Creation)?;
         (genesis, revision, false)
     } else {
-        let pair = authoring::create_initial(&key, &payload, metadata, command.media.as_deref(), budget)
-            .map_err(Error::Creation)?;
+        let pair =
+            authoring::create_initial(&key, &payload, metadata, command.media.as_deref(), budget)
+                .map_err(Error::Creation)?;
         let (genesis, revision) = pair.into_parts();
         (genesis, revision, true)
     };
@@ -219,7 +248,14 @@ pub fn run(command: Command, output: &mut impl Write) -> Result<(), Error> {
     signals.check_cancelled().map_err(Error::Input)?;
     let text = summary(&genesis, &revision, is_initial)?;
     // 保存側へ渡すのは完成Recordと同じ所有本文だけ。秘密鍵/端末はここより前に破棄する。
-    save(&command.data, &genesis, &revision, &payload, command.max_payload, is_initial)?;
+    save(
+        &command.data,
+        &genesis,
+        &revision,
+        &payload,
+        command.max_payload,
+        is_initial,
+    )?;
     report(&text, output)
 }
 
@@ -231,17 +267,26 @@ fn read_revision_selection(
 ) -> Result<(LocalRecord, Vec<LocalRecord>), Error> {
     let mut remaining = 16 * 1024 * 1024;
     let mut read = |path: &std::path::Path| {
-        let bytes = authoring_input::read_record_file_limited(path, remaining, || signals.check_cancelled().is_err()).map_err(Error::File)?;
+        let bytes = authoring_input::read_record_file_limited(path, remaining, || {
+            signals.check_cancelled().is_err()
+        })
+        .map_err(Error::File)?;
         remaining -= bytes.len();
         LocalRecord::check(&bytes, None).map_err(|_| Error::Creation(CreationError::InvalidInput))
     };
     let genesis = read(genesis)?;
-    if genesis.kind() != RecordKind::Genesis { return Err(Error::Creation(CreationError::InvalidInput)); }
+    if genesis.kind() != RecordKind::Genesis {
+        return Err(Error::Creation(CreationError::InvalidInput));
+    }
     let mut records = Vec::with_capacity(parents.len());
     for path in parents {
         let parent = read(path)?;
-        parent.check_genesis(&genesis).map_err(|_| Error::Creation(CreationError::InvalidInput))?;
-        if records.iter().any(|r: &LocalRecord| r.id() == parent.id()) { return Err(Error::Creation(CreationError::InvalidInput)); }
+        parent
+            .check_genesis(&genesis)
+            .map_err(|_| Error::Creation(CreationError::InvalidInput))?;
+        if records.iter().any(|r: &LocalRecord| r.id() == parent.id()) {
+            return Err(Error::Creation(CreationError::InvalidInput));
+        }
         records.push(parent);
     }
     Ok((genesis, records))
@@ -281,8 +326,19 @@ fn save(
     }
     let mut writer = startup.into_writer()?;
     if !is_initial {
-        for id in std::iter::once(genesis.id()).chain(revision.parents().map_err(|_| StorageError::Corrupt)?.into_iter().map(|bytes| Id { kind: Kind::Record, bytes })) {
-            if writer.record(id)?.is_none() { return Err(Error::SelectionMissing); }
+        for id in std::iter::once(genesis.id()).chain(
+            revision
+                .parents()
+                .map_err(|_| StorageError::Corrupt)?
+                .into_iter()
+                .map(|bytes| Id {
+                    kind: Kind::Record,
+                    bytes,
+                }),
+        ) {
+            if writer.record(id)?.is_none() {
+                return Err(Error::SelectionMissing);
+            }
         }
     }
     // 各段階は独立確定。後段失敗で先に保存した本文/Recordを消さない。
@@ -290,11 +346,17 @@ fn save(
     if blob.byte_length != payload.len() as u64 {
         return Err(Error::Storage(StorageError::Corrupt));
     }
-    if is_initial { management::store_record(&mut writer, genesis)?; }
+    if is_initial {
+        management::store_record(&mut writer, genesis)?;
+    }
     management::store_record(&mut writer, revision)?;
     writer.finish().map_err(Error::Storage)
 }
-fn summary(genesis: &LocalRecord, revision: &LocalRecord, is_initial: bool) -> Result<String, Error> {
+fn summary(
+    genesis: &LocalRecord,
+    revision: &LocalRecord,
+    is_initial: bool,
+) -> Result<String, Error> {
     let knowledge = match genesis.body() {
         lngnb::cbor::Value::Map(m) => {
             m.iter()
@@ -312,7 +374,11 @@ fn summary(genesis: &LocalRecord, revision: &LocalRecord, is_initial: bool) -> R
     .ok_or(Error::Creation(CreationError::InvalidInput))?;
     Ok(format!(
         "{}の本文と署名Recordをローカル保存しました（pin・公開は未実装）。\nknowledge_id: {}\ngenesis_id: {}\nrevision_id: {}\n",
-        if is_initial { "新規資料" } else { "改訂版" },
+        if is_initial {
+            "新規資料"
+        } else {
+            "改訂版"
+        },
         Id {
             kind: Kind::Knowledge,
             bytes: knowledge
@@ -360,7 +426,9 @@ mod tests {
         assert!(parse(&a).is_err());
         let mut empty = a.clone();
         empty.push("--no-parents".into());
-        assert!(matches!(parse(&empty).unwrap().action, Action::Revise { parents, .. } if parents.is_empty()));
+        assert!(
+            matches!(parse(&empty).unwrap().action, Action::Revise { parents, .. } if parents.is_empty())
+        );
         empty.push("--no-parents".into());
         assert!(parse(&empty).is_err());
         a.extend(["--parent".into(), "parent.cbor".into()]);
@@ -368,7 +436,9 @@ mod tests {
         let mut conflict = a.clone();
         conflict.push("--no-parents".into());
         assert!(parse(&conflict).is_err());
-        for _ in 1..256 { a.extend(["--parent".into(), "parent.cbor".into()]); }
+        for _ in 1..256 {
+            a.extend(["--parent".into(), "parent.cbor".into()]);
+        }
         assert!(parse(&a).is_ok());
         a.extend(["--parent".into(), "parent.cbor".into()]);
         assert!(parse(&a).is_err());
