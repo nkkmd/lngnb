@@ -335,24 +335,9 @@ fn save_config(
     config: Config,
     output: &mut impl Write,
 ) -> Result<(), Error> {
-    use lngnb::storage::{EvaluationLimits, Limits, LocalStartup, LocalStartupBudget};
-    let mut startup =
-        LocalStartup::open(path, Limits::default()).map_err(|_| Error::ConfigUnconfirmed)?;
-    if startup.needs_review() {
-        return Err(Error::ConfigUnconfirmed);
-    }
-    while !startup
-        .step(EvaluationLimits::default(), LocalStartupBudget::default())
-        .map_err(|_| Error::ConfigUnconfirmed)?
-        .checks_complete()
-    {}
-    let mut writer = startup
-        .into_writer()
-        .map_err(|_| Error::ConfigUnconfirmed)?;
     lngnb::storage::management::ConfigRequest::check(config.saved_values())
-        .and_then(|request| request.save(&mut writer))
+        .and_then(|request| request.save_stopped(path))
         .map_err(|_| Error::ConfigUnconfirmed)?;
-    writer.finish().map_err(|_| Error::ConfigUnconfirmed)?;
     config_report(config, output)
 }
 fn config_report(config: Config, output: &mut impl Write) -> Result<(), Error> {

@@ -279,3 +279,136 @@ fn checked_config_save_is_shared_without_applying_session_values_or_clearing_man
     );
     assert!(matches!(store.begin(), Err(StorageError::NeedsReview)));
 }
+
+fn stopped_config() -> crate::storage::AdminConfig {
+    crate::storage::AdminConfig {
+        request_timeout_ms: 500,
+        max_new_records: 1,
+        max_diagnostic_records: 1,
+        startup_records_per_step: 1,
+    }
+}
+
+#[test]
+fn stopped_config_checks_all_records_before_saving_without_applying_new_limits() {
+    let temp = Temp::new();
+    let mut writer = temp.store().begin().unwrap();
+    for kind in ["genesis", "revision"] {
+        store_record(&mut writer, &fixture(kind)).unwrap();
+    }
+    writer.finish().unwrap();
+    let config = stopped_config();
+    assert_eq!(
+        ConfigRequest::check(config)
+            .unwrap()
+            .save_stopped(&temp.data())
+            .unwrap(),
+        config
+    );
+    let store = RecordStore::open(&temp.data(), crate::storage::Limits::default()).unwrap();
+    assert_eq!(store.startup_state().unwrap(), StartupState::Clean);
+    assert_eq!(store.saved_admin_config().unwrap(), Some(config));
+    // 今回の全検査には、新しい件数1を適用しない。2件を検査・評価してから保存する。
+    assert_eq!(store.diagnose(EvaluationLimits::default()).unwrap().records, 2);
+    let records: i64 = store.conn.query_row(
+        "SELECT count(*) FROM history WHERE new_state='evaluation_input_complete' AND reason LIKE 'evaluation_input_checkpoint:epoch=%:records=2:bytes=%'",
+        [], |r| r.get(0)).unwrap();
+    assert!(records > 0);
+    for kind in ["genesis", "revision"] {
+        let record = fixture(kind);
+        assert_eq!(
+            store.record(record.id()).unwrap().unwrap().bytes(),
+            record.bytes()
+        );
+    }
+    for name in [
+        "admin.sock",
+        "admin-status.sock",
+        "admin-evaluate.sock",
+        "admin-config.sock",
+    ] {
+        assert!(!temp.data().join(name).exists());
+    }
+}
+
+#[test]
+fn stopped_config_lock_and_manual_wait_never_fall_back_or_clear_state() {
+    let temp = Temp::new();
+    let store = temp.store();
+    let before = logical_snapshot(&store.conn);
+    assert!(
+        ConfigRequest::check(stopped_config())
+            .unwrap()
+            .save_stopped(&temp.data())
+            .is_err()
+    );
+    assert_eq!(logical_snapshot(&store.conn), before);
+    let mut writer = store.begin().unwrap();
+    let old = crate::storage::AdminConfig {
+        max_new_records: 7,
+        ..stopped_config()
+    };
+    writer.save_admin_config(old).unwrap();
+    store_record(&mut writer, &fixture("genesis")).unwrap();
+    drop(writer);
+    assert!(matches!(
+        ConfigRequest::check(stopped_config())
+            .unwrap()
+            .save_stopped(&temp.data()),
+        Err(StorageError::NeedsReview)
+    ));
+    let store = RecordStore::open(&temp.data(), crate::storage::Limits::default()).unwrap();
+    assert_eq!(store.startup_state().unwrap(), StartupState::NeedsReview);
+    assert_eq!(store.saved_admin_config().unwrap(), Some(old));
+    assert!(store.record(fixture("genesis").id()).unwrap().is_some());
+    assert!(!temp.data().join("admin-config.sock").exists());
+}
+
+#[test]
+fn stopped_config_save_and_finish_failures_preserve_old_or_committed_values() {
+    for finish_failure in [false, true] {
+        let temp = Temp::new();
+        let mut writer = temp.store().begin().unwrap();
+        let old = crate::storage::AdminConfig {
+            max_new_records: 7,
+            ..stopped_config()
+        };
+        writer.save_admin_config(old).unwrap();
+        store_record(&mut writer, &fixture("genesis")).unwrap();
+        writer.finish().unwrap();
+        let store = RecordStore::open(&temp.data(), crate::storage::Limits::default()).unwrap();
+        let trigger = if finish_failure {
+            "CREATE TRIGGER deny_stopped_finish BEFORE UPDATE ON storage_state WHEN OLD.state='running' AND NEW.state='clean' BEGIN SELECT RAISE(ABORT,'test'); END;"
+        } else {
+            "CREATE TRIGGER deny_stopped_config BEFORE INSERT ON history WHEN NEW.new_state='admin_config_saved_local_only' BEGIN SELECT RAISE(ABORT,'test'); END;"
+        };
+        store.conn.execute_batch(trigger).unwrap();
+        drop(store);
+        assert!(
+            ConfigRequest::check(stopped_config())
+                .unwrap()
+                .save_stopped(&temp.data())
+                .is_err()
+        );
+        let store = RecordStore::open(&temp.data(), crate::storage::Limits::default()).unwrap();
+        let expected = if finish_failure {
+            stopped_config()
+        } else {
+            old
+        };
+        assert_eq!(store.saved_admin_config().unwrap(), Some(expected));
+        assert_eq!(store.startup_state().unwrap(), StartupState::NeedsReview);
+        let record = fixture("genesis");
+        assert_eq!(
+            store.record(record.id()).unwrap().unwrap().bytes(),
+            record.bytes()
+        );
+        drop(store);
+        assert!(matches!(
+            ConfigRequest::check(stopped_config())
+                .unwrap()
+                .save_stopped(&temp.data()),
+            Err(StorageError::NeedsReview)
+        ));
+    }
+}
