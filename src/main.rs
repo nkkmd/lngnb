@@ -30,7 +30,7 @@ const HELP: &str = "lngnb — 分散図書館・知識基盤（開発初期段�
   lngnb admin evaluate --data-dir PATH
   lngnb admin config-show --data-dir PATH
   lngnb admin config-save --data-dir PATH --request-timeout-ms N --max-new-records N --max-diagnostic-records N --startup-records-per-step N
-  lngnb admin serve --data-dir PATH [--request-timeout-ms N] [--max-new-records N] [--max-diagnostic-records N] [--startup-records-per-step N] [--startup-record-bytes-per-step N] [--startup-blob-bytes-per-step N] [--startup-blob-targets-per-step N] [--startup-record-edges-per-step N] [--startup-evaluation-records-per-step N] [--sql-inspection-callbacks N] [--sql-inspection-timeout-ms N] [--startup-inspection-timeout-ms N]
+  lngnb admin serve --data-dir PATH [--request-timeout-ms N] [--max-new-records N] [--max-diagnostic-records N] [--startup-records-per-step N] [--startup-record-bytes-per-step N] [--startup-blob-bytes-per-step N] [--startup-blob-targets-per-step N] [--startup-record-edges-per-step N] [--startup-evaluation-records-per-step N] [--sql-inspection-callbacks N] [--sql-inspection-timeout-ms N] [--startup-inspection-timeout-ms N] [--startup-record-input-timeout-ms N]
   lngnb record submit --data-dir PATH --record PATH
   lngnb document create --data-dir PATH --key-dir PATH --name NAME --expect-key-id KEY_ID --payload PATH --metadata PATH [--media-type TYPE] [--max-payload-bytes N]
   lngnb key create --key-dir PATH --name NAME
@@ -84,6 +84,8 @@ admin serve は前面で管理受理側だけを起動します。SIGINT/SIGTERM
 --sql-inspection-timeout-ms は同じSQL照合群の時間予算（1〜60000 ms、既定60000）です。
 進捗通知時と照合群の前後で確認し、OSのI/O待ちを強制中断する実時間保証ではありません。
 設定読込み前から保存sessionへ適用し、起動後にも使います。保存対象外で、省略時は既定へ戻ります。
+--startup-record-input-timeout-ms は依存入力収集の各stepの時間予算（1〜60000 ms、既定60000）です。
+入力cache照合/新規収集/保存前の期限確認に使い、起動全体・本文評価入力・親評価の期限ではありません。
 --startup-inspection-timeout-ms はRecord局所検査/物理Blob検査の各stepの時間予算（1〜60000 ms、既定60000）です。
 起動全体の期限ではなく、OSのI/O・一件の検査・保存を強制中断しません。全検査後だけ受付します。
 依存入力収集/本文評価入力/親評価やsession全体のSQL予算を変えず、保存対象外で省略時は既定へ戻ります。

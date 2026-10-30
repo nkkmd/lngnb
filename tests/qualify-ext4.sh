@@ -74,3 +74,6 @@ cargo test --locked --offline --test record_cli sql_time_budget_ -- --test-threa
 
 # 起動局所/物理検査のstep時間指定・分割完了・非保存・手動待ち維持を再実行する。
 cargo test --locked --offline --test record_cli startup_inspection_time_budget_ -- --test-threads=1
+
+# 起動依存入力のstep時間指定・収集完了・非保存・手動待ち維持。
+cargo test --locked --offline --test record_cli startup_record_input_time_budget_ -- --test-threads=1

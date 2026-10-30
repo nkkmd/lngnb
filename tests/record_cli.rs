@@ -569,6 +569,16 @@ fn invalid_runtime_options_fail_before_creating_or_changing_data() {
             vec!["--startup-blob-targets-per-step", "0"],
             vec!["--startup-record-edges-per-step", "0"],
             vec!["--startup-evaluation-records-per-step", "0"],
+            vec!["--startup-record-input-timeout-ms", "0"],
+            vec!["--startup-record-input-timeout-ms", "60001"],
+            vec!["--startup-record-input-timeout-ms", "private"],
+            vec!["--startup-record-input-timeout-ms", "01"],
+            vec![
+                "--startup-record-input-timeout-ms",
+                "1",
+                "--startup-record-input-timeout-ms",
+                "2",
+            ],
             vec!["--startup-inspection-timeout-ms", "0"],
             vec!["--startup-inspection-timeout-ms", "60001"],
             vec!["--startup-inspection-timeout-ms", "private"],
@@ -2628,6 +2638,84 @@ fn startup_inspection_time_budget_completes_split_checks_without_saving_or_clear
             .arg(temp.data());
         if explicit {
             command.args(["--startup-inspection-timeout-ms", "30000"]);
+        }
+        let retry = command.output().unwrap();
+        assert_eq!(retry.status.code(), Some(3));
+        assert!(retry.stdout.is_empty());
+        assert_review(&temp, true);
+        assert_eq!(saved_config_row(&temp.data()), (500, 7, 8, 10_000));
+    }
+}
+
+#[test]
+fn startup_record_input_time_budget_completes_collection_without_saving_or_clearing_manual_wait() {
+    let temp = Temp::new();
+    let payloads = startup_blobs(&temp);
+    let mut server = Server::configured(
+        &temp,
+        &[
+            "--startup-record-input-timeout-ms",
+            "30000",
+            "--startup-records-per-step",
+            "1",
+            "--startup-blob-targets-per-step",
+            "1",
+        ],
+    );
+    let diagnostic = evaluate_cli(&temp.data());
+    assert!(diagnostic.status.success());
+    assert_eq!(diagnostic_field(&diagnostic, "records"), 3);
+    assert_eq!(diagnostic_field(&diagnostic, "payload_missing"), 0);
+    server.signal("-TERM");
+    assert!(server.wait().success());
+    let ready = fs::read_to_string(&server.log).unwrap();
+    assert!(ready.contains("startup_record_input_timeout_ms: 30000\n"));
+    assert!(ready.contains("sql_inspection_timeout_ms: 60000\n"));
+    let conn = rusqlite::Connection::open(temp.data().join("database.sqlite")).unwrap();
+    let collected: (i64, i64) = conn
+        .query_row("SELECT records,complete FROM evaluation_input", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(collected, (3, 1));
+    let split: i64 = conn.query_row("SELECT count(*) FROM history WHERE reason LIKE 'evaluation_input_checkpoint:%:records=1:%' AND new_state='evaluation_input_pending'", [], |r| r.get(0)).unwrap();
+    assert!(split > 0);
+    drop(conn);
+    assert_eq!(saved_config_row(&temp.data()), (500, 7, 8, 10_000));
+    let mut restarted = Server::start(&temp);
+    restarted.signal("-TERM");
+    assert!(restarted.wait().success());
+    assert!(
+        fs::read_to_string(&restarted.log)
+            .unwrap()
+            .contains("startup_record_input_timeout_ms: 60000\n")
+    );
+    for payload in &payloads {
+        assert_eq!(
+            fs::read(startup_blob_path(&temp, payload)).unwrap(),
+            *payload
+        );
+    }
+    let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
+    assert_eq!(
+        store.record(fixture().id()).unwrap().unwrap().bytes(),
+        fixture().bytes()
+    );
+    for payload in &payloads {
+        let record = blob_revision(payload);
+        assert_eq!(
+            store.record(record.id()).unwrap().unwrap().bytes(),
+            record.bytes()
+        );
+    }
+    drop(store.begin().unwrap());
+    for explicit in [false, true] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_lngnb"));
+        command
+            .args(["admin", "serve", "--data-dir"])
+            .arg(temp.data());
+        if explicit {
+            command.args(["--startup-record-input-timeout-ms", "30000"]);
         }
         let retry = command.output().unwrap();
         assert_eq!(retry.status.code(), Some(3));
