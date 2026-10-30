@@ -88,3 +88,6 @@ cargo test --locked --offline --test record_cli startup_parent_time_budget_ -- -
 # 設定共通保存と稼働中変更の内部基盤を同じext4で再実行する。
 cargo test --locked --offline --lib storage::management::tests::checked_config_save_is_shared_without_applying_session_values_or_clearing_manual_wait -- --exact --test-threads=1
 cargo test --locked --offline --lib storage::admin_transport::configuration::tests:: -- --test-threads=1
+
+# 設定専用IPCの固定形式/保全/応答喪失とclientの非降格。
+cargo test --locked --offline --lib storage::admin_transport::client::tests::config_client_never_falls_back_or_confirms_mismatched_and_lost_responses -- --exact --test-threads=1
