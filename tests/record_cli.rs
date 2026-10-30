@@ -2761,9 +2761,11 @@ fn startup_blob_input_time_budget_completes_preparation_without_saving_or_cleari
     assert!(ready.contains("sql_inspection_timeout_ms: 60000\n"));
     let conn = rusqlite::Connection::open(temp.data().join("database.sqlite")).unwrap();
     let prepared: (i64, i64) = conn
-        .query_row("SELECT total,complete FROM evaluation_blob_input", [], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })
+        .query_row(
+            "SELECT total,complete FROM evaluation_blob_input",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
         .unwrap();
     assert_eq!(prepared, (2, 1));
     let split: i64 = conn.query_row("SELECT count(*) FROM history WHERE reason LIKE 'evaluation_blob_checkpoint:%:checked=1:%' AND new_state='evaluation_blob_pending'", [], |r| r.get(0)).unwrap();
