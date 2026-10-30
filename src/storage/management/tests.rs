@@ -217,3 +217,65 @@ fn diagnostic_budget_returns_no_partial_result_and_cannot_clear_save_failure() {
         Err(StorageError::UnresolvedFailure)
     ));
 }
+
+#[test]
+fn checked_config_save_is_shared_without_applying_session_values_or_clearing_manual_wait() {
+    let temp = Temp::new();
+    let mut writer = temp.store().begin().unwrap();
+    let record = fixture("genesis");
+    store_record(&mut writer, &record).unwrap();
+    let config = crate::storage::AdminConfig {
+        request_timeout_ms: 500,
+        max_new_records: 2,
+        max_diagnostic_records: 7,
+        startup_records_per_step: 1,
+    };
+    let before = logical_snapshot(&writer.store.conn);
+    for invalid in [
+        crate::storage::AdminConfig {
+            request_timeout_ms: 0,
+            ..config
+        },
+        crate::storage::AdminConfig {
+            max_new_records: 10_001,
+            ..config
+        },
+        crate::storage::AdminConfig {
+            max_diagnostic_records: 0,
+            ..config
+        },
+        crate::storage::AdminConfig {
+            startup_records_per_step: 10_001,
+            ..config
+        },
+    ] {
+        assert!(matches!(
+            ConfigRequest::check(invalid),
+            Err(StorageError::BudgetExceeded)
+        ));
+        assert_eq!(logical_snapshot(&writer.store.conn), before);
+    }
+    let counters = (writer.records, writer.bytes);
+    assert_eq!(
+        ConfigRequest::check(config)
+            .unwrap()
+            .save(&mut writer)
+            .unwrap(),
+        config
+    );
+    assert_eq!((writer.records, writer.bytes), counters);
+    assert_eq!(writer.store.limits.session_records, 10_000);
+    assert_eq!(writer.store.saved_admin_config().unwrap(), Some(config));
+    assert!(
+        crate::storage::RecordStore::open(&temp.data(), crate::storage::Limits::default()).is_err()
+    );
+    drop(writer);
+    let store =
+        crate::storage::RecordStore::open(&temp.data(), crate::storage::Limits::default()).unwrap();
+    assert_eq!(store.startup_state().unwrap(), StartupState::NeedsReview);
+    assert_eq!(
+        store.record(record.id()).unwrap().unwrap().bytes(),
+        record.bytes()
+    );
+    assert!(matches!(store.begin(), Err(StorageError::NeedsReview)));
+}

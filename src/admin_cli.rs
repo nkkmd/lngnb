@@ -320,8 +320,8 @@ fn save_config(
     let mut writer = startup
         .into_writer()
         .map_err(|_| Error::ConfigUnconfirmed)?;
-    writer
-        .save_admin_config(config.saved_values())
+    lngnb::storage::management::ConfigRequest::check(config.saved_values())
+        .and_then(|request| request.save(&mut writer))
         .map_err(|_| Error::ConfigUnconfirmed)?;
     writer.finish().map_err(|_| Error::ConfigUnconfirmed)?;
     config_report(config, output)
