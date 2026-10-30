@@ -27,6 +27,7 @@ pub mod client;
 mod configuration;
 mod evaluation;
 mod status;
+pub use configuration::ConfigError;
 pub use evaluation::Snapshot as EvaluationStatus;
 pub use status::Snapshot as RuntimeStatus;
 
@@ -66,6 +67,7 @@ pub struct Listener {
     socket: UnixListener,
     status: Option<status::Endpoint>,
     evaluation: Option<status::Endpoint>,
+    configuration: Option<status::Endpoint>,
     evaluation_records: u64,
     access: Access,
     identity: (u64, u64),
@@ -135,6 +137,7 @@ impl Listener {
             socket,
             status: None,
             evaluation: None,
+            configuration: None,
             evaluation_records: 10_000,
             access,
             identity: (created.dev(), created.ino()),
@@ -223,16 +226,23 @@ impl Listener {
         if let Some(endpoint) = &self.evaluation {
             endpoint.check(self.access.store(), self.owner)?;
         }
+        if let Some(endpoint) = &self.configuration {
+            endpoint.check(self.access.store(), self.owner)?;
+        }
         let Self {
             socket,
             status,
             evaluation,
+            configuration,
             access,
             owner,
             ..
         } = self;
         drop(socket);
         let store = access.store();
+        if let Some(endpoint) = configuration {
+            endpoint.close(store, owner)?;
+        }
         if let Some(endpoint) = evaluation {
             endpoint.close(store, owner)?;
         }

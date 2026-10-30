@@ -142,6 +142,34 @@ pub fn evaluate(path: &Path, timeout: Duration) -> Result<super::EvaluationStatu
     super::EvaluationStatus::check(&bytes).ok_or(Error::StatusUnavailable)
 }
 
+/// 設定専用socketへ検査済み4項目だけを送る。DB/旧endpointへ降格しない。
+/// 送信開始後の通信失敗・不正応答・値の不一致はすべて確定不明。自動再送なし。
+/// 成功は保存と次操作への反映。startup_records_per_stepは次回起動用。
+pub fn change_config(
+    path: &Path,
+    request: crate::storage::management::ConfigRequest,
+    timeout: Duration,
+) -> Result<crate::storage::AdminConfig> {
+    use super::configuration::{MAGIC, NAME, SIZE, bytes};
+    let expected = request.values();
+    let (mut stream, deadline) = connect_to(path, NAME, timeout)?;
+    let mut header = MAGIC.to_vec();
+    header.extend_from_slice(&(SIZE as u32).to_be_bytes());
+    send_all(&mut stream, &header, deadline).map_err(|_| Error::OutcomeUnknown)?;
+    send_all(&mut stream, &bytes(expected), deadline).map_err(|_| Error::OutcomeUnknown)?;
+    let mut header = [0; 8];
+    transfer(&mut stream, &mut header, deadline).map_err(|_| Error::OutcomeUnknown)?;
+    if header[..4] != MAGIC || header[4..] != ((SIZE + 1) as u32).to_be_bytes() {
+        return Err(Error::OutcomeUnknown);
+    }
+    let mut reply = [0; SIZE + 1];
+    transfer(&mut stream, &mut reply, deadline).map_err(|_| Error::OutcomeUnknown)?;
+    if reply[0] != 3 || reply[1..] != bytes(expected) {
+        return Err(Error::OutcomeUnknown);
+    }
+    Ok(expected)
+}
+
 /// 接続先のkernel UIDが領域所有者/rootであることを、送信前に照合する。
 /// timeoutは接続から応答全体まで一つの単調deadline（最大30秒）。
 /// 書込み開始後の失敗・不正応答・ID不一致は保守的にcommit不明として返す。

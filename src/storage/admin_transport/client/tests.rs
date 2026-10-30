@@ -406,3 +406,73 @@ fn evaluation_rejects_bad_or_missing_endpoint_and_malformed_reply_without_reques
     }
     server.close_writer().unwrap().finish().unwrap();
 }
+
+#[test]
+fn config_client_never_falls_back_or_confirms_mismatched_and_lost_responses() {
+    use crate::storage::{AdminConfig, management::ConfigRequest};
+    let config = AdminConfig {
+        request_timeout_ms: 500,
+        max_new_records: 2,
+        max_diagnostic_records: 7,
+        startup_records_per_step: 1,
+    };
+    let request = ConfigRequest::check(config).unwrap();
+    for variant in 0..8 {
+        let temp = Temp::new();
+        drop(temp.store());
+        let old = mock_socket(&temp.data());
+        old.set_nonblocking(true).unwrap();
+        if variant == 0 {
+            assert_eq!(
+                change_config(&temp.data(), request, Duration::from_secs(2)),
+                Err(Error::Endpoint)
+            );
+        } else {
+            let dir = directory(&temp.data()).unwrap();
+            let path = anchored(&dir, "admin-config.sock");
+            let socket = UnixListener::bind(&path).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let worker = thread::spawn(move || {
+                let (mut stream, _) = socket.accept().unwrap();
+                let mut bytes = [0; 40];
+                stream.read_exact(&mut bytes).unwrap();
+                // 独立固定値で要求順序/版/長さを照合する。
+                assert_eq!(&bytes[..8], &[b'L', b'N', b'C', 1, 0, 0, 0, 32]);
+                assert_eq!(u64::from_be_bytes(bytes[8..16].try_into().unwrap()), 500);
+                assert_eq!(u64::from_be_bytes(bytes[16..24].try_into().unwrap()), 2);
+                assert_eq!(u64::from_be_bytes(bytes[24..32].try_into().unwrap()), 7);
+                assert_eq!(u64::from_be_bytes(bytes[32..40].try_into().unwrap()), 1);
+                let mut header = [b'L', b'N', b'C', 1, 0, 0, 0, 33];
+                let mut reply = vec![3];
+                reply.extend_from_slice(&bytes[8..]);
+                match variant {
+                    1 => return,
+                    2 => header[3] = 2,
+                    3 => header[4..].fill(255),
+                    4 => reply.truncate(10),
+                    5 => reply[0] = 1,
+                    6 => reply[32] = 2,
+                    _ => (),
+                }
+                let _ = stream.write_all(&header);
+                let _ = stream.write_all(&reply);
+            });
+            assert_eq!(
+                change_config(&temp.data(), request, Duration::from_secs(2)),
+                if variant == 7 {
+                    Ok(config)
+                } else {
+                    Err(Error::OutcomeUnknown)
+                }
+            );
+            worker.join().unwrap();
+        }
+        assert_eq!(
+            old.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
+        assert_eq!(store.saved_admin_config().unwrap(), None);
+        assert_eq!(store.startup_state().unwrap(), StartupState::Clean);
+    }
+}
