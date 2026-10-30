@@ -1,8 +1,9 @@
 //! R01/R05/R24/R30/R34: 明示鍵で新規資料を署名し、既存の正常な領域へ保存するCLI。
 use super::AppError;
 use lngnb::{
-    authoring::{self, CreationBudget, CreationError, InitialRecords},
+    authoring::{self, CreationBudget, CreationError},
     authoring_input::{self, InputError},
+    record::{LocalRecord, RecordKind},
     id::{self, Id, Kind},
     keyfile::{KeyDirectory, KeyFileError},
     secret_terminal::{SecretInputError, SecretTerminal, TerminalSignals},
@@ -18,7 +19,13 @@ use std::{
 };
 
 #[derive(Debug, PartialEq, Eq)]
+enum Action {
+    Create,
+    Revise { genesis: PathBuf, parents: Vec<PathBuf> },
+}
+#[derive(Debug, PartialEq, Eq)]
 pub struct Command {
+    action: Action,
     data: PathBuf,
     keys: PathBuf,
     name: String,
@@ -29,11 +36,11 @@ pub struct Command {
     max_payload: usize,
 }
 pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
-    let usage = || AppError::Usage("document create の操作と引数を確認してください");
+    let usage = || AppError::Usage("document create/revise の操作と引数を確認してください");
     let [action, rest @ ..] = args else {
         return Err(usage());
     };
-    if action != "create" {
+    if action != "create" && action != "revise" {
         return Err(usage());
     }
     let mut data = None;
@@ -44,14 +51,23 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
     let mut metadata = None;
     let mut media = None;
     let mut max_payload = None;
-    for pair in rest.chunks(2) {
-        let [option, value] = pair else {
-            return Err(usage());
-        };
+    let mut genesis = None;
+    let mut parents = Vec::new();
+    let mut no_parents = false;
+    let mut rest = rest.iter();
+    while let Some(option) = rest.next() {
+        if option == "--no-parents" {
+            if action != "revise" || no_parents { return Err(usage()); }
+            no_parents = true;
+            continue;
+        }
+        let value = rest.next().ok_or_else(usage)?;
         if value.is_empty() {
             return Err(usage());
         }
         match option.to_str() {
+            Some("--genesis") if action == "revise" && genesis.is_none() => genesis = Some(PathBuf::from(value)),
+            Some("--parent") if action == "revise" && parents.len() < 256 => parents.push(PathBuf::from(value)),
             Some("--data-dir") if data.is_none() => data = Some(PathBuf::from(value)),
             Some("--key-dir") if keys.is_none() => keys = Some(PathBuf::from(value)),
             Some("--payload") if payload.is_none() => payload = Some(PathBuf::from(value)),
@@ -96,7 +112,12 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
             _ => return Err(usage()),
         }
     }
+    let action = if action == "revise" {
+        if no_parents != parents.is_empty() { return Err(usage()); }
+        Action::Revise { genesis: genesis.ok_or_else(usage)?, parents }
+    } else { Action::Create };
     Ok(Command {
+        action,
         data: data.ok_or_else(usage)?,
         keys: keys.ok_or_else(usage)?,
         name: name.ok_or_else(usage)?,
@@ -117,12 +138,13 @@ pub enum Error {
     Creation(CreationError),
     Storage(StorageError),
     Output,
+    SelectionMissing,
 }
 impl Error {
     pub fn exit_code(&self) -> u8 {
         match self {
             Self::Input(SecretInputError::Cancelled) | Self::File(InputError::Cancelled) => 130,
-            Self::Storage(_) => 3,
+            Self::Storage(_) | Self::SelectionMissing => 3,
             _ => 1,
         }
     }
@@ -136,11 +158,15 @@ impl fmt::Display for Error {
         Self::Key(e)=>write!(f,"{e}。資料の保存は開始していません。"),
         Self::Creation(e)=>write!(f,"{e}。資料の保存は開始していません。"),
         Self::Storage(e)=>write!(f,"{e}。保存処理を完了できませんでした。一部または全部が保存済みの可能性があります。領域を保全し、再作成せず確認してください。手動確認待ちは解除していません。"),
+        Self::SelectionMissing=>f.write_str("明示したGenesisまたは親が保存先にありません。新しい本文・Recordの保存は開始していません。領域を保全して確認してください。手動確認待ちは解除していません。"),
         Self::Output=>f.write_str("資料のローカル保存と正常終了は完了しましたが、結果出力に失敗しました。再作成せず保存領域を確認してください。"),
     }
     }
 }
 impl std::error::Error for Error {}
+impl From<StorageError> for Error {
+    fn from(error: StorageError) -> Self { Self::Storage(error) }
+}
 
 pub fn run(command: Command, output: &mut impl Write) -> Result<(), Error> {
     let signals = TerminalSignals::install().map_err(Error::Input)?;
@@ -152,6 +178,10 @@ pub fn run(command: Command, output: &mut impl Write) -> Result<(), Error> {
             signals.check_cancelled().is_err()
         })
         .map_err(Error::File)?;
+    let selected = match &command.action {
+        Action::Create => None,
+        Action::Revise { genesis, parents } => Some(read_revision_selection(genesis, parents, &signals)?),
+    };
     let mut directory = KeyDirectory::open(&command.keys).map_err(Error::Key)?;
     if directory
         .recovery_inventory()
@@ -172,40 +202,74 @@ pub fn run(command: Command, output: &mut impl Write) -> Result<(), Error> {
     }
     signals.check_cancelled().map_err(Error::Input)?;
     let (payload, metadata) = input.into_parts();
-    let pair =
-        authoring::create_initial(&key, &payload, metadata, command.media.as_deref(), budget)
+    let (genesis, revision, is_initial) = if let Some((genesis, parents)) = selected {
+        let refs: Vec<_> = parents.iter().collect();
+        let revision = authoring::create_revision(&key, &genesis, &refs, &payload, metadata, command.media.as_deref(), budget)
             .map_err(Error::Creation)?;
+        (genesis, revision, false)
+    } else {
+        let pair = authoring::create_initial(&key, &payload, metadata, command.media.as_deref(), budget)
+            .map_err(Error::Creation)?;
+        let (genesis, revision) = pair.into_parts();
+        (genesis, revision, true)
+    };
     drop(key);
     drop(terminal);
     drop(directory);
     signals.check_cancelled().map_err(Error::Input)?;
-    let text = summary(&pair)?;
+    let text = summary(&genesis, &revision, is_initial)?;
     // 保存側へ渡すのは完成Recordと同じ所有本文だけ。秘密鍵/端末はここより前に破棄する。
-    save(&command.data, &pair, &payload, command.max_payload).map_err(Error::Storage)?;
+    save(&command.data, &genesis, &revision, &payload, command.max_payload, is_initial)?;
     report(&text, output)
+}
+
+// 元Record集合は合計16 MiBまで。次fileも残予算で確保前に制限する。
+fn read_revision_selection(
+    genesis: &std::path::Path,
+    parents: &[PathBuf],
+    signals: &TerminalSignals,
+) -> Result<(LocalRecord, Vec<LocalRecord>), Error> {
+    let mut remaining = 16 * 1024 * 1024;
+    let mut read = |path: &std::path::Path| {
+        let bytes = authoring_input::read_record_file_limited(path, remaining, || signals.check_cancelled().is_err()).map_err(Error::File)?;
+        remaining -= bytes.len();
+        LocalRecord::check(&bytes, None).map_err(|_| Error::Creation(CreationError::InvalidInput))
+    };
+    let genesis = read(genesis)?;
+    if genesis.kind() != RecordKind::Genesis { return Err(Error::Creation(CreationError::InvalidInput)); }
+    let mut records = Vec::with_capacity(parents.len());
+    for path in parents {
+        let parent = read(path)?;
+        parent.check_genesis(&genesis).map_err(|_| Error::Creation(CreationError::InvalidInput))?;
+        if records.iter().any(|r: &LocalRecord| r.id() == parent.id()) { return Err(Error::Creation(CreationError::InvalidInput)); }
+        records.push(parent);
+    }
+    Ok((genesis, records))
 }
 
 fn save(
     path: &std::path::Path,
-    pair: &InitialRecords,
+    genesis: &LocalRecord,
+    revision: &LocalRecord,
     payload: &[u8],
     max_payload: usize,
-) -> Result<(), StorageError> {
+    is_initial: bool,
+) -> Result<(), Error> {
     let limits = Limits {
         max_blob_bytes: max_payload as u64,
         ..Limits::default()
     };
     let total = (payload.len() as u64)
-        .checked_add(pair.genesis().bytes().len() as u64)
-        .and_then(|n| n.checked_add(pair.revision().bytes().len() as u64))
+        .checked_add(genesis.bytes().len() as u64)
+        .and_then(|n| n.checked_add(revision.bytes().len() as u64))
         .and_then(|n| n.checked_add(1))
         .ok_or(StorageError::BudgetExceeded)?;
     if total > limits.session_bytes {
-        return Err(StorageError::BudgetExceeded);
+        return Err(Error::Storage(StorageError::BudgetExceeded));
     }
     let mut startup = LocalStartup::open(path, limits)?;
     if startup.needs_review() {
-        return Err(StorageError::NeedsReview);
+        return Err(Error::Storage(StorageError::NeedsReview));
     }
     loop {
         if startup
@@ -216,17 +280,22 @@ fn save(
         }
     }
     let mut writer = startup.into_writer()?;
+    if !is_initial {
+        for id in std::iter::once(genesis.id()).chain(revision.parents().map_err(|_| StorageError::Corrupt)?.into_iter().map(|bytes| Id { kind: Kind::Record, bytes })) {
+            if writer.record(id)?.is_none() { return Err(Error::SelectionMissing); }
+        }
+    }
     // 各段階は独立確定。後段失敗で先に保存した本文/Recordを消さない。
     let blob = writer.put_blob(id::blob_id(payload), Cursor::new(payload))?;
     if blob.byte_length != payload.len() as u64 {
-        return Err(StorageError::Corrupt);
+        return Err(Error::Storage(StorageError::Corrupt));
     }
-    management::store_record(&mut writer, pair.genesis())?;
-    management::store_record(&mut writer, pair.revision())?;
-    writer.finish()
+    if is_initial { management::store_record(&mut writer, genesis)?; }
+    management::store_record(&mut writer, revision)?;
+    writer.finish().map_err(Error::Storage)
 }
-fn summary(pair: &InitialRecords) -> Result<String, Error> {
-    let knowledge = match pair.genesis().body() {
+fn summary(genesis: &LocalRecord, revision: &LocalRecord, is_initial: bool) -> Result<String, Error> {
+    let knowledge = match genesis.body() {
         lngnb::cbor::Value::Map(m) => {
             m.iter()
                 .find(|(k, _)| k == "knowledge_id")
@@ -242,13 +311,14 @@ fn summary(pair: &InitialRecords) -> Result<String, Error> {
     }
     .ok_or(Error::Creation(CreationError::InvalidInput))?;
     Ok(format!(
-        "新規資料の本文と署名Recordをローカル保存しました（pin・公開は未実装）。\nknowledge_id: {}\ngenesis_id: {}\nrevision_id: {}\n",
+        "{}の本文と署名Recordをローカル保存しました（pin・公開は未実装）。\nknowledge_id: {}\ngenesis_id: {}\nrevision_id: {}\n",
+        if is_initial { "新規資料" } else { "改訂版" },
         Id {
             kind: Kind::Knowledge,
             bytes: knowledge
         },
-        pair.genesis().id(),
-        pair.revision().id()
+        genesis.id(),
+        revision.id()
     ))
 }
 fn report(text: &str, output: &mut impl Write) -> Result<(), Error> {
@@ -280,6 +350,31 @@ mod tests {
         .into_iter()
         .map(Into::into)
         .collect()
+    }
+    #[test]
+    fn revision_requires_explicit_genesis_and_parent_choice_with_bounded_count() {
+        let mut a = args();
+        a[0] = "revise".into();
+        assert!(parse(&a).is_err());
+        a.extend(["--genesis".into(), "genesis.cbor".into()]);
+        assert!(parse(&a).is_err());
+        let mut empty = a.clone();
+        empty.push("--no-parents".into());
+        assert!(matches!(parse(&empty).unwrap().action, Action::Revise { parents, .. } if parents.is_empty()));
+        empty.push("--no-parents".into());
+        assert!(parse(&empty).is_err());
+        a.extend(["--parent".into(), "parent.cbor".into()]);
+        assert!(parse(&a).is_ok());
+        let mut conflict = a.clone();
+        conflict.push("--no-parents".into());
+        assert!(parse(&conflict).is_err());
+        for _ in 1..256 { a.extend(["--parent".into(), "parent.cbor".into()]); }
+        assert!(parse(&a).is_ok());
+        a.extend(["--parent".into(), "parent.cbor".into()]);
+        assert!(parse(&a).is_err());
+        let mut create = args();
+        create.extend(["--genesis".into(), "private path".into()]);
+        assert!(parse(&create).is_err());
     }
     #[test]
     fn explicit_selection_and_optional_budget_are_parsed_without_correction() {

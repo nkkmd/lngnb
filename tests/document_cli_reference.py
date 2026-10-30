@@ -46,16 +46,20 @@ def assert_preserved_after_retry(name):
     assert new["history"][:len(old["history"])]==old["history"],"past history changed"
     assert count_state(name)[0]=="running"
     assert {p.name:p.read_bytes() for p in (ROOT/name/"blobs").iterdir()}==files
-def args(name, extra=(), key_id=KEY_ID, payload=None, metadata=None):
-    return [BINARY,"document","create","--data-dir",str(ROOT/name),"--key-dir",str(ROOT/"keys"),"--name","publisher","--expect-key-id",key_id,"--payload",str(payload or ROOT/"body"),"--metadata",str(metadata or ROOT/"metadata")]+list(extra)
-def invoke(name, password=PASS, expected=0, cancel=None, full=False, extra=(), key_id=KEY_ID, payload=None, metadata=None, before_password=None, after_password=None, no_prompt=False):
+def args(name, extra=(), key_id=KEY_ID, payload=None, metadata=None, selection=None):
+    command = [BINARY,"document","create","--data-dir",str(ROOT/name),"--key-dir",str(ROOT/"keys"),"--name","publisher","--expect-key-id",key_id,"--payload",str(payload or ROOT/"body"),"--metadata",str(metadata or ROOT/"metadata")]+list(extra)
+    if selection is not None:
+        command[2] = "revise"
+        command += list(selection)
+    return command
+def invoke(name, password=PASS, expected=0, cancel=None, full=False, extra=(), key_id=KEY_ID, payload=None, metadata=None, before_password=None, after_password=None, no_prompt=False, selection=None):
     master,slave=pty.openpty()
     before=termios.tcgetattr(slave);before[3]|=termios.ECHO|termios.ECHONL|termios.ICANON|termios.ISIG
     termios.tcsetattr(slave,termios.TCSANOW,before);before=termios.tcgetattr(slave)
     def setup():
         os.setsid();fcntl.ioctl(slave,termios.TIOCSCTTY,0)
     sink=open("/dev/full","wb") if full else subprocess.PIPE
-    child=subprocess.Popen(args(name,extra,key_id,payload,metadata),stdin=subprocess.DEVNULL,stdout=sink,stderr=subprocess.PIPE,pass_fds=(slave,),preexec_fn=setup)
+    child=subprocess.Popen(args(name,extra,key_id,payload,metadata,selection),stdin=subprocess.DEVNULL,stdout=sink,stderr=subprocess.PIPE,pass_fds=(slave,),preexec_fn=setup)
     captured=bytearray()
     try:
         if not no_prompt:
@@ -162,4 +166,116 @@ assert count_state("kill")==("running",1,1)
 assert_preserved_after_retry("kill")
 assert (ROOT/"keys/publisher").read_bytes()==original_key
 assert (ROOT/"body").read_bytes()==BODY and cbor2.loads((ROOT/"metadata").read_bytes())==META
+# R07: 同一Knowledgeの明示改訂。元Recordをファイルへ書くのは試験側の操作。
+def fields(out):
+    return dict(line.decode().split(": ",1) for line in out.splitlines() if b"_id: " in line)
+def rawid(text):
+    return base64.b32decode(text.split("_",1)[1].upper()+"====")
+def saved(name):
+    with db(name) as c:
+        return dict(c.execute("SELECT id,bytes FROM records"))
+def export(name, rid, filename):
+    path = ROOT/filename
+    path.write_bytes(saved(name)[rawid(rid)])
+    return str(path)
+base = fields(out2)
+gen = export("ok", base["genesis_id"], "revision-genesis")
+parent = export("ok", base["revision_id"], "revision-parent")
+old_records = saved("ok")
+(ROOT/"revision-meta").write_bytes(cbor2.dumps({},canonical=True))
+(ROOT/"revision-body").write_bytes(b"branch a")
+selection = ["--genesis",gen,"--parent",parent]
+def revision(name="ok", parents=None, **kwargs):
+    return invoke(name, payload=ROOT/"revision-body", metadata=ROOT/"revision-meta",
+                  selection=selection if parents is None else ["--genesis",gen]+sum((["--parent",p] for p in parents),[]), **kwargs)
+def checked_revision(out, payload, parent_ids):
+    f = fields(out)
+    assert f["knowledge_id"] == base["knowledge_id"] and f["genesis_id"] == base["genesis_id"]
+    raw = saved("ok")[rawid(f["revision_id"])];record = cbor2.loads(raw);body = record["body"]
+    assert cbor2.dumps(record,canonical=True)==raw
+    assert hashlib.sha256(b"lngnb:record:library-core-1\0"+raw).digest()==rawid(f["revision_id"])
+    sig=record["signature"]
+    assert sig["public_key_bytes"]==KEY and sig["key_id"]==hashlib.sha256(b"lngnb:key:ed25519:1\0"+KEY).digest()
+    Ed25519PublicKey.from_public_bytes(KEY).verify(sig["signature_bytes"],b"lngnb:signature:library-core-1\0"+cbor2.dumps(body,canonical=True))
+    assert body["knowledge_id"]==rawid(base["knowledge_id"]) and body["genesis_record_id"]==rawid(base["genesis_id"])
+    assert body["parents"]==sorted(rawid(r) for r in parent_ids)
+    assert "origins" not in body
+    assert body["metadata"]=={"information_type":{"namespace":"lngnb","code":0},"resource_type":"lngnb:unspecified"}
+    bid=hashlib.sha256(b"lngnb:blob:1\0"+payload).digest()
+    assert body["payload"]=={"blob_id":bid,"byte_length":len(payload),"media_type":""}
+    assert (ROOT/"ok/blobs"/bid.hex()).read_bytes()==payload
+    assert count_state("ok")[0]=="clean"
+    assert all(saved("ok")[rid]==raw for rid,raw in old_records.items())
+    return f["revision_id"]
+a,_=revision();aid=checked_revision(a,b"branch a",[base["revision_id"]]);ap=export("ok",aid,"branch-a")
+(ROOT/"revision-body").write_bytes(b"branch b")
+b,_=revision();bid=checked_revision(b,b"branch b",[base["revision_id"]]);bp=export("ok",bid,"branch-b")
+(ROOT/"revision-body").write_bytes(b"merge")
+m,_=revision(parents=[bp,ap]);mid=checked_revision(m,b"merge",[aid,bid])
+state=count_state("ok");again,_=revision(parents=[ap,bp]);assert fields(again)["revision_id"]==mid and count_state("ok")==state
+(ROOT/"revision-body").write_bytes(b"another initial")
+empty=["--genesis",gen,"--no-parents"]
+e,_=invoke("ok",payload=ROOT/"revision-body",metadata=ROOT/"revision-meta",selection=empty)
+checked_revision(e,b"another initial",[])
+# 書込み前拒否では全論理DB不変。取消し・鍵・入力・明示親の異常を区別する。
+for sig in [signal.SIGHUP,signal.SIGINT,signal.SIGQUIT,signal.SIGTERM,signal.SIGTSTP]:
+    old=snapshot("ok");revision(expected=130,cancel=sig);assert snapshot("ok")==old
+for kwargs in [{"password":b"public wrong password"},{"key_id":"ky1_"+"a"*52}]:
+    old=snapshot("ok");revision(expected=1,**kwargs);assert snapshot("ok")==old
+for chosen in [["--genesis",parent,"--parent",parent], ["--genesis",gen,"--parent",gen],
+               ["--genesis",gen,"--parent",parent,"--parent",parent]]:
+    old=snapshot("ok");invoke("ok",selection=chosen,expected=1,no_prompt=True);assert snapshot("ok")==old
+# 別Knowledgeの親、局所署名不正、予算不足、危険link、親未選択。
+other_id=next(ident("rc1_", b"lngnb:record:library-core-1\0", raw) for raw in old_records.values() if cbor2.loads(raw)["body"]["record_kind"]=="revision" and cbor2.loads(raw)["body"]["knowledge_id"]!=rawid(base["knowledge_id"]))
+other=export("ok",other_id,"other-parent")
+old=snapshot("ok");revision(parents=[other],expected=1,no_prompt=True);assert snapshot("ok")==old
+(ROOT/"bad-record").write_bytes(b"not cbor")
+old=snapshot("ok");revision(parents=[str(ROOT/"bad-record")],expected=1,no_prompt=True);assert snapshot("ok")==old
+old=snapshot("ok");revision(extra=["--max-payload-bytes","0"],expected=1,no_prompt=True);assert snapshot("ok")==old
+os.symlink(parent,ROOT/"linked-parent")
+old=snapshot("ok");revision(parents=[str(ROOT/"linked-parent")],expected=1,no_prompt=True);assert snapshot("ok")==old
+r=subprocess.run(args("ok",selection=["--genesis",gen]),capture_output=True)
+assert r.returncode==2 and r.stdout==b""
+# 一Record上限と、複数の有効Recordの合計16 MiB予算を署名前に適用する。
+(ROOT/"oversize-parent").write_bytes(b"x"*2097153)
+old=snapshot("ok");revision(parents=[str(ROOT/"oversize-parent")],expected=1,no_prompt=True);assert snapshot("ok")==old
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+A13=json.loads(SPEC.split("## 付録A13 ",1)[1].split("```json\n",1)[1].split("\n```",1)[0])
+signing=Ed25519PrivateKey.from_private_bytes(bytes.fromhex(A13["seed_hex"]))
+large_parents=[]
+for n in range(65):
+    body=cbor2.loads(Path(parent).read_bytes())["body"]
+    body["metadata"]={"information_type":{"namespace":"lngnb","code":0},"resource_type":"lngnb:unspecified","extensions":{"padding":"x"*260000}}
+    body["payload"]["byte_length"]=n
+    encoded=cbor2.dumps(body,canonical=True)
+    record={"body":body,"signature":{"algorithm":"ed25519","public_key_bytes":KEY,
+            "key_id":hashlib.sha256(b"lngnb:key:ed25519:1\0"+KEY).digest(),
+            "signature_bytes":signing.sign(b"lngnb:signature:library-core-1\0"+encoded)}}
+    path=ROOT/("large-parent-"+str(n));path.write_bytes(cbor2.dumps(record,canonical=True));large_parents.append(str(path))
+assert sum(Path(p).stat().st_size for p in large_parents)>16*1024*1024
+old=snapshot("ok");revision(parents=large_parents,expected=1,no_prompt=True);assert snapshot("ok")==old
+# 元pathの後の差替えで署名対象を変えない。
+parent_bytes=Path(parent).read_bytes()
+(ROOT/"revision-body").write_bytes(b"stable input")
+v,_=revision(before_password=lambda:Path(parent).write_bytes(b"changed path"))
+checked_revision(v,b"stable input",[base["revision_id"]]);Path(parent).write_bytes(parent_bytes)
+# 保存先に元版がなければ、新しい本文/Recordを保存せず保全停止する。
+for name in ["revision-missing","revision-sql","revision-finish","revision-output"]:
+    r=subprocess.run([BINARY,"data","init","--data-dir",str(ROOT/name)],capture_output=True);assert r.returncode==0
+revision("revision-missing",expected=3);assert count_state("revision-missing")==("running",0,0)
+# 元版のある領域へ複製するのは、全保存fileを持つ停止中fixtureの明示コピーだけ。
+import shutil
+for name in ["revision-sql","revision-finish","revision-output"]:
+    shutil.rmtree(ROOT/name);shutil.copytree(ROOT/"ok",ROOT/name)
+with db("revision-sql") as c:c.executescript("CREATE TRIGGER fail_new_revision BEFORE INSERT ON records BEGIN SELECT RAISE(ABORT,'test'); END;")
+old=saved("revision-sql");(ROOT/"revision-body").write_bytes(b"sql failure")
+revision("revision-sql",expected=3);assert saved("revision-sql")==old and count_state("revision-sql")[0]=="running"
+with db("revision-finish") as c:c.executescript("CREATE TRIGGER fail_revision_finish BEFORE UPDATE OF state ON storage_state WHEN NEW.state='clean' BEGIN SELECT RAISE(ABORT,'test'); END;")
+old=saved("revision-finish");revision("revision-finish",expected=3)
+assert len(saved("revision-finish"))==len(old)+1 and count_state("revision-finish")[0]=="running"
+_,err=revision("revision-output",expected=1,full=True);assert "保存と正常終了は完了" in err.decode();assert count_state("revision-output")[0]=="clean"
+# 後続の無関係操作で手動待ちを解除しない。一次bytes・鍵・元入力を保持する。
+old=saved("revision-sql");revision("revision-sql",expected=3);assert saved("revision-sql")==old and count_state("revision-sql")[0]=="running"
+assert (ROOT/"keys/publisher").read_bytes()==original_key
+assert Path(parent).read_bytes()==parent_bytes and saved("ok")[rawid(base["genesis_id"])]==Path(gen).read_bytes()
 print("DOCUMENT_CLI_CASES_OK")

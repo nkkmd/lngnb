@@ -53,6 +53,10 @@ impl InitialRecords {
     pub fn revision(&self) -> &LocalRecord {
         &self.revision
     }
+    /// 完成した組を、再符号化せず所有権ごと保存側へ渡す。
+    pub fn into_parts(self) -> (LocalRecord, LocalRecord) {
+        (self.genesis, self.revision)
+    }
 }
 fn map(fields: Vec<(&str, Value)>) -> Value {
     Value::Map(fields.into_iter().map(|(k, v)| (k.into(), v)).collect())

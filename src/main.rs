@@ -34,6 +34,7 @@ const HELP: &str = "lngnb — 分散図書館・知識基盤（開発初期段�
   lngnb admin serve --data-dir PATH [--request-timeout-ms N] [--max-new-records N] [--max-diagnostic-records N] [--startup-records-per-step N] [--startup-record-bytes-per-step N] [--startup-blob-bytes-per-step N] [--startup-blob-targets-per-step N] [--startup-record-edges-per-step N] [--startup-evaluation-records-per-step N] [--sql-inspection-callbacks N] [--sql-inspection-timeout-ms N] [--startup-inspection-timeout-ms N] [--startup-record-input-timeout-ms N] [--startup-blob-input-timeout-ms N] [--startup-evaluation-timeout-ms N]
   lngnb record submit --data-dir PATH --record PATH
   lngnb document create --data-dir PATH --key-dir PATH --name NAME --expect-key-id KEY_ID --payload PATH --metadata PATH [--media-type TYPE] [--max-payload-bytes N]
+  lngnb document revise --data-dir PATH --key-dir PATH --name NAME --expect-key-id KEY_ID --payload PATH --metadata PATH --genesis PATH (--parent PATH ... | --no-parents) [--media-type TYPE] [--max-payload-bytes N]
   lngnb key create --key-dir PATH --name NAME
   lngnb key check --key-dir PATH --name NAME
   lngnb key change-passphrase --key-dir PATH --name NAME
@@ -58,6 +59,8 @@ restore-residue は期待鍵IDと照合し、同じ領域の空いている通�
 config show は設定候補の表示だけを行います。
 データ領域の初期化・設定の保存・既存設定の読込み・接続は行いません。
 document create は初期化済みの正常なデータ領域へ新規資料を保存します。
+document revise は明示したGenesisと親（最大256件）から同じKnowledgeの新Revisionを保存します。
+親なしは --no-parents を明示。起点・親は保存先に必要で、自動取込み・先端選択・由来継承はしません。
 metadataは決定的CBOR map。本文予算は既定16 MiB、指定上限は64 MiB未満です。
 保存失敗時は一部保存の可能性があるため、再作成せず領域を保全してください。
 data init は既存の親ディレクトリの下に新しい保存領域だけを作成します。
