@@ -56,6 +56,43 @@ for case in json.load(sys.stdin):
             assert "languages" not in body["metadata"] and "origins" not in body
         else:
             assert body["record_kind"] == "genesis"
+    if "revision_creation" in case:
+        creation = case["revision_creation"]
+        genesis_bytes = bytes.fromhex(creation["genesis"])
+        genesis = cbor2.loads(genesis_bytes)
+        assert cbor2.dumps(genesis, canonical=True) == genesis_bytes
+        assert genesis["body"]["record_kind"] == "genesis"
+        assert genesis["body"]["publisher_public_key"] == public
+        key.public_key().verify(genesis["signature"]["signature_bytes"],
+                                DS + cbor2.dumps(genesis["body"], canonical=True))
+        genesis_id = hashlib.sha256(DR + genesis_bytes).digest()
+        parent_ids = []
+        for parent_hex in creation["parents"]:
+            parent_bytes = bytes.fromhex(parent_hex)
+            parent = cbor2.loads(parent_bytes)
+            assert cbor2.dumps(parent, canonical=True) == parent_bytes
+            parent_body = parent["body"]
+            assert parent_body["profile_id"] == genesis["body"]["profile_id"]
+            assert parent_body["record_kind"] == "revision"
+            assert parent_body["knowledge_id"] == genesis["body"]["knowledge_id"]
+            assert parent_body["genesis_record_id"] == genesis_id
+            assert parent["signature"]["public_key_bytes"] == public
+            key.public_key().verify(parent["signature"]["signature_bytes"],
+                                    DS + cbor2.dumps(parent_body, canonical=True))
+            parent_ids.append(hashlib.sha256(DR + parent_bytes).digest())
+        assert len(set(parent_ids)) == len(parent_ids)
+        assert body["record_kind"] == "revision"
+        assert body["knowledge_id"] == genesis["body"]["knowledge_id"]
+        assert body["genesis_record_id"] == genesis_id
+        assert body["parents"] == sorted(parent_ids)
+        payload = bytes.fromhex(creation["payload"])
+        assert body["payload"]["blob_id"] == hashlib.sha256(b"lngnb:blob:1\0" + payload).digest()
+        assert body["payload"]["byte_length"] == len(payload)
+        assert body["payload"]["media_type"] == "application/octet-stream"
+        assert body["metadata"]["titles"] == {"ja": "e\u0301 é"}
+        assert body["metadata"]["information_type"] == {"namespace": "lngnb", "code": 0}
+        assert body["metadata"]["resource_type"] == "lngnb:unspecified"
+        assert "origins" not in body
     digest = hashlib.sha256(DR + encoded).digest()
     ids.append("rc1_" + base64.b32encode(digest).decode("ascii").lower().rstrip("="))
 json.dump(ids, sys.stdout)

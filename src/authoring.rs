@@ -1,4 +1,4 @@
-//! A2/A3/A11: 新規資料のGenesis/初版Revisionを署名する内部基盤。
+//! A2/A3/A11: 新規資料と明示したGenesis・親からRevisionを署名する内部基盤。
 //! 完成Recordだけを返す。CLI・本文I/O・永続保存・pin・公開には接続しない。
 use crate::{
     cbor::{self, Value},
@@ -236,6 +236,77 @@ fn create_with(
         .check_genesis(&genesis)
         .map_err(|_| CreationError::SigningFailed)?;
     Ok(InitialRecords { genesis, revision })
+}
+
+/// 明示したGenesisの発行鍵で、指定した親集合を持つ新しいRevisionを作る。
+/// 親は局所検査済みのRevisionを最大256件、重複なしで指定する。生ID順へ並べる。
+/// 空集合は同じKnowledgeの別初版。先端選択・親/metadata/由来の暗黙継承は行わない。
+/// 直接の親とGenesisの結合だけを照合し、祖先全体・本文・保存・pin・公開は検証しない。
+/// 返却値は完成署名Recordだけであり、record_validation=validを表さない。
+pub fn create_revision(
+    key: &UnlockedKey,
+    genesis: &LocalRecord,
+    parents: &[&LocalRecord],
+    payload: &[u8],
+    metadata_input: Value,
+    media_type: Option<&str>,
+    budget: CreationBudget,
+) -> Result<LocalRecord> {
+    if genesis.kind() != crate::record::RecordKind::Genesis
+        || key.public_key() != genesis.identity().public
+        || parents.len() > 256
+    {
+        return Err(CreationError::InvalidInput);
+    }
+    if payload.len() > budget.max_payload_bytes {
+        return Err(CreationError::PayloadLimit);
+    }
+    let media_type = media_type.unwrap_or("");
+    if media_type.len() > 255 {
+        return Err(CreationError::InvalidInput);
+    }
+    // 件数を検査してから確保。親の署名済みbytesやmetadataを複製しない。
+    let mut ids = Vec::with_capacity(parents.len());
+    for parent in parents {
+        parent
+            .check_genesis(genesis)
+            .map_err(|_| CreationError::InvalidInput)?;
+        ids.push(parent.id().bytes);
+    }
+    ids.sort_unstable();
+    if ids.windows(2).any(|w| w[0] == w[1]) {
+        return Err(CreationError::InvalidInput);
+    }
+    let length = i64::try_from(payload.len()).map_err(|_| CreationError::PayloadLimit)?;
+    let metadata = metadata(metadata_input)?;
+    let revision = key
+        .sign_record(map(vec![
+            ("profile_id", text(PROFILE)),
+            ("record_kind", text("revision")),
+            ("knowledge_id", bytes(&genesis.identity().knowledge)),
+            ("genesis_record_id", bytes(&genesis.id().bytes)),
+            (
+                "parents",
+                Value::Array(ids.iter().map(|id| bytes(id)).collect()),
+            ),
+            (
+                "payload",
+                map(vec![
+                    ("blob_id", bytes(&id::blob_id(payload).bytes)),
+                    ("byte_length", Value::Int(length)),
+                    ("media_type", text(media_type)),
+                ]),
+            ),
+            ("metadata", metadata),
+        ]))
+        .map_err(|_| CreationError::InvalidInput)?;
+    revision
+        .check_genesis(genesis)
+        .map_err(|_| CreationError::SigningFailed)?;
+    if ids.contains(&revision.id().bytes) {
+        return Err(CreationError::InvalidInput);
+    }
+    Ok(revision)
 }
 
 #[cfg(test)]
@@ -624,4 +695,116 @@ mod tests {
             ]
         );
     }
+
+    fn revise(key: &UnlockedKey, genesis: &LocalRecord, parents: &[&LocalRecord], payload: &[u8]) -> LocalRecord {
+        create_revision(key, genesis, parents, payload, Value::Map(vec![]), None, CreationBudget::default()).unwrap()
+    }
+
+    #[test]
+    fn revision_empty_parents_reproduces_a13_without_changing_genesis() {
+        let key = key();
+        let f = a13();
+        let genesis = LocalRecord::check(&unhex(f["genesis"]["envelope_cbor_hex"].as_str().unwrap()), None).unwrap();
+        let expected = LocalRecord::check(&unhex(f["revision"]["envelope_cbor_hex"].as_str().unwrap()), None).unwrap();
+        let original = genesis.bytes().to_vec();
+        let payload = unhex(f["blob_hex"].as_str().unwrap());
+        let result = create_revision(&key, &genesis, &[], &payload, get(expected.body(), "metadata").clone(), Some("text/plain"), CreationBudget::default()).unwrap();
+        assert_eq!(result.bytes(), expected.bytes());
+        assert_eq!(genesis.bytes(), original);
+    }
+
+    #[test]
+    fn revision_chain_branch_and_merge_keep_inputs_and_canonical_parent_set() {
+        let key = key();
+        let initial = create_initial(&key, b"base", Value::Map(vec![]), None, CreationBudget::default()).unwrap();
+        let original = initial.revision().bytes().to_vec();
+        let a = revise(&key, initial.genesis(), &[initial.revision()], b"branch a");
+        let b = revise(&key, initial.genesis(), &[initial.revision()], b"branch b");
+        let merged = revise(&key, initial.genesis(), &[&b, &a], b"merged");
+        let reordered = revise(&key, initial.genesis(), &[&a, &b], b"merged");
+        assert_eq!(merged.bytes(), reordered.bytes());
+        let mut expected = vec![a.id().bytes, b.id().bytes];
+        expected.sort();
+        assert_eq!(merged.parents().unwrap(), expected);
+        assert_eq!(a.parents().unwrap(), vec![initial.revision().id().bytes]);
+        assert_ne!(a.id(), b.id());
+        assert_eq!(initial.revision().bytes(), original);
+        // 同じ起点であっても、新しい親なし初版を旧先端へ自動接続しない。
+        let independent = revise(&key, initial.genesis(), &[], b"another initial");
+        assert!(independent.parents().unwrap().is_empty());
+    }
+
+    #[test]
+    fn revision_rejects_wrong_key_or_genesis_duplicate_and_excessive_parents() {
+        let key = key();
+        let initial = create_initial(&key, b"base", Value::Map(vec![]), None, CreationBudget::default()).unwrap();
+        let other = create_initial(&key, b"other", Value::Map(vec![]), None, CreationBudget::default()).unwrap();
+        let other_key = ed25519_dalek::SigningKey::from_bytes(&[1; 32]);
+        let wrong_publisher = LocalRecord::sign(initial.revision().body().clone(), &other_key).unwrap();
+        let wrong_genesis = LocalRecord::sign(map(vec![
+            ("profile_id", text(PROFILE)), ("record_kind", text("genesis")),
+            ("knowledge_id", bytes(&initial.genesis().identity().knowledge)),
+            ("publisher_public_key", bytes(&other_key.verifying_key().to_bytes())),
+        ]), &other_key).unwrap();
+        for (genesis, parents) in [
+            (initial.revision(), vec![]),
+            (&wrong_genesis, vec![]),
+            (initial.genesis(), vec![initial.genesis()]),
+            (initial.genesis(), vec![other.revision()]),
+            (initial.genesis(), vec![&wrong_publisher]),
+            (initial.genesis(), vec![initial.revision(), initial.revision()]),
+            (initial.genesis(), vec![initial.revision(); 257]),
+        ] {
+            assert_eq!(create_revision(&key, genesis, &parents, b"", Value::Map(vec![]), None, CreationBudget::default()).unwrap_err(), CreationError::InvalidInput);
+        }
+        // 同じKnowledgeと鍵でも、別Genesisに属する親は受け入れない。
+        let mut body = initial.revision().body().clone();
+        let Value::Map(fields) = &mut body else { unreachable!() };
+        fields.iter_mut().find(|(k, _)| k == "genesis_record_id").unwrap().1 = bytes(&other.genesis().id().bytes);
+        let changed = key.sign_record(body).unwrap();
+        assert_eq!(create_revision(&key, initial.genesis(), &[&changed], b"", Value::Map(vec![]), None, CreationBudget::default()).unwrap_err(), CreationError::InvalidInput);
+    }
+
+    #[test]
+    fn revision_payload_metadata_and_parent_count_boundaries_are_checked() {
+        let key = key();
+        let initial = create_initial(&key, b"", Value::Map(vec![]), None, CreationBudget::default()).unwrap();
+        let budget = CreationBudget { max_payload_bytes: 2 };
+        for payload in [b"".as_slice(), b"a".as_slice(), b"ab".as_slice()] {
+            create_revision(&key, initial.genesis(), &[], payload, Value::Map(vec![]), None, budget).unwrap();
+        }
+        assert_eq!(create_revision(&key, initial.genesis(), &[], b"abc", Value::Map(vec![]), None, budget).unwrap_err(), CreationError::PayloadLimit);
+        for metadata in [Value::Null, map(vec![("titles", map(vec![("JA", text("a")), ("ja", text("b"))]))])] {
+            assert_eq!(create_revision(&key, initial.genesis(), &[], b"", metadata, None, budget).unwrap_err(), CreationError::InvalidInput);
+        }
+        assert_eq!(create_revision(&key, initial.genesis(), &[], b"", Value::Map(vec![]), Some(&"a".repeat(256)), budget).unwrap_err(), CreationError::InvalidInput);
+        let parents: Vec<_> = (0..256u32).map(|n| revise(&key, initial.genesis(), &[], &n.to_be_bytes())).collect();
+        let refs: Vec<_> = parents.iter().collect();
+        let merged = revise(&key, initial.genesis(), &refs, b"max parents");
+        assert_eq!(merged.parents().unwrap().len(), 256);
+    }
+
+    #[test]
+    fn independent_python_checks_revision_parent_bindings_and_payload() {
+        let key = key();
+        let initial = create_initial(&key, b"base", Value::Map(vec![]), None, CreationBudget::default()).unwrap();
+        let a = revise(&key, initial.genesis(), &[initial.revision()], b"a");
+        let b = revise(&key, initial.genesis(), &[initial.revision()], b"b");
+        let payload = b"public revised payload\x00\xff\n";
+        let merged = create_revision(&key, initial.genesis(), &[&b, &a], payload,
+            map(vec![("titles", map(vec![("JA", text("e\u{301} é"))]))]),
+            Some("application/octet-stream"), CreationBudget::default()).unwrap();
+        let cases = vec![serde_json::json!({
+            "seed": a13()["seed_hex"], "body": hex(&cbor::encode(merged.body()).unwrap()), "envelope": hex(merged.bytes()),
+            "revision_creation": {"payload": hex(payload), "genesis": hex(initial.genesis().bytes()), "parents": [hex(b.bytes()), hex(a.bytes())]}
+        })];
+        let mut child = Command::new(std::env::var_os("LNGNB_REFERENCE_PYTHON").expect("independent checker required"))
+            .arg("tests/reference.py").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        child.stdin.take().unwrap().write_all(serde_json::to_string(&cases).unwrap().as_bytes()).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "independent revision check failed (details suppressed)");
+        let ids: Vec<String> = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(ids, vec![merged.id().to_string()]);
+    }
+
 }
