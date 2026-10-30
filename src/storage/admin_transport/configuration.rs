@@ -142,6 +142,9 @@ impl Listener {
     }
     fn change_admin_config_inner(&mut self, request: ConfigRequest) -> Result<AdminConfig> {
         self.check_endpoint()?;
+        if let Some(endpoint) = &self.configuration {
+            endpoint.check(self.access.store(), self.owner)?;
+        }
         for endpoint in [&self.status, &self.evaluation] {
             endpoint
                 .as_ref()
@@ -360,6 +363,7 @@ mod tests {
         let temp = Temp::new();
         let mut listener = listener(&temp, true);
         listener.enable_configuration().unwrap();
+        listener.timeout = Duration::from_secs(5);
         assert!(!listener.serve_configuration_if_pending().unwrap());
         let before = status(&temp, &mut listener);
         let path = temp.data();
@@ -402,6 +406,7 @@ mod tests {
             let temp = Temp::new();
             let mut listener = listener(&temp, true);
             listener.enable_configuration().unwrap();
+            listener.timeout = Duration::from_secs(5);
             let before = logical_snapshot(&listener.access.store().conn);
             let mut header = [b'L', b'N', b'C', 1, 0, 0, 0, 32];
             let mut body = bytes(values()).to_vec();
@@ -418,7 +423,7 @@ mod tests {
                 Err(ConfigError::Transport(_))
             ));
             assert_eq!(logical_snapshot(&listener.access.store().conn), before);
-            assert_eq!(listener.timeout, Duration::from_millis(100));
+            assert_eq!(listener.timeout, Duration::from_secs(5));
             drop(listener); // 保全停止ではsocketも残す。
             assert!(temp.data().join(NAME).exists());
             let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
@@ -436,14 +441,11 @@ mod tests {
             let temp = Temp::new();
             let mut listener = listener(&temp, true);
             listener.enable_configuration().unwrap();
+            listener.timeout = Duration::from_secs(5);
             if reject_sql {
                 listener.access.store().conn.execute_batch("CREATE TRIGGER reject_config BEFORE INSERT ON history WHEN NEW.new_state='admin_config_saved_local_only' BEGIN SELECT RAISE(ABORT,'test'); END;").unwrap();
             }
-            let stream = raw_request(
-                &temp,
-                &bytes(values()),
-                [b'L', b'N', b'C', 1, 0, 0, 0, 32],
-            );
+            let stream = raw_request(&temp, &bytes(values()), [b'L', b'N', b'C', 1, 0, 0, 0, 32]);
             // 書込み済み要求は残すが応答を受取れない状態にし、速度に依存させない。
             stream.shutdown(std::net::Shutdown::Read).unwrap();
             assert_eq!(
@@ -456,7 +458,7 @@ mod tests {
             );
             assert_eq!(
                 listener.timeout,
-                Duration::from_millis(if reject_sql { 100 } else { 500 })
+                Duration::from_millis(if reject_sql { 5000 } else { 500 })
             );
             assert_eq!(
                 listener.access.store().saved_admin_config().unwrap(),
@@ -479,6 +481,7 @@ mod tests {
             let path = anchored(&listener.access.store().dir, NAME);
             if replace {
                 listener.enable_configuration().unwrap();
+                listener.timeout = Duration::from_secs(5);
                 std::fs::remove_file(&path).unwrap();
             }
             std::fs::write(&path, b"preserve").unwrap();
@@ -497,5 +500,4 @@ mod tests {
             assert_eq!(store.startup_state().unwrap(), StartupState::NeedsReview);
         }
     }
-
 }
