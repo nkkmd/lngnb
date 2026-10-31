@@ -692,7 +692,14 @@ fn independent_python_checks_reference_views_including_absence_and_bounds() {
         with_references(&parents, Some(origins), 2),
         with_references(&[], Some(origin_forms()), 3),
     ];
-    let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let hex = |bytes: &[u8]| {
+        use std::fmt::Write as _;
+        let mut text = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            write!(text, "{byte:02x}").unwrap();
+        }
+        text
+    };
     let cases: Vec<_> = records.iter().map(|record| {
         let refs = record.revision_references().unwrap();
         serde_json::json!({"seed": fixture_data()["seed_hex"], "body": hex(&cbor::encode(record.body()).unwrap()), "envelope": hex(record.bytes()),
