@@ -433,6 +433,48 @@ pub fn store_record(writer: &mut RecordWriter, record: &LocalRecord) -> Result<R
     })
 }
 
+/// 管理者の明示した根拠復旧確認。確認文を解釈して復旧/再開を推測しない。
+#[derive(PartialEq, Eq)]
+pub struct RecoveryReviewRequest {
+    expected_generation: i64,
+    restored: String,
+    unconfirmed: String,
+}
+impl std::fmt::Debug for RecoveryReviewRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecoveryReviewRequest")
+            .field("expected_generation", &self.expected_generation)
+            .finish_non_exhaustive()
+    }
+}
+impl RecoveryReviewRequest {
+    /// 確認文はそれぞれUTF-8で1〜4096 bytes、空白のみ/NULを拒否。確保前に検査する。
+    pub fn check(expected_generation: i64, restored: &str, unconfirmed: &str) -> Result<Self> {
+        if expected_generation < 0
+            || [restored, unconfirmed]
+                .iter()
+                .any(|s| s.trim().is_empty() || s.len() > 4096 || s.contains('\0'))
+        {
+            return Err(super::StorageError::InvalidRecoveryReview);
+        }
+        Ok(Self {
+            expected_generation,
+            restored: restored.into(),
+            unconfirmed: unconfirmed.into(),
+        })
+    }
+    /// 既存の所有者/root・領域・排他・起動検査を再利用し、同じ排他で既存確認APIへ渡す。
+    /// 開始履歴や確認が保存済みの可能性を失敗から推測しない。再試行・writer/finishなし。
+    pub fn confirm_stopped(self, path: &std::path::Path) -> Result<super::EvidenceRecoveryReview> {
+        RecordStore::open(path, super::Limits::default())?.confirm_evidence_recovery(
+            self.expected_generation,
+            &self.restored,
+            &self.unconfirmed,
+            EvaluationLimits::default(),
+        )
+    }
+}
+
 /// 全4項目を明示した検査済み要求。内部型でありIPCのwire形式ではない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConfigRequest(super::AdminConfig);
