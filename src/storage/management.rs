@@ -128,7 +128,8 @@ impl RevisionInventoryRequest {
                 let mut remaining_records = budget.records;
                 let mut remaining_bytes = budget.record_bytes;
                 let mut remaining_references = budget.references;
-                let mut statement = tx.prepare("SELECT id,length(bytes) FROM records ORDER BY id")?;
+                let mut statement =
+                    tx.prepare("SELECT id,length(bytes) FROM records ORDER BY id")?;
                 let mut rows = statement.query([])?;
                 while let Some(row) = rows.next()? {
                     check()?;
@@ -163,8 +164,8 @@ impl RevisionInventoryRequest {
                     let references = record
                         .revision_references()
                         .map_err(|_| StorageError::Corrupt)?;
-                    let count = references.parents.len()
-                        + references.origins.as_ref().map_or(0, Vec::len);
+                    let count =
+                        references.parents.len() + references.origins.as_ref().map_or(0, Vec::len);
                     remaining_references = remaining_references
                         .checked_sub(count as u64)
                         .ok_or(StorageError::BudgetExceeded)?;
