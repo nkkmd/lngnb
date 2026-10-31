@@ -435,18 +435,38 @@ impl LocalRecord {
         if self.kind != RecordKind::Revision {
             return invalid();
         }
-        let record_id = |bytes| Id { kind: id::Kind::Record, bytes };
-        let origins = opt(&self.body, "origins")?.map(|origins| {
-            array(origins)?.iter().map(|origin| {
-                Ok(OriginReference {
-                    knowledge_id: Id { kind: id::Kind::Knowledge, bytes: bytes(get(origin, "knowledge_id")?)? },
-                    genesis_record_id: opt(origin, "genesis_record_id")?.map(bytes).transpose()?.map(record_id),
-                    revision_record_id: opt(origin, "revision_record_id")?.map(bytes).transpose()?.map(record_id),
-                })
-            }).collect::<Result<Vec<_>>>()
-        }).transpose()?;
+        let record_id = |bytes| Id {
+            kind: id::Kind::Record,
+            bytes,
+        };
+        let origins = opt(&self.body, "origins")?
+            .map(|origins| {
+                array(origins)?
+                    .iter()
+                    .map(|origin| {
+                        Ok(OriginReference {
+                            knowledge_id: Id {
+                                kind: id::Kind::Knowledge,
+                                bytes: bytes(get(origin, "knowledge_id")?)?,
+                            },
+                            genesis_record_id: opt(origin, "genesis_record_id")?
+                                .map(bytes)
+                                .transpose()?
+                                .map(record_id),
+                            revision_record_id: opt(origin, "revision_record_id")?
+                                .map(bytes)
+                                .transpose()?
+                                .map(record_id),
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .transpose()?;
         Ok(RevisionReferences {
-            knowledge_id: Id { kind: id::Kind::Knowledge, bytes: self.knowledge },
+            knowledge_id: Id {
+                kind: id::Kind::Knowledge,
+                bytes: self.knowledge,
+            },
             genesis_record_id: record_id(self.genesis()?),
             publisher_key_id: id::key_id(&self.public),
             parents: self.parents()?.into_iter().map(record_id).collect(),

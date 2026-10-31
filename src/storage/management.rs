@@ -22,19 +22,33 @@ pub struct SavedRevision {
 impl RevisionRequest {
     pub fn check(knowledge: Id, genesis: Id, revision: Id) -> crate::Result<Self> {
         use crate::id::Kind;
-        if knowledge.kind != Kind::Knowledge || genesis.kind != Kind::Record || revision.kind != Kind::Record {
+        if knowledge.kind != Kind::Knowledge
+            || genesis.kind != Kind::Record
+            || revision.kind != Kind::Record
+        {
             return Err(crate::Error::InvalidId);
         }
-        Ok(Self { knowledge, genesis, revision })
+        Ok(Self {
+            knowledge,
+            genesis,
+            revision,
+        })
     }
     /// 同じ排他中の既存読取り（最大2 MiB・ID/署名再検査）を利用する。
     /// 未保持・別種別・三ID不一致はNone。別版・別Genesisへ代替しない。
     /// Genesis/親/由来の参照先を読まず、評価確定・writer取得・finish・手動待ち解除を行わない。
     pub fn inspect(self, store: &RecordStore) -> Result<Option<SavedRevision>> {
-        let Some(record) = store.record(self.revision)? else { return Ok(None); };
-        if record.kind() != crate::record::RecordKind::Revision { return Ok(None); }
-        let references = record.revision_references().map_err(|_| super::StorageError::Corrupt)?;
-        if references.knowledge_id != self.knowledge || references.genesis_record_id != self.genesis {
+        let Some(record) = store.record(self.revision)? else {
+            return Ok(None);
+        };
+        if record.kind() != crate::record::RecordKind::Revision {
+            return Ok(None);
+        }
+        let references = record
+            .revision_references()
+            .map_err(|_| super::StorageError::Corrupt)?;
+        if references.knowledge_id != self.knowledge || references.genesis_record_id != self.genesis
+        {
             return Ok(None);
         }
         Ok(Some(SavedRevision { record, references }))
