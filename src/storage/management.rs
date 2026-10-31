@@ -148,7 +148,10 @@ impl RevisionInventoryRequest {
         budget: RevisionInventoryBudget,
     ) -> Result<SavedRevisionHistory> {
         let (inventory, relations) = self.inspect_inner(store, budget, true)?;
-        Ok(SavedRevisionHistory { inventory, relations })
+        Ok(SavedRevisionHistory {
+            inventory,
+            relations,
+        })
     }
     fn inspect_inner(
         self,
@@ -200,7 +203,13 @@ impl RevisionInventoryRequest {
                         .ok_or(StorageError::BudgetExceeded)?;
                     let record = store.record(id)?.ok_or(StorageError::Corrupt)?;
                     if with_relations {
-                        targets.insert(id.bytes, (record.identity(), record.genesis().map_err(|_| StorageError::Corrupt)?));
+                        targets.insert(
+                            id.bytes,
+                            (
+                                record.identity(),
+                                record.genesis().map_err(|_| StorageError::Corrupt)?,
+                            ),
+                        );
                     }
                     if record.kind() != crate::record::RecordKind::Revision {
                         continue;
@@ -229,12 +238,15 @@ impl RevisionInventoryRequest {
                 } else {
                     Vec::new()
                 };
-                Ok((RevisionInventory {
-                    knowledge_id: self.knowledge,
-                    genesis_record_id: self.genesis,
-                    generation,
-                    revisions,
-                }, relations))
+                Ok((
+                    RevisionInventory {
+                        knowledge_id: self.knowledge,
+                        genesis_record_id: self.genesis,
+                        generation,
+                        revisions,
+                    },
+                    relations,
+                ))
             },
         )?;
         // SQL進捗handlerはread群だけ。commit/rollbackへ残さない。
@@ -265,13 +277,24 @@ fn saved_relations(
             check()?;
             let target = match targets.get(&parent.bytes) {
                 None => Target::Missing,
-                Some((identity, _)) if identity.kind != crate::record::RecordKind::Revision => Target::NotRevision,
-                Some((identity, _)) if identity.knowledge != refs.knowledge_id.bytes => Target::DifferentKnowledge,
-                Some((_, genesis)) if *genesis != refs.genesis_record_id.bytes => Target::DifferentGenesis,
-                Some((identity, _)) if identity.public != revision.record.identity().public => Target::DifferentPublisher,
+                Some((identity, _)) if identity.kind != crate::record::RecordKind::Revision => {
+                    Target::NotRevision
+                }
+                Some((identity, _)) if identity.knowledge != refs.knowledge_id.bytes => {
+                    Target::DifferentKnowledge
+                }
+                Some((_, genesis)) if *genesis != refs.genesis_record_id.bytes => {
+                    Target::DifferentGenesis
+                }
+                Some((identity, _)) if identity.public != revision.record.identity().public => {
+                    Target::DifferentPublisher
+                }
                 Some(_) => Target::DirectMatch,
             };
-            parents.push(SavedParentLink { parent_id: *parent, target });
+            parents.push(SavedParentLink {
+                parent_id: *parent,
+                target,
+            });
             if let Some(declared) = children.get_mut(&parent.bytes) {
                 declared.push(revision.record.id());
             }
@@ -284,7 +307,8 @@ fn saved_relations(
     }
     for relation in &mut relations {
         check()?;
-        relation.declared_children = children.remove(&relation.revision_id.bytes)
+        relation.declared_children = children
+            .remove(&relation.revision_id.bytes)
             .ok_or(super::StorageError::Corrupt)?;
     }
     check()?;

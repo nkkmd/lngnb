@@ -487,23 +487,56 @@ fn saved_history_keeps_branches_merge_roots_and_origins_separate() {
     drop(writer);
     let store = RecordStore::open(&temp.data(), crate::storage::Limits::default()).unwrap();
     let before = logical_snapshot(&store.conn);
-    let history = inventory_request().inspect_history(&store, RevisionInventoryBudget::default()).unwrap();
+    let history = inventory_request()
+        .inspect_history(&store, RevisionInventoryBudget::default())
+        .unwrap();
     let ticks = std::cell::Cell::new(0);
-    let interrupted = saved_relations(&history.inventory.revisions, &std::collections::BTreeMap::new(), &|| {
-        ticks.set(ticks.get() + 1);
-        if ticks.get() > 3 { Err(StorageError::BudgetExceeded) } else { Ok(()) }
-    });
+    let interrupted = saved_relations(
+        &history.inventory.revisions,
+        &std::collections::BTreeMap::new(),
+        &|| {
+            ticks.set(ticks.get() + 1);
+            if ticks.get() > 3 {
+                Err(StorageError::BudgetExceeded)
+            } else {
+                Ok(())
+            }
+        },
+    );
     assert!(matches!(interrupted, Err(StorageError::BudgetExceeded)));
     assert_eq!(history.inventory.revisions.len(), 5);
-    let ids: Vec<_> = history.relations.iter().map(|r| r.revision_id.bytes).collect();
+    let ids: Vec<_> = history
+        .relations
+        .iter()
+        .map(|r| r.revision_id.bytes)
+        .collect();
     let mut sorted = ids.clone();
     sorted.sort();
     assert_eq!(ids, sorted);
-    let relation = |id| history.relations.iter().find(|r| r.revision_id == id).unwrap();
+    let relation = |id| {
+        history
+            .relations
+            .iter()
+            .find(|r| r.revision_id == id)
+            .unwrap()
+    };
     assert!(relation(root.id()).parents.is_empty());
-    assert_eq!(relation(root.id()).declared_children.iter().map(|id| id.bytes).collect::<Vec<_>>(), parents);
+    assert_eq!(
+        relation(root.id())
+            .declared_children
+            .iter()
+            .map(|id| id.bytes)
+            .collect::<Vec<_>>(),
+        parents
+    );
     for branch in [&a, &b] {
-        assert_eq!(relation(branch.id()).parents, vec![SavedParentLink { parent_id: root.id(), target: SavedParentTarget::DirectMatch }]);
+        assert_eq!(
+            relation(branch.id()).parents,
+            vec![SavedParentLink {
+                parent_id: root.id(),
+                target: SavedParentTarget::DirectMatch
+            }]
+        );
         assert_eq!(relation(branch.id()).declared_children, vec![merge.id()]);
     }
     assert_eq!(relation(merge.id()).parents.len(), 2);
@@ -522,14 +555,23 @@ fn saved_history_distinguishes_missing_kind_scope_and_direct_signer_mismatches()
     let root = fixture("revision");
     let genesis = fixture("genesis");
     let outside = |field: &str| {
-        let Value::Map(mut body) = root.body().clone() else { unreachable!() };
+        let Value::Map(mut body) = root.body().clone() else {
+            unreachable!()
+        };
         body.iter_mut().find(|(k, _)| k == field).unwrap().1 = Value::Bytes(vec![55; 32]);
         LocalRecord::sign(Value::Map(body), &signing_key()).unwrap()
     };
     let other_k = outside("knowledge_id");
     let other_g = outside("genesis_record_id");
-    let other_key = LocalRecord::sign(root.body().clone(), &ed25519_dalek::SigningKey::from_bytes(&[1; 32])).unwrap();
-    let missing = Id { kind: crate::id::Kind::Record, bytes: [240; 32] };
+    let other_key = LocalRecord::sign(
+        root.body().clone(),
+        &ed25519_dalek::SigningKey::from_bytes(&[1; 32]),
+    )
+    .unwrap();
+    let missing = Id {
+        kind: crate::id::Kind::Record,
+        bytes: [240; 32],
+    };
     let mut targets = vec![
         (root.id(), SavedParentTarget::DirectMatch),
         (genesis.id(), SavedParentTarget::NotRevision),
@@ -547,13 +589,33 @@ fn saved_history_distinguishes_missing_kind_scope_and_direct_signer_mismatches()
     writer.finish().unwrap();
     let store = RecordStore::open(&temp.data(), crate::storage::Limits::default()).unwrap();
     let before = logical_snapshot(&store.conn);
-    let history = inventory_request().inspect_history(&store, RevisionInventoryBudget::default()).unwrap();
+    let history = inventory_request()
+        .inspect_history(&store, RevisionInventoryBudget::default())
+        .unwrap();
     assert_eq!(history.inventory.revisions.len(), 3);
-    let relation = history.relations.iter().find(|r| r.revision_id == child.id()).unwrap();
-    assert_eq!(relation.parents, targets.into_iter().map(|(parent_id, target)| SavedParentLink { parent_id, target }).collect::<Vec<_>>());
+    let relation = history
+        .relations
+        .iter()
+        .find(|r| r.revision_id == child.id())
+        .unwrap();
+    assert_eq!(
+        relation.parents,
+        targets
+            .into_iter()
+            .map(|(parent_id, target)| SavedParentLink { parent_id, target })
+            .collect::<Vec<_>>()
+    );
     // 不一致でも宣言を消さない。scope内の別鍵親への逆向き宣言も保持する。
     for record in [&root, &other_key] {
-        assert_eq!(history.relations.iter().find(|r| r.revision_id == record.id()).unwrap().declared_children, vec![child.id()]);
+        assert_eq!(
+            history
+                .relations
+                .iter()
+                .find(|r| r.revision_id == record.id())
+                .unwrap()
+                .declared_children,
+            vec![child.id()]
+        );
     }
     assert_eq!(logical_snapshot(&store.conn), before);
 }
@@ -578,13 +640,29 @@ fn saved_history_does_not_promote_known_invalid_or_clear_unavailable_evidence() 
     std::fs::remove_file(temp.data().join("blobs").join(name)).unwrap();
     let store = RecordStore::open(&temp.data(), crate::storage::Limits::default()).unwrap();
     let before = logical_snapshot(&store.conn);
-    let history = inventory_request().inspect_history(&store, RevisionInventoryBudget::default()).unwrap();
+    let history = inventory_request()
+        .inspect_history(&store, RevisionInventoryBudget::default())
+        .unwrap();
     assert_eq!(history.inventory.revisions.len(), 2);
-    assert_eq!(history.relations.iter().find(|r| r.revision_id == child.id()).unwrap().parents[0].target, SavedParentTarget::DirectMatch);
+    assert_eq!(
+        history
+            .relations
+            .iter()
+            .find(|r| r.revision_id == child.id())
+            .unwrap()
+            .parents[0]
+            .target,
+        SavedParentTarget::DirectMatch
+    );
     assert_eq!(logical_snapshot(&store.conn), before);
     assert_eq!(store.startup_state().unwrap(), StartupState::NeedsReview);
     let diagnostic = store.evaluate(EvaluationLimits::default()).unwrap();
-    assert!(diagnostic.records.iter().any(|a| a.reason == Some(crate::storage::Reason::EvidenceUnavailable)));
+    assert!(
+        diagnostic
+            .records
+            .iter()
+            .any(|a| a.reason == Some(crate::storage::Reason::EvidenceUnavailable))
+    );
     assert_eq!(logical_snapshot(&store.conn), before);
 }
 
@@ -716,11 +794,21 @@ fn inventory_budgets_are_all_or_error_and_do_not_release_manual_wait() {
             request.inspect(&store, budget),
             Err(StorageError::BudgetExceeded)
         ));
-        assert!(matches!(request.inspect_history(&store, budget), Err(StorageError::BudgetExceeded)));
+        assert!(matches!(
+            request.inspect_history(&store, budget),
+            Err(StorageError::BudgetExceeded)
+        ));
         assert_eq!(logical_snapshot(&store.conn), before);
         assert_eq!(store.startup_state().unwrap(), StartupState::NeedsReview);
     }
-    assert_eq!(request.inspect_history(&store, exact).unwrap().relations.len(), 1);
+    assert_eq!(
+        request
+            .inspect_history(&store, exact)
+            .unwrap()
+            .relations
+            .len(),
+        1
+    );
     let result = request.inspect(&store, exact).unwrap();
     assert_eq!(result.revisions.len(), 1);
     assert_eq!(result.revisions[0].record.bytes(), r.bytes());
