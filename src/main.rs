@@ -299,7 +299,9 @@ fn run(args: &[OsString], output: &mut impl Write) -> Result<(), AppError> {
             return document_cli::run(command, output).map_err(AppError::Document);
         }
         #[cfg(target_os = "linux")]
-        Command::Inspect(command) => return document_inspect_cli::run(command, output).map_err(AppError::Inspect),
+        Command::Inspect(command) => {
+            return document_inspect_cli::run(command, output).map_err(AppError::Inspect);
+        }
         #[cfg(target_os = "linux")]
         Command::Data(command) => return data_cli::run(command, output).map_err(AppError::Data),
         #[cfg(target_os = "linux")]
