@@ -144,6 +144,22 @@ for case in json.load(sys.stdin):
         else:
             assert body == genesis["body"]
             assert "origins" not in body
+    if "reference_view" in case:
+        def formatted(prefix, raw):
+            return prefix + base64.b32encode(raw).decode("ascii").lower().rstrip("=")
+        assert body["record_kind"] == "revision"
+        expected_origins = None
+        if "origins" in body:
+            expected_origins = [{"knowledge_id": formatted("kn1_", ref["knowledge_id"]),
+                                 "genesis_record_id": formatted("rc1_", ref["genesis_record_id"]) if "genesis_record_id" in ref else None,
+                                 "revision_record_id": formatted("rc1_", ref["revision_record_id"]) if "revision_record_id" in ref else None}
+                                for ref in body["origins"]]
+        assert case["reference_view"] == {
+            "knowledge_id": formatted("kn1_", body["knowledge_id"]),
+            "genesis_record_id": formatted("rc1_", body["genesis_record_id"]),
+            "publisher_key_id": formatted("ky1_", hashlib.sha256(DK + public).digest()),
+            "parents": [formatted("rc1_", parent) for parent in body["parents"]],
+            "origins": expected_origins}
     digest = hashlib.sha256(DR + encoded).digest()
     ids.append("rc1_" + base64.b32encode(digest).decode("ascii").lower().rstrip("="))
 json.dump(ids, sys.stdout)

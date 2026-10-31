@@ -292,6 +292,23 @@ pub enum RecordKind {
     Genesis,
     Revision,
 }
+/// 署名に含まれる由来参照。省略IDを補完せず、参照先の保持・承認を表さない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OriginReference {
+    pub knowledge_id: Id,
+    pub genesis_record_id: Option<Id>,
+    pub revision_record_id: Option<Id>,
+}
+/// 局所検査済みRevisionの宣言値。Genesis/親/由来の外部照合・評価結果ではない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevisionReferences {
+    pub knowledge_id: Id,
+    pub genesis_record_id: Id,
+    pub publisher_key_id: Id,
+    pub parents: Vec<Id>,
+    /// 未指定と明示した空集合を区別し、符号化済みの集合順を保つ。
+    pub origins: Option<Vec<OriginReference>>,
+}
 #[derive(Debug, Clone)]
 pub struct LocalRecord {
     bytes: Vec<u8>,
@@ -411,6 +428,50 @@ impl LocalRecord {
     }
     pub fn kind(&self) -> RecordKind {
         self.kind
+    }
+    /// 元bytesを変えず、署名された直接参照だけを読み取る。Genesisでは失敗する。
+    /// 祖先探索・不足IDの推測・参照取得・現在版選択・pin/公開判定は行わない。
+    pub fn revision_references(&self) -> Result<RevisionReferences> {
+        if self.kind != RecordKind::Revision {
+            return invalid();
+        }
+        let record_id = |bytes| Id {
+            kind: id::Kind::Record,
+            bytes,
+        };
+        let origins = opt(&self.body, "origins")?
+            .map(|origins| {
+                array(origins)?
+                    .iter()
+                    .map(|origin| {
+                        Ok(OriginReference {
+                            knowledge_id: Id {
+                                kind: id::Kind::Knowledge,
+                                bytes: bytes(get(origin, "knowledge_id")?)?,
+                            },
+                            genesis_record_id: opt(origin, "genesis_record_id")?
+                                .map(bytes)
+                                .transpose()?
+                                .map(record_id),
+                            revision_record_id: opt(origin, "revision_record_id")?
+                                .map(bytes)
+                                .transpose()?
+                                .map(record_id),
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .transpose()?;
+        Ok(RevisionReferences {
+            knowledge_id: Id {
+                kind: id::Kind::Knowledge,
+                bytes: self.knowledge,
+            },
+            genesis_record_id: record_id(self.genesis()?),
+            publisher_key_id: id::key_id(&self.public),
+            parents: self.parents()?.into_iter().map(record_id).collect(),
+            origins,
+        })
     }
     pub(crate) fn identity(&self) -> RecordIdentity {
         RecordIdentity {

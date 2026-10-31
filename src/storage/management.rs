@@ -6,6 +6,55 @@ use super::{
 };
 use crate::{id::Id, record::LocalRecord};
 
+/// ローカル管理専用の完全固定指定。公開APIの開示判断や可変参照解決ではない。
+#[derive(Debug, Clone, Copy)]
+pub struct RevisionRequest {
+    knowledge: Id,
+    genesis: Id,
+    revision: Id,
+}
+/// 保存済みの元bytesと署名された参照宣言。valid/本文保持/公開を証明しない。
+#[derive(Debug)]
+pub struct SavedRevision {
+    pub record: LocalRecord,
+    pub references: crate::record::RevisionReferences,
+}
+impl RevisionRequest {
+    pub fn check(knowledge: Id, genesis: Id, revision: Id) -> crate::Result<Self> {
+        use crate::id::Kind;
+        if knowledge.kind != Kind::Knowledge
+            || genesis.kind != Kind::Record
+            || revision.kind != Kind::Record
+        {
+            return Err(crate::Error::InvalidId);
+        }
+        Ok(Self {
+            knowledge,
+            genesis,
+            revision,
+        })
+    }
+    /// 同じ排他中の既存読取り（最大2 MiB・ID/署名再検査）を利用する。
+    /// 未保持・別種別・三ID不一致はNone。別版・別Genesisへ代替しない。
+    /// Genesis/親/由来の参照先を読まず、評価確定・writer取得・finish・手動待ち解除を行わない。
+    pub fn inspect(self, store: &RecordStore) -> Result<Option<SavedRevision>> {
+        let Some(record) = store.record(self.revision)? else {
+            return Ok(None);
+        };
+        if record.kind() != crate::record::RecordKind::Revision {
+            return Ok(None);
+        }
+        let references = record
+            .revision_references()
+            .map_err(|_| super::StorageError::Corrupt)?;
+        if references.knowledge_id != self.knowledge || references.genesis_record_id != self.genesis
+        {
+            return Ok(None);
+        }
+        Ok(Some(SavedRevision { record, references }))
+    }
+}
+
 /// 内部IPCの要求は完成したRecordの生bytes一つだけ。秘密鍵・パスフレーズは受けない。
 pub struct RecordRequest(LocalRecord);
 impl RecordRequest {
