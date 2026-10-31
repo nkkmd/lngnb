@@ -76,11 +76,16 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
             return Err(usage());
         }
         match option.to_str() {
-            Some("--origin-genesis") if action == "derive" && origin_genesis.is_none() && origins.len() < 128 => {
+            Some("--origin-genesis")
+                if action == "derive" && origin_genesis.is_none() && origins.len() < 128 =>
+            {
                 origin_genesis = Some(PathBuf::from(value));
             }
             Some("--origin-revision") if action == "derive" && origin_genesis.is_some() => {
-                origins.push((origin_genesis.take().ok_or_else(usage)?, PathBuf::from(value)));
+                origins.push((
+                    origin_genesis.take().ok_or_else(usage)?,
+                    PathBuf::from(value),
+                ));
             }
             Some("--genesis") if action == "revise" && genesis.is_none() => {
                 genesis = Some(PathBuf::from(value))
@@ -133,7 +138,9 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
         }
     }
     let action = if action == "derive" {
-        if origins.is_empty() || origin_genesis.is_some() { return Err(usage()); }
+        if origins.is_empty() || origin_genesis.is_some() {
+            return Err(usage());
+        }
         Action::Derive { origins }
     } else if action == "revise" {
         if no_parents != parents.is_empty() {
@@ -260,11 +267,22 @@ pub fn run(command: Command, output: &mut impl Write) -> Result<(), Error> {
         )
     } else {
         let pair = if let Some(origins) = origins {
-            let sources: Vec<_> = origins.iter().map(|(genesis, revision)| authoring::DerivationSource { genesis, revision }).collect();
-            authoring::create_derived(&key, &sources, &payload, metadata, command.media.as_deref(), budget)
+            let sources: Vec<_> = origins
+                .iter()
+                .map(|(genesis, revision)| authoring::DerivationSource { genesis, revision })
+                .collect();
+            authoring::create_derived(
+                &key,
+                &sources,
+                &payload,
+                metadata,
+                command.media.as_deref(),
+                budget,
+            )
         } else {
             authoring::create_initial(&key, &payload, metadata, command.media.as_deref(), budget)
-        }.map_err(Error::Creation)?;
+        }
+        .map_err(Error::Creation)?;
         let (genesis, revision) = pair.into_parts();
         (genesis, revision, true, vec![])
     };
@@ -321,7 +339,10 @@ fn read_selected_record(
     remaining: &mut usize,
     signals: &TerminalSignals,
 ) -> Result<LocalRecord, Error> {
-    let bytes = authoring_input::read_record_file_limited(path, *remaining, || signals.check_cancelled().is_err()).map_err(Error::File)?;
+    let bytes = authoring_input::read_record_file_limited(path, *remaining, || {
+        signals.check_cancelled().is_err()
+    })
+    .map_err(Error::File)?;
     *remaining -= bytes.len();
     LocalRecord::check(&bytes, None).map_err(|_| Error::Creation(CreationError::InvalidInput))
 }
@@ -331,14 +352,21 @@ fn read_origin_selection(
     paths: &[(PathBuf, PathBuf)],
     signals: &TerminalSignals,
 ) -> Result<Vec<(LocalRecord, LocalRecord)>, Error> {
-    if paths.is_empty() || paths.len() > 128 { return Err(Error::Creation(CreationError::InvalidInput)); }
+    if paths.is_empty() || paths.len() > 128 {
+        return Err(Error::Creation(CreationError::InvalidInput));
+    }
     let mut remaining = 16 * 1024 * 1024;
     let mut origins: Vec<(LocalRecord, LocalRecord)> = Vec::with_capacity(paths.len());
     for (g, r) in paths {
         let genesis = read_selected_record(g, &mut remaining, signals)?;
         let revision = read_selected_record(r, &mut remaining, signals)?;
-        revision.check_genesis(&genesis).map_err(|_| Error::Creation(CreationError::InvalidInput))?;
-        if origins.iter().any(|(g, r)| g.id() == genesis.id() && r.id() == revision.id()) {
+        revision
+            .check_genesis(&genesis)
+            .map_err(|_| Error::Creation(CreationError::InvalidInput))?;
+        if origins
+            .iter()
+            .any(|(g, r)| g.id() == genesis.id() && r.id() == revision.id())
+        {
             return Err(Error::Creation(CreationError::InvalidInput));
         }
         origins.push((genesis, revision));
@@ -398,11 +426,7 @@ fn save(
     management::store_record(&mut writer, revision)?;
     writer.finish().map_err(Error::Storage)
 }
-fn summary(
-    genesis: &LocalRecord,
-    revision: &LocalRecord,
-    label: &str,
-) -> Result<String, Error> {
+fn summary(genesis: &LocalRecord, revision: &LocalRecord, label: &str) -> Result<String, Error> {
     let knowledge = match genesis.body() {
         lngnb::cbor::Value::Map(m) => {
             m.iter()
@@ -470,24 +494,46 @@ mod tests {
         duplicate.extend(["--origin-genesis".into(), "another".into()]);
         assert!(parse(&duplicate).is_err());
         a.extend(["--origin-revision".into(), "r".into()]);
-        assert!(matches!(parse(&a).unwrap().action, Action::Derive { origins } if origins.len() == 1));
+        assert!(
+            matches!(parse(&a).unwrap().action, Action::Derive { origins } if origins.len() == 1)
+        );
         let mut wrong = args();
         wrong[0] = "derive".into();
         wrong.extend(["--origin-revision".into(), "r".into()]);
         assert!(parse(&wrong).is_err());
         for pair in [["--genesis", "g"], ["--parent", "r"]] {
-            let mut wrong = a.clone(); wrong.extend(pair.map(OsString::from));
+            let mut wrong = a.clone();
+            wrong.extend(pair.map(OsString::from));
             assert!(parse(&wrong).is_err());
         }
-        let mut wrong = a.clone(); wrong.push("--no-parents".into());
+        let mut wrong = a.clone();
+        wrong.push("--no-parents".into());
         assert!(parse(&wrong).is_err());
-        for _ in 1..128 { a.extend(["--origin-genesis".into(), "g".into(), "--origin-revision".into(), "r".into()]); }
+        for _ in 1..128 {
+            a.extend([
+                "--origin-genesis".into(),
+                "g".into(),
+                "--origin-revision".into(),
+                "r".into(),
+            ]);
+        }
         assert!(parse(&a).is_ok());
-        a.extend(["--origin-genesis".into(), "g".into(), "--origin-revision".into(), "r".into()]);
+        a.extend([
+            "--origin-genesis".into(),
+            "g".into(),
+            "--origin-revision".into(),
+            "r".into(),
+        ]);
         assert!(parse(&a).is_err());
         for action in ["create", "revise"] {
-            let mut wrong = args(); wrong[0] = action.into();
-            wrong.extend(["--origin-genesis".into(), "g".into(), "--origin-revision".into(), "r".into()]);
+            let mut wrong = args();
+            wrong[0] = action.into();
+            wrong.extend([
+                "--origin-genesis".into(),
+                "g".into(),
+                "--origin-revision".into(),
+                "r".into(),
+            ]);
             assert!(parse(&wrong).is_err());
         }
     }
