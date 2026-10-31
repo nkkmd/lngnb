@@ -434,7 +434,6 @@ pub fn store_record(writer: &mut RecordWriter, record: &LocalRecord) -> Result<R
 }
 
 /// 全4項目を明示した検査済み要求。内部型でありIPCのwire形式ではない。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// 管理者の明示した根拠復旧確認。確認文を解釈して復旧/再開を推測しない。
 #[derive(PartialEq, Eq)]
 pub struct RecoveryReviewRequest {
@@ -477,6 +476,7 @@ impl RecoveryReviewRequest {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConfigRequest(super::AdminConfig);
 impl ConfigRequest {
     pub fn check(config: super::AdminConfig) -> Result<Self> {
