@@ -7,7 +7,7 @@ use super::{
 use crate::{id::Id, record::LocalRecord};
 
 /// ローカル管理専用の完全固定指定。公開APIの開示判断や可変参照解決ではない。
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RevisionRequest {
     knowledge: Id,
     genesis: Id,

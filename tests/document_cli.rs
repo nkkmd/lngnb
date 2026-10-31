@@ -82,6 +82,7 @@ fn creation_cli_preserves_inputs_and_storage_across_failure_cancellation_and_res
             "CLI fixture initialization failed"
         );
     }
+    inspection_fixture(&root, spec);
     let out = Command::new(
         std::env::var_os("LNGNB_REFERENCE_PYTHON").expect("independent checker required"),
     )
@@ -99,4 +100,84 @@ fn creation_cli_preserves_inputs_and_storage_across_failure_cancellation_and_res
         String::from_utf8(out.stdout).unwrap().trim(),
         "DOCUMENT_CLI_CASES_OK"
     );
+}
+
+// 公開A13試験seed専用。実運用へ流用しない。本文/Genesis/親/由来を保持しない正常fixture。
+fn inspection_fixture(root: &std::path::Path, spec: &str) {
+    use lngnb::{
+        cbor::{self, Value},
+        record::LocalRecord,
+        storage::{Limits, RecordStore},
+    };
+    let a13: serde_json::Value = serde_json::from_str(
+        spec.split("## 付録A13 ")
+            .nth(1)
+            .unwrap()
+            .split("```json\n")
+            .nth(1)
+            .unwrap()
+            .split("\n```")
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    let unhex = |s: &str| {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect::<Vec<_>>()
+    };
+    let key = ed25519_dalek::SigningKey::from_bytes(
+        &unhex(a13["seed_hex"].as_str().unwrap()).try_into().unwrap(),
+    );
+    let source = LocalRecord::check(
+        &unhex(a13["revision"]["envelope_cbor_hex"].as_str().unwrap()),
+        None,
+    )
+    .unwrap();
+    let Value::Map(mut body) = source.body().clone() else {
+        unreachable!()
+    };
+    let parents = (0..256u32)
+        .map(|n| {
+            let mut id = vec![0; 32];
+            id[28..].copy_from_slice(&n.to_be_bytes());
+            Value::Bytes(id)
+        })
+        .collect();
+    *body.iter_mut().find(|(k, _)| k == "parents").unwrap() =
+        ("parents".into(), Value::Array(parents));
+    let one = vec![("knowledge_id".into(), Value::Bytes(vec![0; 32]))];
+    let mut two = one.clone();
+    two.push(("genesis_record_id".into(), Value::Bytes(vec![8; 32])));
+    let mut three = two.clone();
+    three.push(("revision_record_id".into(), Value::Bytes(vec![9; 32])));
+    let mut origins = vec![Value::Map(one), Value::Map(two), Value::Map(three)];
+    origins.extend(
+        (1..126u8).map(|n| Value::Map(vec![("knowledge_id".into(), Value::Bytes(vec![n; 32]))])),
+    );
+    origins.sort_by_key(|v| cbor::encode(v).unwrap());
+    body.push(("origins".into(), Value::Array(origins)));
+    let (_, Value::Map(metadata)) = body.iter_mut().find(|(k, _)| k == "metadata").unwrap() else {
+        unreachable!()
+    };
+    metadata.retain(|(k, _)| k != "titles");
+    metadata.push((
+        "titles".into(),
+        Value::Map(vec![("ja".into(), Value::Text("PRIVATE METADATA".into()))]),
+    ));
+    let maximum = LocalRecord::sign(Value::Map(body.clone()), &key).unwrap();
+    for (k, v) in &mut body {
+        if k == "parents" || k == "origins" {
+            *v = Value::Array(vec![]);
+        }
+    }
+    let empty = LocalRecord::sign(Value::Map(body), &key).unwrap();
+    let mut writer = RecordStore::initialize(&root.join("inspect-declarations"), Limits::default())
+        .unwrap()
+        .begin()
+        .unwrap();
+    writer.insert(&maximum).unwrap();
+    writer.insert(&empty).unwrap();
+    writer.finish().unwrap();
 }

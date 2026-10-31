@@ -13,6 +13,8 @@ mod data_cli;
 #[cfg(target_os = "linux")]
 mod document_cli;
 #[cfg(target_os = "linux")]
+mod document_inspect_cli;
+#[cfg(target_os = "linux")]
 mod key_cli;
 #[cfg(target_os = "linux")]
 mod record_cli;
@@ -33,6 +35,7 @@ const HELP: &str = "lngnb — 分散図書館・知識基盤（開発初期段�
   lngnb admin config-change --data-dir PATH --request-timeout-ms N --max-new-records N --max-diagnostic-records N --startup-records-per-step N
   lngnb admin serve --data-dir PATH [--request-timeout-ms N] [--max-new-records N] [--max-diagnostic-records N] [--startup-records-per-step N] [--startup-record-bytes-per-step N] [--startup-blob-bytes-per-step N] [--startup-blob-targets-per-step N] [--startup-record-edges-per-step N] [--startup-evaluation-records-per-step N] [--sql-inspection-callbacks N] [--sql-inspection-timeout-ms N] [--startup-inspection-timeout-ms N] [--startup-record-input-timeout-ms N] [--startup-blob-input-timeout-ms N] [--startup-evaluation-timeout-ms N]
   lngnb record submit --data-dir PATH --record PATH
+  lngnb document inspect --data-dir PATH --knowledge-id KNOWLEDGE_ID --genesis-id GENESIS_ID --revision-id REVISION_ID
   lngnb document create --data-dir PATH --key-dir PATH --name NAME --expect-key-id KEY_ID --payload PATH --metadata PATH [--media-type TYPE] [--max-payload-bytes N]
   lngnb document revise --data-dir PATH --key-dir PATH --name NAME --expect-key-id KEY_ID --payload PATH --metadata PATH --genesis PATH (--parent PATH ... | --no-parents) [--media-type TYPE] [--max-payload-bytes N]
   lngnb document derive --data-dir PATH --key-dir PATH --name NAME --expect-key-id KEY_ID --payload PATH --metadata PATH --origin-genesis PATH --origin-revision PATH [--origin-genesis PATH --origin-revision PATH ...] [--media-type TYPE] [--max-payload-bytes N]
@@ -59,6 +62,8 @@ restore-residue は期待鍵IDと照合し、同じ領域の空いている通�
 
 config show は設定候補の表示だけを行います。
 データ領域の初期化・設定の保存・既存設定の読込み・接続は行いません。
+document inspect は完全固定の三IDで保存版の親・由来の宣言を確認します（鍵・端末入力不要）。
+参照先の取得・依存評価・本文出力・pin/公開判定・復旧解除を行わず、稼働中IPCへ切り替えません。
 document create は初期化済みの正常なデータ領域へ新規資料を保存します。
 document revise は明示したGenesisと親（最大256件）から同じKnowledgeの新Revisionを保存します。
 親なしは --no-parents を明示。起点・親は保存先に必要で、自動取込み・先端選択・由来継承はしません。
@@ -115,7 +120,7 @@ admin config-save は停止中の正常領域へ4項目すべてを明示保存�
 admin config-change は稼働中の専用socketへ4項目すべてを明示して保存・次操作へ反映します。起動分割件数は次回起動用です。
 送信前の失敗は終了1、送信開始後の確定不明は3、保存/適用確認後の出力失敗は1です。自動再送・直接DB保存・旧endpoint接続はしません。
 全管理状態・製品リレー起動は未実装です。
-改訂・派生・pin・公開・リレー起動・復旧確認CLIは未実装です。
+全保存版・分岐の一覧、pin・公開・リレー起動・復旧確認CLIは未実装です。
 ";
 
 // 工程②は候補表示だけ。永続設定やリレー起動は対応工程で実装する。
@@ -151,6 +156,8 @@ enum Command {
     #[cfg(target_os = "linux")]
     Document(document_cli::Command),
     #[cfg(target_os = "linux")]
+    Inspect(document_inspect_cli::Command),
+    #[cfg(target_os = "linux")]
     Data(data_cli::Command),
     #[cfg(target_os = "linux")]
     Record(record_cli::Command),
@@ -166,6 +173,8 @@ enum AppError {
     Key(key_cli::Error),
     #[cfg(target_os = "linux")]
     Document(document_cli::Error),
+    #[cfg(target_os = "linux")]
+    Inspect(document_inspect_cli::Error),
     #[cfg(target_os = "linux")]
     Data(data_cli::Error),
     #[cfg(target_os = "linux")]
@@ -183,6 +192,8 @@ impl AppError {
             Self::Key(e) => e.exit_code(),
             #[cfg(target_os = "linux")]
             Self::Document(e) => e.exit_code(),
+            #[cfg(target_os = "linux")]
+            Self::Inspect(e) => e.exit_code(),
             #[cfg(target_os = "linux")]
             Self::Data(e) => e.exit_code(),
             #[cfg(target_os = "linux")]
@@ -203,6 +214,8 @@ impl fmt::Display for AppError {
             #[cfg(target_os = "linux")]
             Self::Document(e) => e.fmt(f),
             #[cfg(target_os = "linux")]
+            Self::Inspect(e) => e.fmt(f),
+            #[cfg(target_os = "linux")]
             Self::Data(e) => e.fmt(f),
             #[cfg(target_os = "linux")]
             Self::Record(e) => e.fmt(f),
@@ -222,6 +235,8 @@ impl std::error::Error for AppError {
             #[cfg(target_os = "linux")]
             Self::Document(_) => None,
             #[cfg(target_os = "linux")]
+            Self::Inspect(_) => None,
+            #[cfg(target_os = "linux")]
             Self::Data(_) => None,
             #[cfg(target_os = "linux")]
             Self::Record(_) => None,
@@ -238,6 +253,10 @@ fn parse(args: &[OsString]) -> Result<Command, AppError> {
         [arg] if arg == "--version" || arg == "-V" => Ok(Command::Version),
         #[cfg(target_os = "linux")]
         [group, rest @ ..] if group == "key" => key_cli::parse(rest).map(Command::Key),
+        #[cfg(target_os = "linux")]
+        [group, action, rest @ ..] if group == "document" && action == "inspect" => {
+            document_inspect_cli::parse(rest).map(Command::Inspect)
+        }
         #[cfg(target_os = "linux")]
         [group, rest @ ..] if group == "document" => {
             document_cli::parse(rest).map(Command::Document)
@@ -278,6 +297,10 @@ fn run(args: &[OsString], output: &mut impl Write) -> Result<(), AppError> {
         #[cfg(target_os = "linux")]
         Command::Document(command) => {
             return document_cli::run(command, output).map_err(AppError::Document);
+        }
+        #[cfg(target_os = "linux")]
+        Command::Inspect(command) => {
+            return document_inspect_cli::run(command, output).map_err(AppError::Inspect);
         }
         #[cfg(target_os = "linux")]
         Command::Data(command) => return data_cli::run(command, output).map_err(AppError::Data),
