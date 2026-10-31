@@ -376,4 +376,98 @@ _,err=derive("derived-output",expected=1,full=True)
 assert "保存と正常終了は完了" in err.decode() and count_state("derived-output")==("clean",2,1)
 assert snapshot("ok")==source_state and all(Path(p).read_bytes()==raw for p,raw in source_bytes.items())
 assert (ROOT/"keys/publisher").read_bytes()==original_key
+# R04/R07: 鍵・端末なしの完全固定指定。署名中の親/由来だけを独立照合する。
+def text_id(prefix, raw):
+    return prefix+base64.b32encode(raw).decode("ascii").lower().rstrip("=")
+def fixed_in(name, rid=None):
+    for raw in saved(name).values():
+        body=cbor2.loads(raw)["body"]
+        revision=text_id("rc1_",hashlib.sha256(b"lngnb:record:library-core-1\0"+raw).digest())
+        if body["record_kind"]=="revision" and (rid is None or rid==revision):
+            return {"knowledge_id":text_id("kn1_",body["knowledge_id"]),"genesis_id":text_id("rc1_",body["genesis_record_id"]),"revision_id":revision}
+    raise AssertionError("revision fixture absent")
+def inspect_args(name, fixed, extra=()):
+    return [BINARY,"document","inspect","--data-dir",str(ROOT/name),
+            "--knowledge-id",fixed["knowledge_id"],"--genesis-id",fixed["genesis_id"],
+            "--revision-id",fixed["revision_id"]]+list(extra)
+def inspect(name, fixed, expected=0, state="clean", full=False, extra=()):
+    sink=open("/dev/full","wb") if full else subprocess.PIPE
+    try:
+        result=subprocess.run(inspect_args(name,fixed,extra),stdin=subprocess.DEVNULL,stdout=sink,
+                              stderr=subprocess.PIPE,start_new_session=True,timeout=60)
+    finally:
+        if full:sink.close()
+    out=result.stdout or b"";err=result.stderr
+    assert result.returncode==expected,(name,result.returncode,err.decode())
+    assert PASS not in out+err and b"PRIVATE METADATA" not in out+err
+    if expected!=0:
+        assert out==b"";return err
+    assert err==b""
+    raw=saved(name)[rawid(fixed["revision_id"])];record=cbor2.loads(raw);body=record["body"];sig=record["signature"]
+    assert hashlib.sha256(b"lngnb:record:library-core-1\0"+raw).digest()==rawid(fixed["revision_id"])
+    assert cbor2.dumps(record,canonical=True)==raw
+    Ed25519PublicKey.from_public_bytes(sig["public_key_bytes"]).verify(sig["signature_bytes"],b"lngnb:signature:library-core-1\0"+cbor2.dumps(body,canonical=True))
+    expected_fields={"startup_state":state,"knowledge_id":text_id("kn1_",body["knowledge_id"]),
+                     "genesis_id":text_id("rc1_",body["genesis_record_id"]),"revision_id":fixed["revision_id"],
+                     "publisher_key_id":text_id("ky1_",hashlib.sha256(b"lngnb:key:ed25519:1\0"+sig["public_key_bytes"]).digest()),
+                     "parents":str(len(body["parents"])),"origins":"unspecified" if "origins" not in body else str(len(body["origins"]))}
+    expected_fields.update({"parent["+str(n)+"]":text_id("rc1_",p) for n,p in enumerate(body["parents"])})
+    for n,origin in enumerate(body.get("origins",[])):
+        expected_fields["origin["+str(n)+"].knowledge_id"]=text_id("kn1_",origin["knowledge_id"])
+        for name,key in [("genesis_id","genesis_record_id"),("revision_id","revision_record_id")]:
+            expected_fields["origin["+str(n)+"]."+name]=text_id("rc1_",origin[key]) if key in origin else "unspecified"
+    lines=out.decode().splitlines()
+    assert dict(line.split(": ",1) for line in lines[1:-1])==expected_fields
+    assert "署名内参照" in lines[0] and "全祖先評価" in lines[-1] and "解除しません" in lines[-1]
+    assert len(out)<100000 and b"record_validation:" not in out
+    return out
+# 初版・二分岐・merge・別初版・派生・派生の派生を明示IDで開く。全論理DB不変。
+for name,rid in [("ok",base["revision_id"]),("ok",aid),("ok",bid),("ok",mid),("ok",fields(e)["revision_id"]),
+                 ("derived",df["revision_id"]),("derived",df2["revision_id"]),("derived-next",fields(d3)["revision_id"])]:
+    old=snapshot(name);inspect(name,fixed_in(name,rid));assert snapshot(name)==old
+# 正常な保存APIで作った、Genesis/256親/本文/128由来を未保持のfixture。
+for raw in saved("inspect-declarations").values():
+    body=cbor2.loads(raw)["body"];rid=text_id("rc1_",hashlib.sha256(b"lngnb:record:library-core-1\0"+raw).digest())
+    old=snapshot("inspect-declarations");inspect("inspect-declarations",fixed_in("inspect-declarations",rid))
+    assert snapshot("inspect-declarations")==old
+assert count_state("inspect-declarations")==("clean",2,0)
+# 既存の手動待ちを読取り成功・出力失敗・照合失敗で解除しない。
+for name in ["revision-finish","derived-finish"]:
+    fixed=fixed_in(name);old=snapshot(name);inspect(name,fixed,state="manual_review_required");assert snapshot(name)==old
+    err=inspect(name,fixed,expected=1,full=True);assert "読取り確認は終了" in err.decode() and snapshot(name)==old
+fixed=fixed_in("ok",base["revision_id"])
+for changed in [{"knowledge_id":"kn1_"+"a"*52},{"genesis_id":"rc1_"+"a"*52},
+                {"revision_id":"rc1_"+"a"*52},{"revision_id":base["genesis_id"]},
+                {"revision_id":other_id}]:
+    old=snapshot("ok");inspect("ok",dict(fixed,**changed),expected=1);assert snapshot("ok")==old
+old=snapshot("derived-finish");inspect("derived-finish",dict(fixed,revision_id="rc1_"+"a"*52),expected=1);assert snapshot("derived-finish")==old
+# 不正引数は接触前。lock競合・不存在・危険pathでIPC/直接保存へ切り替えない。
+for extra in [["--key-dir",str(ROOT/"missing-keys")],["--parent",parent],["--revision-id",fixed["revision_id"]]]:
+    old=snapshot("ok");inspect("ok",fixed,expected=2,extra=extra);assert snapshot("ok")==old
+inspect("inspect-missing",fixed,expected=1);assert not (ROOT/"inspect-missing").exists()
+os.symlink(ROOT/"ok",ROOT/"inspect-linked")
+old=snapshot("ok");inspect("inspect-linked",fixed,expected=1);assert snapshot("ok")==old
+with open(ROOT/"ok/lock","rb") as lock:
+    fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB);inspect("ok",fixed,expected=1)
+assert snapshot("ok")==old
+# 停止中fixtureの明示コピーだけで未知形式・保存破損を注入する。
+for name in ["inspect-old-format","inspect-corrupt"]:shutil.copytree(ROOT/"inspect-declarations",ROOT/name)
+with db("inspect-old-format") as c:c.execute("PRAGMA user_version=11")
+fixed_decl=fixed_in("inspect-declarations")
+old=snapshot("inspect-old-format");inspect("inspect-old-format",fixed_decl,expected=1);assert snapshot("inspect-old-format")==old
+with db("inspect-old-format") as c:assert c.execute("PRAGMA user_version").fetchone()==(11,)
+with db("inspect-corrupt") as c:
+    c.execute("DROP TRIGGER records_no_update")
+    # 対象以外の破損でもopenの全局所検査を省略しない。
+    c.execute("UPDATE records SET bytes=? WHERE id<>?",(b"not cbor",rawid(fixed_decl["revision_id"])))
+old=snapshot("inspect-corrupt");inspect("inspect-corrupt",fixed_decl,expected=1);assert snapshot("inspect-corrupt")==old
+# openが保持本文欠損を検出した停止印・履歴は残す。署名内の宣言表示とは別。
+shutil.copytree(ROOT/"ok",ROOT/"inspect-blob-fault")
+victim=next((ROOT/"inspect-blob-fault/blobs").iterdir());victim.unlink()
+old_records=saved("inspect-blob-fault");files={p.name:p.read_bytes() for p in (ROOT/"inspect-blob-fault/blobs").iterdir()}
+inspect("inspect-blob-fault",fixed,state="manual_review_required")
+assert saved("inspect-blob-fault")==old_records and count_state("inspect-blob-fault")[0]=="running"
+assert {p.name:p.read_bytes() for p in (ROOT/"inspect-blob-fault/blobs").iterdir()}==files
+old=snapshot("inspect-blob-fault");inspect("inspect-blob-fault",fixed,state="manual_review_required");assert snapshot("inspect-blob-fault")==old
+assert (ROOT/"keys/publisher").read_bytes()==original_key
 print("DOCUMENT_CLI_CASES_OK")
