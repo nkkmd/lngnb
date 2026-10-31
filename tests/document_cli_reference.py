@@ -470,4 +470,110 @@ assert saved("inspect-blob-fault")==old_records and count_state("inspect-blob-fa
 assert {p.name:p.read_bytes() for p in (ROOT/"inspect-blob-fault/blobs").iterdir()}==files
 old=snapshot("inspect-blob-fault");inspect("inspect-blob-fault",fixed,state="manual_review_required");assert snapshot("inspect-blob-fault")==old
 assert (ROOT/"keys/publisher").read_bytes()==original_key
+# R04/R07: 保存scope一覧を元bytesから再構成し、評価は独立DFSへ渡す。
+def history_args(name, fixed, extra=()):
+    return [BINARY,"document","history","--data-dir",str(ROOT/name),
+            "--knowledge-id",fixed["knowledge_id"],"--genesis-id",fixed["genesis_id"]]+list(extra)
+def history(name, fixed, expected=0, state="clean", full=False, extra=()):
+    sink=open("/dev/full","wb") if full else subprocess.PIPE
+    try:
+        result=subprocess.run(history_args(name,fixed,extra),stdin=subprocess.DEVNULL,stdout=sink,
+                              stderr=subprocess.PIPE,start_new_session=True,timeout=120)
+    finally:
+        if full:sink.close()
+    out=result.stdout or b"";err=result.stderr
+    assert result.returncode==expected,(name,result.returncode,err.decode())
+    assert PASS not in out+err and b"PRIVATE METADATA" not in out+err
+    if expected!=0:
+        assert out==b"";return err
+    assert not err
+    rows=saved(name)
+    bodies={rid:cbor2.loads(raw)["body"] for rid,raw in rows.items()}
+    public={rid:cbor2.loads(raw)["signature"]["public_key_bytes"] for rid,raw in rows.items()}
+    selected=sorted(rid for rid,b in bodies.items() if b["record_kind"]=="revision"
+                    and b["knowledge_id"]==rawid(fixed["knowledge_id"])
+                    and b["genesis_record_id"]==rawid(fixed["genesis_id"]))
+    with db(name) as c:
+        generation=c.execute("SELECT generation FROM storage_state").fetchone()[0]
+        known=[rid.hex() for (rid,) in c.execute("SELECT record_id FROM known_invalid")]
+        retained=[];unavailable=[]
+        for (bid,) in c.execute("SELECT id FROM blobs"):
+            path=ROOT/name/"blobs"/bid.hex()
+            if path.exists():retained.append(path.read_bytes().hex())
+            else:unavailable.append(bid.hex())
+    case={"records":[raw.hex() for raw in rows.values()],"retained":retained,"known":known,"unavailable":unavailable}
+    oracle=subprocess.run([sys.executable,"tests/dependency_reference.py"],input=json.dumps([case]).encode(),
+                          stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=60)
+    assert oracle.returncode==0,oracle.stderr.decode()
+    assessments={bytes.fromhex(a["id"]):a for a in json.loads(oracle.stdout)[0]}
+    expected_fields={"startup_state":state,"knowledge_id":fixed["knowledge_id"],"genesis_id":fixed["genesis_id"],
+                     "generation":str(generation),"assessment_committed":"false",
+                     "assessment_storage_fault":str(bool(unavailable)).lower(),"revisions":str(len(selected))}
+    for n,rid in enumerate(selected):
+        b=bodies[rid];a=assessments[rid];p="revision["+str(n)+"]"
+        children=[child for child in selected if rid in bodies[child]["parents"]]
+        related="unspecified"
+        if a["related"]:
+            prefix="bl1_" if (a["reason"]=="declared_length_mismatch" or
+                (a["reason"]=="evidence_unavailable" and a["related"]==b["payload"]["blob_id"].hex())) else "rc1_"
+            related=text_id(prefix,bytes.fromhex(a["related"]))
+        expected_fields.update({p+".id":text_id("rc1_",rid),
+            p+".publisher_key_id":text_id("ky1_",hashlib.sha256(b"lngnb:key:ed25519:1\0"+public[rid]).digest()),
+            p+".record_validation":a["validation"],p+".validation_reason":a["reason"] or "none",
+            p+".related_id":related,p+".payload_status":a["payload"] or "unspecified",
+            p+".payload_reason":a["payload_reason"] or "none",
+            p+".declared_root":str(not b["parents"]).lower(),p+".declared_merge":str(len(b["parents"])>1).lower(),
+            p+".declared_branch":str(len(children)>1).lower(),p+".declared_tip":str(not children).lower(),
+            p+".parents":str(len(b["parents"])),p+".declared_children":str(len(children)),
+            p+".origins":"unspecified" if "origins" not in b else str(len(b["origins"]))})
+        for j,parent in enumerate(b["parents"]):
+            target=bodies.get(parent)
+            if target is None:match="missing"
+            elif target["record_kind"]!="revision":match="not_revision"
+            elif target["knowledge_id"]!=b["knowledge_id"]:match="different_knowledge"
+            elif target["genesis_record_id"]!=b["genesis_record_id"]:match="different_genesis"
+            elif public[parent]!=public[rid]:match="different_publisher"
+            else:match="direct_match"
+            expected_fields[p+".parent["+str(j)+"].id"]=text_id("rc1_",parent)
+            expected_fields[p+".parent["+str(j)+"].target"]=match
+        for j,child in enumerate(children):expected_fields[p+".declared_child["+str(j)+"]"]=text_id("rc1_",child)
+        for j,origin in enumerate(b.get("origins",[])):
+            o=p+".origin["+str(j)+"]"
+            expected_fields[o+".knowledge_id"]=text_id("kn1_",origin["knowledge_id"])
+            for label,key in [("genesis_id","genesis_record_id"),("revision_id","revision_record_id")]:
+                expected_fields[o+"."+label]=text_id("rc1_",origin[key]) if key in origin else "unspecified"
+    lines=out.decode().splitlines()
+    assert dict(line.split(": ",1) for line in lines[1:-1])==expected_fields
+    assert "世界の完全履歴・現在候補・公開資格ではありません" in lines[0]
+    assert "非永続" in lines[-1] and "解除しません" in lines[-1]
+    return out
+A13=json.loads(SPEC.split("## 付録A13 ",1)[1].split("```json\n",1)[1].split("\n```",1)[0])
+diag_rid=ident("rc1_",b"lngnb:record:library-core-1\0",bytes.fromhex(A13["revision"]["envelope_cbor_hex"]))
+for name in ["ok","derived","derived-next","inspect-declarations","history-diagnostics"]:
+    f=fixed_in(name,base["revision_id"] if name=="ok" else diag_rid if name=="history-diagnostics" else None)
+    old=snapshot(name);history(name,f);assert snapshot(name)==old
+# 空scopeは空の保存範囲であり、不在Genesisの代替や全世界の不在証明ではない。
+fixed=fixed_in("ok")
+for changed in [{"knowledge_id":"kn1_"+"a"*52},{"genesis_id":"rc1_"+"a"*52}]:
+    old=snapshot("ok");out=history("ok",dict(fixed,**changed));assert b"revisions: 0" in out and snapshot("ok")==old
+for name in ["revision-finish","derived-finish"]:
+    old=snapshot(name);f=fixed_in(name);history(name,f,state="manual_review_required");assert snapshot(name)==old
+    err=history(name,f,expected=1,full=True);assert "読取り診断は終了" in err.decode() and snapshot(name)==old
+for extra in [["--revision-id",fixed["revision_id"]],["--key-dir","PRIVATE INPUT"],["--genesis-id",fixed["genesis_id"]]]:
+    old=snapshot("ok");history("ok",fixed,expected=2,extra=extra);assert snapshot("ok")==old
+history("history-missing",fixed,expected=1);assert not (ROOT/"history-missing").exists()
+for name in ["inspect-linked","inspect-old-format","inspect-corrupt"]:
+    old=snapshot("ok" if name=="inspect-linked" else name);history(name,fixed,expected=1)
+    assert snapshot("ok" if name=="inspect-linked" else name)==old
+with open(ROOT/"ok/lock","rb") as lock:
+    fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB);old=snapshot("ok");history("ok",fixed,expected=1);assert snapshot("ok")==old
+# 既知不正の真正本文根拠を失った場合、非永続pending/保存障害を保持する。
+shutil.copytree(ROOT/"history-diagnostics",ROOT/"history-evidence-lost")
+for path in (ROOT/"history-evidence-lost/blobs").iterdir():path.unlink()
+f=fixed_in("history-evidence-lost",diag_rid);old_records=saved("history-evidence-lost")
+out=history("history-evidence-lost",f,state="manual_review_required")
+assert b"evidence_unavailable" in out and b"assessment_storage_fault: true" in out
+assert saved("history-evidence-lost")==old_records and count_state("history-evidence-lost")[0]=="running"
+old=snapshot("history-evidence-lost");history("history-evidence-lost",f,state="manual_review_required");assert snapshot("history-evidence-lost")==old
+assert (ROOT/"keys/publisher").read_bytes()==original_key
 print("DOCUMENT_CLI_CASES_OK")
