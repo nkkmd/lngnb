@@ -160,6 +160,39 @@ for case in json.load(sys.stdin):
             "publisher_key_id": formatted("ky1_", hashlib.sha256(DK + public).digest()),
             "parents": [formatted("rc1_", parent) for parent in body["parents"]],
             "origins": expected_origins}
+    if "history_view" in case:
+        held = {}
+        for raw in case["history_records"]:
+            data = bytes.fromhex(raw)
+            value = cbor2.loads(data)
+            assert cbor2.dumps(value, canonical=True) == data
+            Ed25519PublicKey.from_public_bytes(value["signature"]["public_key_bytes"]).verify(
+                value["signature"]["signature_bytes"], DS + cbor2.dumps(value["body"], canonical=True))
+            held[hashlib.sha256(DR + data).digest()] = value
+        own_id = hashlib.sha256(DR + encoded).digest()
+        parents = []
+        for parent_id in body["parents"]:
+            target = held.get(parent_id)
+            if target is None:
+                status = "Missing"
+            elif target["body"]["record_kind"] != "revision":
+                status = "NotRevision"
+            elif target["body"]["knowledge_id"] != body["knowledge_id"]:
+                status = "DifferentKnowledge"
+            elif target["body"]["genesis_record_id"] != body["genesis_record_id"]:
+                status = "DifferentGenesis"
+            elif target["signature"]["public_key_bytes"] != public:
+                status = "DifferentPublisher"
+            else:
+                status = "DirectMatch"
+            parents.append({"id": formatted("rc1_", parent_id), "target": status})
+        children = sorted(raw_id for raw_id, value in held.items()
+                          if value["body"]["record_kind"] == "revision"
+                          and value["body"]["knowledge_id"] == body["knowledge_id"]
+                          and value["body"]["genesis_record_id"] == body["genesis_record_id"]
+                          and own_id in value["body"]["parents"])
+        assert case["history_view"] == {"parents": parents,
+                                        "children": [formatted("rc1_", c) for c in children]}
     digest = hashlib.sha256(DR + encoded).digest()
     ids.append("rc1_" + base64.b32encode(digest).decode("ascii").lower().rstrip("="))
 json.dump(ids, sys.stdout)

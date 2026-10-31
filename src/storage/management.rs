@@ -92,6 +92,36 @@ pub struct RevisionInventory {
     /// 生Record ID昇順。局所署名の成功だけで発行鍵/祖先の有効性を認定しない。
     pub revisions: Vec<SavedRevision>,
 }
+/// 親宣言と保存された参照先の直接照合だけ。祖先有効性の判定ではない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SavedParentTarget {
+    Missing,
+    NotRevision,
+    DifferentKnowledge,
+    DifferentGenesis,
+    DifferentPublisher,
+    DirectMatch,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedParentLink {
+    pub parent_id: Id,
+    pub target: SavedParentTarget,
+}
+/// 保存範囲内の署名された親宣言。親なし/複数親、子の分岐/先端は宣言数で区別する。
+/// 子なしは保存範囲内の宣言上の先端だけで、validな現在候補・公開候補ではない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedRevisionRelations {
+    pub revision_id: Id,
+    pub parents: Vec<SavedParentLink>,
+    /// このscope内で当該IDを親と宣言する版。署名鍵違いの宣言も消さない。
+    pub declared_children: Vec<Id>,
+}
+#[derive(Debug)]
+pub struct SavedRevisionHistory {
+    pub inventory: RevisionInventory,
+    /// 生Revision ID順、各親/子も生ID順。originsはinventory内の別宣言のまま。
+    pub relations: Vec<SavedRevisionRelations>,
+}
 impl RevisionInventoryRequest {
     pub fn check(knowledge: Id, genesis: Id) -> crate::Result<Self> {
         use crate::id::Kind;
@@ -108,6 +138,27 @@ impl RevisionInventoryRequest {
         store: &RecordStore,
         budget: RevisionInventoryBudget,
     ) -> Result<RevisionInventory> {
+        Ok(self.inspect_inner(store, budget, false)?.0)
+    }
+    /// 一覧と親参照先/子の直接関係を同じtransaction・予算内で取得する。
+    /// 全祖先評価・本文/既知不正根拠の再検査・現在候補解決は実行しない。
+    pub fn inspect_history(
+        self,
+        store: &RecordStore,
+        budget: RevisionInventoryBudget,
+    ) -> Result<SavedRevisionHistory> {
+        let (inventory, relations) = self.inspect_inner(store, budget, true)?;
+        Ok(SavedRevisionHistory {
+            inventory,
+            relations,
+        })
+    }
+    fn inspect_inner(
+        self,
+        store: &RecordStore,
+        budget: RevisionInventoryBudget,
+        with_relations: bool,
+    ) -> Result<(RevisionInventory, Vec<SavedRevisionRelations>)> {
         use super::{StorageError, sql_inspection};
         let start = std::time::Instant::now();
         let check = || {
@@ -125,6 +176,7 @@ impl RevisionInventoryRequest {
             || {
                 let generation = store.generation()?;
                 let mut revisions = Vec::new();
+                let mut targets = std::collections::BTreeMap::new();
                 let mut remaining_records = budget.records;
                 let mut remaining_bytes = budget.record_bytes;
                 let mut remaining_references = budget.references;
@@ -150,6 +202,15 @@ impl RevisionInventoryRequest {
                         .checked_sub(length as u64)
                         .ok_or(StorageError::BudgetExceeded)?;
                     let record = store.record(id)?.ok_or(StorageError::Corrupt)?;
+                    if with_relations {
+                        targets.insert(
+                            id.bytes,
+                            (
+                                record.identity(),
+                                record.genesis().map_err(|_| StorageError::Corrupt)?,
+                            ),
+                        );
+                    }
                     if record.kind() != crate::record::RecordKind::Revision {
                         continue;
                     }
@@ -172,12 +233,20 @@ impl RevisionInventoryRequest {
                     revisions.push(SavedRevision { record, references });
                 }
                 check()?;
-                Ok(RevisionInventory {
-                    knowledge_id: self.knowledge,
-                    genesis_record_id: self.genesis,
-                    generation,
-                    revisions,
-                })
+                let relations = if with_relations {
+                    saved_relations(&revisions, &targets, &check)?
+                } else {
+                    Vec::new()
+                };
+                Ok((
+                    RevisionInventory {
+                        knowledge_id: self.knowledge,
+                        genesis_record_id: self.genesis,
+                        generation,
+                        revisions,
+                    },
+                    relations,
+                ))
             },
         )?;
         // SQL進捗handlerはread群だけ。commit/rollbackへ残さない。
@@ -186,6 +255,64 @@ impl RevisionInventoryRequest {
         check()?;
         Ok(inventory)
     }
+}
+
+fn saved_relations(
+    revisions: &[SavedRevision],
+    targets: &std::collections::BTreeMap<[u8; 32], (crate::record::RecordIdentity, [u8; 32])>,
+    check: &impl Fn() -> Result<()>,
+) -> Result<Vec<SavedRevisionRelations>> {
+    use SavedParentTarget as Target;
+    // 全対象は走査件数予算内、親/逆向き子は選択参照予算内。再帰・全祖先探索なし。
+    let mut children: std::collections::BTreeMap<_, Vec<Id>> = revisions
+        .iter()
+        .map(|r| (r.record.id().bytes, Vec::new()))
+        .collect();
+    let mut relations = Vec::new();
+    for revision in revisions {
+        check()?;
+        let refs = &revision.references;
+        let mut parents = Vec::new();
+        for parent in &refs.parents {
+            check()?;
+            let target = match targets.get(&parent.bytes) {
+                None => Target::Missing,
+                Some((identity, _)) if identity.kind != crate::record::RecordKind::Revision => {
+                    Target::NotRevision
+                }
+                Some((identity, _)) if identity.knowledge != refs.knowledge_id.bytes => {
+                    Target::DifferentKnowledge
+                }
+                Some((_, genesis)) if *genesis != refs.genesis_record_id.bytes => {
+                    Target::DifferentGenesis
+                }
+                Some((identity, _)) if identity.public != revision.record.identity().public => {
+                    Target::DifferentPublisher
+                }
+                Some(_) => Target::DirectMatch,
+            };
+            parents.push(SavedParentLink {
+                parent_id: *parent,
+                target,
+            });
+            if let Some(declared) = children.get_mut(&parent.bytes) {
+                declared.push(revision.record.id());
+            }
+        }
+        relations.push(SavedRevisionRelations {
+            revision_id: revision.record.id(),
+            parents,
+            declared_children: Vec::new(),
+        });
+    }
+    for relation in &mut relations {
+        check()?;
+        relation.declared_children = children
+            .remove(&relation.revision_id.bytes)
+            .ok_or(super::StorageError::Corrupt)?;
+    }
+    check()?;
+    Ok(relations)
 }
 
 /// 内部IPCの要求は完成したRecordの生bytes一つだけ。秘密鍵・パスフレーズは受けない。
