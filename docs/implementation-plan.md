@@ -1568,7 +1568,7 @@ main `c696f1784b8c13f2e409a15fc5b516db1d3c5611`、tree `58010d4645ab07a72d49c742
 
 追加lib1/main2/data実CLI3件を検証対象とする。UTF-8 byte境界と不正申告・Debug非反射、必須項目/正規世代/重複・read/commit不確定とwrite/flush失敗を確認。実CLIではA13の真正本文/不正宣言を使い、確認履歴を独立cbor2で復号して申告・対象世代・件数と照合する。実効UID/規則、履歴prefix・一次/根拠/評価表/本文保全、dirty化と手動待ち、古い世代/正常領域/未完了検査・不存在/link/排他/旧形式の拒否、根拠欠損/破損・履歴SQL拒否のrollbackと開始印維持、commit後/dev/full失敗でも記録と待ちの維持を確認。既存の予算/容量/hash後変化/SIGKILLと鍵関連回帰を必須CIで継続する。
 
-通常559件予定（553＋6、lib407/main55/CLI3/data8/document1/key1/record67/core13/terminal1/scale3）。専用ext4必須2と既存再実行79は別計上し、結合内の条件数を加算しない。ローカルRust/cargo/rustfmtなし・AF_UNIX errno1。diff/Python構文検査とCIでのRust/実通信/独立Python/専用ext4を区別する。最終head/ローカル/CI仮マージ/mainのtree、レビュー、CI初回失敗/skipped・環境/件数/成否をPRへ記録する。 最終headの15分jobがRelease build中に2回cancelledとなったため、CI job全体の実行上限だけを30分へ広げる。試験選択・件数・条件・製品の時間/SQL予算・正式性能の合格条件は変更せず、未実行を通過させない。取消理由の詳細annotationは未取得で、上限到達は設定/実測時間からの推定と区別してPRへ残す。次は最新の実確認履歴に基づくローカル保存の明示再開CLIを最小単位として具体化する。残る管理状態/停止操作・鍵残存物整理/元領域停止解除/安全な鍵置換、工程⑤全体/G1〜G5/正式性能・実EIO・電源断相当/初期版完成は未完了。
+通常559件予定（553＋6、lib407/main55/CLI3/data8/document1/key1/record67/core13/terminal1/scale3）。専用ext4必須2と既存再実行79は別計上し、結合内の条件数を加算しない。ローカルRust/cargo/rustfmtなし・AF_UNIX errno1。diff/Python構文検査とCIでのRust/実通信/独立Python/専用ext4を区別する。最終head/ローカル/CI仮マージ/mainのtree、レビュー、CI初回失敗/skipped・環境/件数/成否をPRへ記録する。 15分jobのattempt1はRelease build中にcancelled、attempt2は各step成功後もjob全体がcancelledとなったため、CI job全体の実行上限だけを30分へ広げる。試験選択・件数・条件・製品の時間/SQL予算・正式性能の合格条件は変更せず、未実行を通過させない。取消理由の詳細annotationは未取得で、上限到達は設定/実測時間からの推定と区別してPRへ残す。次は最新の実確認履歴に基づくローカル保存の明示再開CLIを最小単位として具体化する。残る管理状態/停止操作・鍵残存物整理/元領域停止解除/安全な鍵置換、工程⑤全体/G1〜G5/正式性能・実EIO・電源断相当/初期版完成は未完了。
 
 ## 6. 実装ゲートと試験方針
 
