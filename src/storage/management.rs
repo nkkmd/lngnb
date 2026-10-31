@@ -452,17 +452,27 @@ impl std::fmt::Debug for RecoveryReviewRequest {
 impl RecoveryReviewRequest {
     /// 確認文はそれぞれUTF-8で1〜4096 bytes、空白のみ/NULを拒否。確保前に検査する。
     pub fn check(expected_generation: i64, restored: &str, unconfirmed: &str) -> Result<Self> {
-        if expected_generation < 0 || [restored, unconfirmed].iter()
-            .any(|s| s.trim().is_empty() || s.len() > 4096 || s.contains('\0')) {
+        if expected_generation < 0
+            || [restored, unconfirmed]
+                .iter()
+                .any(|s| s.trim().is_empty() || s.len() > 4096 || s.contains('\0'))
+        {
             return Err(super::StorageError::InvalidRecoveryReview);
         }
-        Ok(Self { expected_generation, restored: restored.into(), unconfirmed: unconfirmed.into() })
+        Ok(Self {
+            expected_generation,
+            restored: restored.into(),
+            unconfirmed: unconfirmed.into(),
+        })
     }
     /// 既存の所有者/root・領域・排他・起動検査を再利用し、同じ排他で既存確認APIへ渡す。
     /// 開始履歴や確認が保存済みの可能性を失敗から推測しない。再試行・writer/finishなし。
     pub fn confirm_stopped(self, path: &std::path::Path) -> Result<super::EvidenceRecoveryReview> {
         RecordStore::open(path, super::Limits::default())?.confirm_evidence_recovery(
-            self.expected_generation, &self.restored, &self.unconfirmed, EvaluationLimits::default(),
+            self.expected_generation,
+            &self.restored,
+            &self.unconfirmed,
+            EvaluationLimits::default(),
         )
     }
 }

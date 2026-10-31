@@ -380,99 +380,258 @@ fn concurrent_initialization_and_output_failures_preserve_confirmed_data() {
 }
 
 fn recovery_fixture(t: &Temp) -> Vec<u8> {
-    let f=fixture();
-    let body=unhex(f["blob_hex"].as_str().unwrap());
-    let key=ed25519_dalek::SigningKey::from_bytes(&unhex(f["seed_hex"].as_str().unwrap()).try_into().unwrap());
-    let lngnb::cbor::Value::Map(mut fields)=record("revision").body().clone() else {unreachable!()};
-    let lngnb::cbor::Value::Map(payload)=&mut fields.iter_mut().find(|(k,_)|k=="payload").unwrap().1 else {unreachable!()};
-    payload.iter_mut().find(|(k,_)|k=="byte_length").unwrap().1=lngnb::cbor::Value::Int(body.len() as i64+1);
-    let bad=LocalRecord::sign(lngnb::cbor::Value::Map(fields),&key).unwrap();
-    let mut writer=RecordStore::initialize(&t.data(),Limits::default()).unwrap().begin().unwrap();
-    for r in [&record("genesis"),&record("revision"),&bad] {writer.insert(r).unwrap();}
-    writer.put_blob(id::blob_id(&body),Cursor::new(&body)).unwrap();
-    writer.revalidate(lngnb::storage::EvaluationLimits::default()).unwrap();
+    let f = fixture();
+    let body = unhex(f["blob_hex"].as_str().unwrap());
+    let key = ed25519_dalek::SigningKey::from_bytes(
+        &unhex(f["seed_hex"].as_str().unwrap()).try_into().unwrap(),
+    );
+    let lngnb::cbor::Value::Map(mut fields) = record("revision").body().clone() else {
+        unreachable!()
+    };
+    let lngnb::cbor::Value::Map(payload) =
+        &mut fields.iter_mut().find(|(k, _)| k == "payload").unwrap().1
+    else {
+        unreachable!()
+    };
+    payload
+        .iter_mut()
+        .find(|(k, _)| k == "byte_length")
+        .unwrap()
+        .1 = lngnb::cbor::Value::Int(body.len() as i64 + 1);
+    let bad = LocalRecord::sign(lngnb::cbor::Value::Map(fields), &key).unwrap();
+    let mut writer = RecordStore::initialize(&t.data(), Limits::default())
+        .unwrap()
+        .begin()
+        .unwrap();
+    for r in [&record("genesis"), &record("revision"), &bad] {
+        writer.insert(r).unwrap();
+    }
+    writer
+        .put_blob(id::blob_id(&body), Cursor::new(&body))
+        .unwrap();
+    writer
+        .revalidate(lngnb::storage::EvaluationLimits::default())
+        .unwrap();
     drop(writer);
     body
 }
-fn generation(t:&Temp)->i64 {RecordStore::open(&t.data(),Limits::default()).unwrap().generation().unwrap()}
-fn recovery_command(path:&Path,g:i64)->Command {
-    let mut c=Command::new(env!("CARGO_BIN_EXE_lngnb"));
-    c.args(["data","recovery-confirm","--data-dir"]).arg(path)
-        .args(["--expect-generation",&g.to_string(),"--restored","真正本文を復元 PRIVATE NOTE","--unconfirmed","公開設定・未確定制限は未確認"]);
+fn generation(t: &Temp) -> i64 {
+    RecordStore::open(&t.data(), Limits::default())
+        .unwrap()
+        .generation()
+        .unwrap()
+}
+fn recovery_command(path: &Path, g: i64) -> Command {
+    let mut c = Command::new(env!("CARGO_BIN_EXE_lngnb"));
+    c.args(["data", "recovery-confirm", "--data-dir"])
+        .arg(path)
+        .args([
+            "--expect-generation",
+            &g.to_string(),
+            "--restored",
+            "真正本文を復元 PRIVATE NOTE",
+            "--unconfirmed",
+            "公開設定・未確定制限は未確認",
+        ]);
     c
 }
-fn protected_unchanged(before:&[(String,Vec<String>)],after:&[(String,Vec<String>)]) {
-    for (table,rows) in before {
-        let current=&after.iter().find(|(n,_)|n==table).unwrap().1;
-        if !["history","storage_state","evaluation_state"].contains(&table.as_str()) {assert_eq!(current,rows,"{table}");}
-        if table=="history" {assert_eq!(&current[..rows.len()],rows.as_slice());}
+fn protected_unchanged(before: &[(String, Vec<String>)], after: &[(String, Vec<String>)]) {
+    for (table, rows) in before {
+        let current = &after.iter().find(|(n, _)| n == table).unwrap().1;
+        if !["history", "storage_state", "evaluation_state"].contains(&table.as_str()) {
+            assert_eq!(current, rows, "{table}");
+        }
+        if table == "history" {
+            assert_eq!(&current[..rows.len()], rows.as_slice());
+        }
     }
 }
 #[test]
 fn recovery_confirmation_records_only_review_and_keeps_wait_after_output_failure() {
     use std::io::Write;
-    let t=Temp::new();let body=recovery_fixture(&t);let g=generation(&t);
-    let before=snapshot(&t.data());
-    let out=recovery_command(&t.data(),g).output().unwrap();
-    let text=success(out);
+    let t = Temp::new();
+    let body = recovery_fixture(&t);
+    let g = generation(&t);
+    let before = snapshot(&t.data());
+    let out = recovery_command(&t.data(), g).output().unwrap();
+    let text = success(out);
     assert!(!text.contains("PRIVATE NOTE"));
     assert!(text.contains(&format!("source_generation: {g}\n")));
-    assert!(text.contains(&format!("recorded_generation: {}\n",g+2)));
+    assert!(text.contains(&format!("recorded_generation: {}\n", g + 2)));
     assert!(text.contains("checked_evidence: 1\nmanual_review_required: true\n"));
-    assert_eq!(generation(&t),g+2);
-    protected_unchanged(&before,&snapshot(&t.data()));
-    let conn=Connection::open(t.data().join("database.sqlite")).unwrap();
-    let (reason,actor,rules):(String,String,String)=conn.query_row("SELECT reason,actor,rules FROM history ORDER BY generation DESC LIMIT 1",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
-    assert_eq!(rules,"lngnb-validation-1");assert_eq!(actor,format!("uid:{}",rustix::process::geteuid().as_raw()));
-    assert_eq!(conn.query_row("SELECT dirty FROM evaluation_state",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+    assert_eq!(generation(&t), g + 2);
+    protected_unchanged(&before, &snapshot(&t.data()));
+    let conn = Connection::open(t.data().join("database.sqlite")).unwrap();
+    let (reason, actor, rules): (String, String, String) = conn
+        .query_row(
+            "SELECT reason,actor,rules FROM history ORDER BY generation DESC LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(rules, "lngnb-validation-1");
+    assert_eq!(
+        actor,
+        format!("uid:{}", rustix::process::geteuid().as_raw())
+    );
+    assert_eq!(
+        conn.query_row("SELECT dirty FROM evaluation_state", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
     // 独立CBORで実際の履歴を復号し、申告を改変せず保存したことを確認する。
     let mut checker=Command::new(std::env::var_os("LNGNB_REFERENCE_PYTHON").expect("independent checker required"))
         .args(["-c","import json,sys,cbor2; x=json.load(sys.stdin); raw=bytes.fromhex(x['reason'].removeprefix('evidence_recovery_review:')); d=cbor2.loads(raw); assert cbor2.dumps(d,canonical=True)==raw; assert d=={'operation':'confirm_evidence_recovery','source_generation':x['generation'],'checked_evidence':1,'restored':'真正本文を復元 PRIVATE NOTE','unconfirmed':'公開設定・未確定制限は未確認'}"])
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
-    checker.stdin.take().unwrap().write_all(serde_json::to_string(&serde_json::json!({"reason":reason,"generation":g})).unwrap().as_bytes()).unwrap();
+    checker
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(
+            serde_json::to_string(&serde_json::json!({"reason":reason,"generation":g}))
+                .unwrap()
+                .as_bytes(),
+        )
+        .unwrap();
     assert!(checker.wait_with_output().unwrap().status.success());
     drop(conn);
-    assert_eq!(fs::read(t.data().join("blobs").join(data_encoding::HEXLOWER.encode(&id::blob_id(&body).bytes))).unwrap(),body);
-    assert!(RecordStore::open(&t.data(),Limits::default()).unwrap().begin().is_err());
-    let before=snapshot(&t.data());reject(recovery_command(&t.data(),g).output().unwrap(),1);assert_eq!(snapshot(&t.data()),before);
-    let out=recovery_command(&t.data(),g+2).stdout(fs::OpenOptions::new().write(true).open("/dev/full").unwrap()).stderr(Stdio::piped()).output().unwrap();
-    assert_eq!(out.status.code(),Some(1));assert!(String::from_utf8(out.stderr).unwrap().contains("確認は記録"));
-    assert_eq!(generation(&t),g+4);protected_unchanged(&before,&snapshot(&t.data()));
-    assert!(success(cli("status",&t.data())).contains("manual_review_required"));
-    assert!(RecordStore::open(&t.data(),Limits::default()).unwrap().begin().is_err());
+    assert_eq!(
+        fs::read(
+            t.data()
+                .join("blobs")
+                .join(data_encoding::HEXLOWER.encode(&id::blob_id(&body).bytes))
+        )
+        .unwrap(),
+        body
+    );
+    assert!(
+        RecordStore::open(&t.data(), Limits::default())
+            .unwrap()
+            .begin()
+            .is_err()
+    );
+    let before = snapshot(&t.data());
+    reject(recovery_command(&t.data(), g).output().unwrap(), 1);
+    assert_eq!(snapshot(&t.data()), before);
+    let out = recovery_command(&t.data(), g + 2)
+        .stdout(
+            fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/full")
+                .unwrap(),
+        )
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8(out.stderr)
+            .unwrap()
+            .contains("確認は記録")
+    );
+    assert_eq!(generation(&t), g + 4);
+    protected_unchanged(&before, &snapshot(&t.data()));
+    assert!(success(cli("status", &t.data())).contains("manual_review_required"));
+    assert!(
+        RecordStore::open(&t.data(), Limits::default())
+            .unwrap()
+            .begin()
+            .is_err()
+    );
 }
 #[test]
 fn recovery_confirmation_preflight_never_adopts_clean_stale_pending_or_unsafe_storage() {
-    let t=Temp::new();
-    let out=recovery_command(&t.data(),0).args(["--restored","PRIVATE INPUT"]).output().unwrap();reject(out,2);assert!(!t.data().exists());
-    reject(recovery_command(&t.data(),0).output().unwrap(),1);assert!(!t.data().exists());
-    success(cli("init",&t.data()));let before=snapshot(&t.data());
-    reject(recovery_command(&t.data(),0).output().unwrap(),1);assert_eq!(snapshot(&t.data()),before);
-    let store=RecordStore::open(&t.data(),Limits::default()).unwrap();reject(recovery_command(&t.data(),0).output().unwrap(),1);drop(store);assert_eq!(snapshot(&t.data()),before);
-    let link=t.0.join("linked");symlink(t.data(),&link).unwrap();reject(recovery_command(&link,0).output().unwrap(),1);assert_eq!(snapshot(&t.data()),before);
-    RecordInspection::open(&t.data(),Limits::default()).unwrap().pause().unwrap();
-    let g=generation(&t);let before=snapshot(&t.data());reject(recovery_command(&t.data(),g).output().unwrap(),1);assert_eq!(snapshot(&t.data()),before);
-    let old=Temp::new();success(cli("init",&old.data()));
-    Connection::open(old.data().join("database.sqlite")).unwrap().pragma_update(None,"user_version",11).unwrap();
-    let before=snapshot(&old.data());reject(recovery_command(&old.data(),0).output().unwrap(),1);assert_eq!(snapshot(&old.data()),before);
+    let t = Temp::new();
+    let out = recovery_command(&t.data(), 0)
+        .args(["--restored", "PRIVATE INPUT"])
+        .output()
+        .unwrap();
+    reject(out, 2);
+    assert!(!t.data().exists());
+    reject(recovery_command(&t.data(), 0).output().unwrap(), 1);
+    assert!(!t.data().exists());
+    success(cli("init", &t.data()));
+    let before = snapshot(&t.data());
+    reject(recovery_command(&t.data(), 0).output().unwrap(), 1);
+    assert_eq!(snapshot(&t.data()), before);
+    let store = RecordStore::open(&t.data(), Limits::default()).unwrap();
+    reject(recovery_command(&t.data(), 0).output().unwrap(), 1);
+    drop(store);
+    assert_eq!(snapshot(&t.data()), before);
+    let link = t.0.join("linked");
+    symlink(t.data(), &link).unwrap();
+    reject(recovery_command(&link, 0).output().unwrap(), 1);
+    assert_eq!(snapshot(&t.data()), before);
+    RecordInspection::open(&t.data(), Limits::default())
+        .unwrap()
+        .pause()
+        .unwrap();
+    let g = generation(&t);
+    let before = snapshot(&t.data());
+    reject(recovery_command(&t.data(), g).output().unwrap(), 1);
+    assert_eq!(snapshot(&t.data()), before);
+    let old = Temp::new();
+    success(cli("init", &old.data()));
+    Connection::open(old.data().join("database.sqlite"))
+        .unwrap()
+        .pragma_update(None, "user_version", 11)
+        .unwrap();
+    let before = snapshot(&old.data());
+    reject(recovery_command(&old.data(), 0).output().unwrap(), 1);
+    assert_eq!(snapshot(&old.data()), before);
 }
 #[test]
 fn recovery_confirmation_missing_corrupt_or_sql_failure_preserves_primary_and_wait() {
-    for fault in ["missing","corrupt","sql"] {
-        let t=Temp::new();let body=recovery_fixture(&t);
-        let path=t.data().join("blobs").join(data_encoding::HEXLOWER.encode(&id::blob_id(&body).bytes));
+    for fault in ["missing", "corrupt", "sql"] {
+        let t = Temp::new();
+        let body = recovery_fixture(&t);
+        let path = t
+            .data()
+            .join("blobs")
+            .join(data_encoding::HEXLOWER.encode(&id::blob_id(&body).bytes));
         match fault {
-            "missing"=>fs::remove_file(&path).unwrap(),
-            "corrupt"=>fs::write(&path,b"corrupt public fixture").unwrap(),
-            _=>{Connection::open(t.data().join("database.sqlite")).unwrap().execute_batch("CREATE TRIGGER deny_review BEFORE INSERT ON history WHEN NEW.reason LIKE 'evidence_recovery_review:%' BEGIN SELECT RAISE(ABORT,'test'); END;").unwrap();}
+            "missing" => fs::remove_file(&path).unwrap(),
+            "corrupt" => fs::write(&path, b"corrupt public fixture").unwrap(),
+            _ => {
+                Connection::open(t.data().join("database.sqlite")).unwrap().execute_batch("CREATE TRIGGER deny_review BEFORE INSERT ON history WHEN NEW.reason LIKE 'evidence_recovery_review:%' BEGIN SELECT RAISE(ABORT,'test'); END;").unwrap();
+            }
         }
-        let g=generation(&t);let before=snapshot(&t.data());
-        let out=recovery_command(&t.data(),g).output().unwrap();assert!(!String::from_utf8_lossy(&out.stderr).contains("PRIVATE NOTE"));reject(out,1);
-        protected_unchanged(&before,&snapshot(&t.data()));assert_eq!(generation(&t),g+1);
-        let c=Connection::open(t.data().join("database.sqlite")).unwrap();
-        assert_eq!(c.query_row("SELECT count(*) FROM history WHERE reason LIKE 'evidence_recovery_review:%'",[],|r|r.get::<_,i64>(0)).unwrap(),0);
-        assert_eq!(c.query_row("SELECT dirty FROM evaluation_state",[],|r|r.get::<_,i64>(0)).unwrap(),0);
-        assert!(RecordStore::open(&t.data(),Limits::default()).unwrap().begin().is_err());
-        if fault=="sql" {assert_eq!(fs::read(&path).unwrap(),body);} else if fault=="corrupt" {assert_eq!(fs::read(&path).unwrap(),b"corrupt public fixture");} else {assert!(!path.exists());}
+        let g = generation(&t);
+        let before = snapshot(&t.data());
+        let out = recovery_command(&t.data(), g).output().unwrap();
+        assert!(!String::from_utf8_lossy(&out.stderr).contains("PRIVATE NOTE"));
+        reject(out, 1);
+        protected_unchanged(&before, &snapshot(&t.data()));
+        assert_eq!(generation(&t), g + 1);
+        let c = Connection::open(t.data().join("database.sqlite")).unwrap();
+        assert_eq!(
+            c.query_row(
+                "SELECT count(*) FROM history WHERE reason LIKE 'evidence_recovery_review:%'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            c.query_row("SELECT dirty FROM evaluation_state", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert!(
+            RecordStore::open(&t.data(), Limits::default())
+                .unwrap()
+                .begin()
+                .is_err()
+        );
+        if fault == "sql" {
+            assert_eq!(fs::read(&path).unwrap(), body);
+        } else if fault == "corrupt" {
+            assert_eq!(fs::read(&path).unwrap(), b"corrupt public fixture");
+        } else {
+            assert!(!path.exists());
+        }
     }
 }

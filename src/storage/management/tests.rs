@@ -1421,13 +1421,24 @@ fn independent_python_checks_reference_views_including_absence_and_bounds() {
 #[test]
 fn recovery_review_request_checks_notes_before_owned_copy_and_redacts_debug() {
     let exact = "界".repeat(1365) + "x";
-    assert_eq!(exact.len(),4096);
-    let request = RecoveryReviewRequest::check(0,&exact,"PRIVATE NOTE").unwrap();
+    assert_eq!(exact.len(), 4096);
+    let request = RecoveryReviewRequest::check(0, &exact, "PRIVATE NOTE").unwrap();
     assert!(!format!("{request:?}").contains("PRIVATE NOTE"));
     assert!(!format!("{request:?}").contains("界"));
-    for note in ["".to_owned()," \n".into(),"x".repeat(4097),"bad\0note".into()] {
-        assert!(matches!(RecoveryReviewRequest::check(0,&note,"未確認"),Err(StorageError::InvalidRecoveryReview)));
-        assert!(matches!(RecoveryReviewRequest::check(0,"復旧",&note),Err(StorageError::InvalidRecoveryReview)));
+    for note in [
+        "".to_owned(),
+        " \n".into(),
+        "x".repeat(4097),
+        "bad\0note".into(),
+    ] {
+        assert!(matches!(
+            RecoveryReviewRequest::check(0, &note, "未確認"),
+            Err(StorageError::InvalidRecoveryReview)
+        ));
+        assert!(matches!(
+            RecoveryReviewRequest::check(0, "復旧", &note),
+            Err(StorageError::InvalidRecoveryReview)
+        ));
     }
-    assert!(RecoveryReviewRequest::check(-1,"復旧","未確認").is_err());
+    assert!(RecoveryReviewRequest::check(-1, "復旧", "未確認").is_err());
 }
