@@ -633,10 +633,10 @@ fn inspection_keeps_manual_wait_and_rejects_corrupt_or_oversized_saved_bytes() {
     );
     assert_eq!(store.startup_state().unwrap(), StartupState::NeedsReview);
     assert_eq!(logical_snapshot(&store.conn), before);
-    // 破損注入fixtureだけで制約を迂回し、製品読取りの確保前上限を確認する。
+    // 破損注入fixtureだけで不変triggerと制約を迂回し、製品読取りの確保前上限を確認する。
     store
         .conn
-        .execute_batch("PRAGMA ignore_check_constraints=ON")
+        .execute_batch("DROP TRIGGER records_no_update; PRAGMA ignore_check_constraints=ON")
         .unwrap();
     for bad in [
         fixture("genesis").bytes().to_vec(),

@@ -1464,7 +1464,7 @@ main `c4ec2a397a75ac99e6f9971cf7edd94e58ce8a0f`、tree `40f94d3e8aa254ab71b92b64
 |---|---|---|
 | R03〜07/R34 | `LocalRecord::revision_references`で局所検査済みRevisionのKnowledge/Genesis/発行鍵ID・親・由来を型付きで抽出。由来の三形と省略ID、origins未指定/明示空、署名中の集合順を保持する | 元bytesを変更・再署名せず、不足IDを補完しない。Genesisでの呼出しは拒否。返すのは署名された直接宣言であり、Genesis/親/由来の外部照合、祖先有効性、本文保持、評価確定を表さない |
 | R04/R07/R24/R28/R30 | 共通管理`RevisionRequest::check`でKnowledge/Genesis/Revisionの三IDの用途を検査。`inspect`は同じ排他の既存Record読取り（各2 MiBの確保前制限・ID/署名再検査）から完全一致の元Recordと宣言を返す | 未保持/別種別/Knowledge・Genesis不一致はNone、破損・SQL失敗はエラー。別版/別Genesisへの代替、参照先取得/探索、writer取得/finish/評価更新/手動待ち解除をしない。RecordStoreの既存open検査・予算を迂回せず、この一版読取りだけを起動検査完了とは扱わない。CLI/全保存版列挙・分岐一覧・公開経路は未接続 |
-| R03〜07/R24/R30、検証 | lib4件追加：A13固定版/三ID・用途不一致/未保持/元bytes不変/排他・全論理DB不変、分岐/merge/別初版・未保持Genesis/親/由来と参照三形/省略・空の区別、手動待ち維持/ID不一致/不正CBOR/上限超過保存bytes拒否、独立Pythonで署名/ID/全参照宣言・256親/128由来を照合 | 通常539件予定（535＋4、lib396/main49/CLI3/data5/document1/key1/record67/core13/terminal1/scale3）。専用ext4必須2・既存再実行79は別集計。制約無効化は破損注入fixtureだけ。ローカルRustなし/AF_UNIX制限のためRust/実通信・独立Python必須検査はCIで確認し、未実行を合格にしない |
+| R03〜07/R24/R30、検証 | lib4件追加：A13固定版/三ID・用途不一致/未保持/元bytes不変/排他・全論理DB不変、分岐/merge/別初版・未保持Genesis/親/由来と参照三形/省略・空の区別、手動待ち維持/ID不一致/不正CBOR/上限超過保存bytes拒否、独立Pythonで署名/ID/全参照宣言・256親/128由来を照合 | 通常539件予定（535＋4、lib396/main49/CLI3/data5/document1/key1/record67/core13/terminal1/scale3）。専用ext4必須2・既存再実行79は別集計。不変trigger/制約の解除は破損注入fixtureだけ。ローカルRustなし/AF_UNIX制限のためRust/実通信・独立Python必須検査はCIで確認し、未実行を合格にしない |
 
 最終head/ローカル/CI仮マージ/mainのtree・レビュー・全CI・初回失敗/skipped・環境はPRへ記録する。次はこの一版読取りを利用者向けの完全固定指定CLIへ接続し、全保存版/分岐/由来一覧は予算と範囲を分けて整える。復旧CLI・残存物整理・鍵置換等も残る。工程⑤全体・G1〜G5・正式性能/実デバイスEIO/電源断相当・初期版完成は未完了。
 
