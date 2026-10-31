@@ -122,6 +122,26 @@ pub struct SavedRevisionHistory {
     /// 生Revision ID順、各親/子も生ID順。originsはinventory内の別宣言のまま。
     pub relations: Vec<SavedRevisionRelations>,
 }
+/// 同じ世代の管理用診断。永続評価・pin・公開・復旧完了の証明ではない。
+#[derive(Debug)]
+pub struct SavedHistoryAssessment {
+    pub generation: i64,
+    pub committed: bool,
+    /// 既存評価器が参照本文/根拠の照合で観測した保存障害。全領域診断ではない。
+    pub storage_fault: bool,
+    /// 選択scopeの全保存Revisionと一対一、生ID順。先端やvalidだけへ絞らない。
+    pub revisions: Vec<super::Assessment>,
+}
+#[derive(Debug)]
+pub struct DiagnosedRevisionHistory {
+    pub history: SavedRevisionHistory,
+    pub assessment: SavedHistoryAssessment,
+}
+struct HistoryRead {
+    inventory: RevisionInventory,
+    relations: Vec<SavedRevisionRelations>,
+    assessment: Option<SavedHistoryAssessment>,
+}
 impl RevisionInventoryRequest {
     pub fn check(knowledge: Id, genesis: Id) -> crate::Result<Self> {
         use crate::id::Kind;
@@ -138,7 +158,7 @@ impl RevisionInventoryRequest {
         store: &RecordStore,
         budget: RevisionInventoryBudget,
     ) -> Result<RevisionInventory> {
-        Ok(self.inspect_inner(store, budget, false)?.0)
+        Ok(self.inspect_inner(store, budget, false, None, || Ok(()))?.inventory)
     }
     /// 一覧と親参照先/子の直接関係を同じtransaction・予算内で取得する。
     /// 全祖先評価・本文/既知不正根拠の再検査・現在候補解決は実行しない。
@@ -147,10 +167,28 @@ impl RevisionInventoryRequest {
         store: &RecordStore,
         budget: RevisionInventoryBudget,
     ) -> Result<SavedRevisionHistory> {
-        let (inventory, relations) = self.inspect_inner(store, budget, true)?;
+        let read = self.inspect_inner(store, budget, true, None, || Ok(()))?;
         Ok(SavedRevisionHistory {
-            inventory,
-            relations,
+            inventory: read.inventory,
+            relations: read.relations,
+        })
+    }
+    /// 同じread transactionで既存の管理用評価器を実行する。全保存集合の評価が
+    /// 予算内で完了した場合だけ、選択scopeの全版と一対一の診断を返す。
+    /// 一覧と評価の各走査予算は別で、budget.elapsedは両段階と返却準備の合計。
+    pub fn inspect_diagnosed(
+        self,
+        store: &RecordStore,
+        budget: RevisionInventoryBudget,
+        evaluation: EvaluationLimits,
+    ) -> Result<DiagnosedRevisionHistory> {
+        let read = self.inspect_inner(store, budget, true, Some(evaluation), || Ok(()))?;
+        Ok(DiagnosedRevisionHistory {
+            history: SavedRevisionHistory {
+                inventory: read.inventory,
+                relations: read.relations,
+            },
+            assessment: read.assessment.ok_or(super::StorageError::Corrupt)?,
         })
     }
     fn inspect_inner(
@@ -158,7 +196,9 @@ impl RevisionInventoryRequest {
         store: &RecordStore,
         budget: RevisionInventoryBudget,
         with_relations: bool,
-    ) -> Result<(RevisionInventory, Vec<SavedRevisionRelations>)> {
+        evaluation: Option<EvaluationLimits>,
+        after_inventory: impl FnOnce() -> Result<()>,
+    ) -> Result<HistoryRead> {
         use super::{StorageError, sql_inspection};
         let start = std::time::Instant::now();
         let check = || {
@@ -249,11 +289,37 @@ impl RevisionInventoryRequest {
                 ))
             },
         )?;
-        // SQL進捗handlerはread群だけ。commit/rollbackへ残さない。
+        // 一覧のSQL進捗handlerを外してから評価する。既存評価器のscopeとネストしない。
+        check()?;
+        after_inventory()?;
+        let (inventory, relations) = inventory;
+        let assessment = if let Some(mut limits) = evaluation {
+            limits.elapsed = limits.elapsed.min(budget.elapsed.saturating_sub(start.elapsed()));
+            let (snapshot, storage_fault) = store.diagnostic_evaluation(limits)?;
+            if snapshot.generation != inventory.generation || snapshot.committed {
+                return Err(StorageError::Corrupt);
+            }
+            let mut assessed: std::collections::BTreeMap<_, _> = snapshot.records
+                .into_iter().map(|r| (r.record_id.bytes, r)).collect();
+            let mut revisions = Vec::new();
+            for saved in &inventory.revisions {
+                check()?;
+                revisions.push(assessed.remove(&saved.record.id().bytes).ok_or(StorageError::Corrupt)?);
+            }
+            Some(SavedHistoryAssessment {
+                generation: snapshot.generation,
+                committed: snapshot.committed,
+                storage_fault,
+                revisions,
+            })
+        } else {
+            None
+        };
+        // commit/rollbackへ進捗handlerを残さず、失敗では部分一覧/診断を返さない。
         check()?;
         tx.commit()?;
         check()?;
-        Ok(inventory)
+        Ok(HistoryRead { inventory, relations, assessment })
     }
 }
 
