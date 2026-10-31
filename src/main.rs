@@ -35,6 +35,7 @@ const HELP: &str = "lngnb — 分散図書館・知識基盤（開発初期段�
   lngnb record submit --data-dir PATH --record PATH
   lngnb document create --data-dir PATH --key-dir PATH --name NAME --expect-key-id KEY_ID --payload PATH --metadata PATH [--media-type TYPE] [--max-payload-bytes N]
   lngnb document revise --data-dir PATH --key-dir PATH --name NAME --expect-key-id KEY_ID --payload PATH --metadata PATH --genesis PATH (--parent PATH ... | --no-parents) [--media-type TYPE] [--max-payload-bytes N]
+  lngnb document derive --data-dir PATH --key-dir PATH --name NAME --expect-key-id KEY_ID --payload PATH --metadata PATH --origin-genesis PATH --origin-revision PATH [--origin-genesis PATH --origin-revision PATH ...] [--media-type TYPE] [--max-payload-bytes N]
   lngnb key create --key-dir PATH --name NAME
   lngnb key check --key-dir PATH --name NAME
   lngnb key change-passphrase --key-dir PATH --name NAME
@@ -61,6 +62,9 @@ config show は設定候補の表示だけを行います。
 document create は初期化済みの正常なデータ領域へ新規資料を保存します。
 document revise は明示したGenesisと親（最大256件）から同じKnowledgeの新Revisionを保存します。
 親なしは --no-parents を明示。起点・親は保存先に必要で、自動取込み・先端選択・由来継承はしません。
+document derive は明示した元Genesis/Revisionの組（最大128組）から新Knowledgeを保存します。
+由来は親・承認ではありません。元版は自動取込みせず、親・本文・metadata・由来を暗黙継承しません。
+元発行鍵と派生先鍵の一致、元版の本文・全祖先の保持は不要です。
 metadataは決定的CBOR map。本文予算は既定16 MiB、指定上限は64 MiB未満です。
 保存失敗時は一部保存の可能性があるため、再作成せず領域を保全してください。
 data init は既存の親ディレクトリの下に新しい保存領域だけを作成します。
