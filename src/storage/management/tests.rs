@@ -465,6 +465,248 @@ fn origin_forms() -> Vec<crate::cbor::Value> {
     vec![Value::Map(one), Value::Map(two), Value::Map(three)]
 }
 
+fn inventory_request() -> RevisionInventoryRequest {
+    let fixed = fixed_request(&fixture("revision"));
+    RevisionInventoryRequest::check(fixed.knowledge, fixed.genesis).unwrap()
+}
+
+#[test]
+fn inventory_scopes_raw_saved_revisions_without_selecting_or_evaluating_heads() {
+    use crate::cbor::Value;
+    let temp = Temp::new();
+    let mut writer = temp.store().begin().unwrap();
+    let r = fixture("revision");
+    let a = with_references(&[r.id().bytes], None, 101);
+    let b = with_references(&[r.id().bytes], Some(vec![]), 102);
+    let mut parents = [a.id().bytes, b.id().bytes];
+    parents.sort();
+    let merge = with_references(&parents, Some(origin_forms()), 103);
+    let other_initial = with_references(&[], None, 104);
+    let records = [&r, &a, &b, &merge, &other_initial];
+    for record in records.iter().rev() {
+        store_record(&mut writer, record).unwrap();
+    }
+    // 同Knowledgeの別Genesis、別Knowledge、別発行鍵を明示的に作る。
+    for field in ["knowledge_id", "genesis_record_id"] {
+        let Value::Map(mut body) = r.body().clone() else {
+            unreachable!()
+        };
+        body.iter_mut().find(|(k, _)| k == field).unwrap().1 = Value::Bytes(vec![55; 32]);
+        let outside = LocalRecord::sign(Value::Map(body), &signing_key()).unwrap();
+        store_record(&mut writer, &outside).unwrap();
+    }
+    let wrong_key = ed25519_dalek::SigningKey::from_bytes(&[1; 32]);
+    let wrong_publisher = LocalRecord::sign(r.body().clone(), &wrong_key).unwrap();
+    store_record(&mut writer, &wrong_publisher).unwrap();
+    store_record(&mut writer, &fixture("genesis")).unwrap();
+    writer.finish().unwrap();
+    let store = RecordStore::open(&temp.data(), crate::storage::Limits::default()).unwrap();
+    let before = logical_snapshot(&store.conn);
+    let request = inventory_request();
+    let result = request
+        .inspect(&store, RevisionInventoryBudget::default())
+        .unwrap();
+    let mut expected: Vec<_> = records.iter().map(|r| r.id()).collect();
+    expected.push(wrong_publisher.id());
+    expected.sort_by_key(|id| id.bytes);
+    assert_eq!(
+        result
+            .revisions
+            .iter()
+            .map(|r| r.record.id())
+            .collect::<Vec<_>>(),
+        expected
+    );
+    assert_eq!(result.generation, store.generation().unwrap());
+    assert_eq!(result.knowledge_id, request.knowledge);
+    assert_eq!(result.genesis_record_id, request.genesis);
+    for record in records {
+        let saved = result
+            .revisions
+            .iter()
+            .find(|v| v.record.id() == record.id())
+            .unwrap();
+        assert_eq!(saved.record.bytes(), record.bytes());
+        assert_eq!(saved.references, record.revision_references().unwrap());
+    }
+    // 保存一覧には局所署名済みの別鍵版も残す。valid/現在候補と呼ばない。
+    assert!(
+        result
+            .revisions
+            .iter()
+            .any(|v| v.record.id() == wrong_publisher.id())
+    );
+    let empty = RevisionInventoryRequest {
+        genesis: r.id(),
+        ..request
+    }
+    .inspect(&store, RevisionInventoryBudget::default())
+    .unwrap();
+    assert!(empty.revisions.is_empty());
+    assert!(RevisionInventoryRequest::check(request.genesis, request.genesis).is_err());
+    assert!(RevisionInventoryRequest::check(request.knowledge, request.knowledge).is_err());
+    assert_eq!(logical_snapshot(&store.conn), before);
+    assert!(RecordStore::open(&temp.data(), crate::storage::Limits::default()).is_err());
+}
+
+#[test]
+fn inventory_budgets_are_all_or_error_and_do_not_release_manual_wait() {
+    use std::time::Duration;
+    let temp = Temp::new();
+    let mut writer = temp.store().begin().unwrap();
+    let r = with_references(&[[2; 32]], Some(origin_forms()), 1);
+    let g = fixture("genesis");
+    for record in [&r, &g] {
+        store_record(&mut writer, record).unwrap();
+    }
+    drop(writer);
+    let store = RecordStore::open(&temp.data(), crate::storage::Limits::default()).unwrap();
+    let before = logical_snapshot(&store.conn);
+    let exact = RevisionInventoryBudget {
+        records: 2,
+        record_bytes: (r.bytes().len() + g.bytes().len()) as u64,
+        references: 4,
+        ..RevisionInventoryBudget::default()
+    };
+    let request = inventory_request();
+    for budget in [
+        RevisionInventoryBudget {
+            records: 1,
+            ..exact
+        },
+        RevisionInventoryBudget {
+            record_bytes: exact.record_bytes - 1,
+            ..exact
+        },
+        RevisionInventoryBudget {
+            references: 3,
+            ..exact
+        },
+        RevisionInventoryBudget {
+            elapsed: Duration::ZERO,
+            ..exact
+        },
+        RevisionInventoryBudget {
+            sql_inspection: super::super::SqlInspectionBudget {
+                callbacks: 0,
+                ..exact.sql_inspection
+            },
+            ..exact
+        },
+    ] {
+        assert!(matches!(
+            request.inspect(&store, budget),
+            Err(StorageError::BudgetExceeded)
+        ));
+        assert_eq!(logical_snapshot(&store.conn), before);
+        assert_eq!(store.startup_state().unwrap(), StartupState::NeedsReview);
+    }
+    let result = request.inspect(&store, exact).unwrap();
+    assert_eq!(result.revisions.len(), 1);
+    assert_eq!(result.revisions[0].record.bytes(), r.bytes());
+    // Genesis/親/由来/本文の不足と、保存済み評価の未確定を補完しない。
+    assert_eq!(logical_snapshot(&store.conn), before);
+    assert_eq!(store.startup_state().unwrap(), StartupState::NeedsReview);
+    assert!(matches!(store.begin(), Err(StorageError::NeedsReview)));
+}
+
+#[test]
+fn inventory_rechecks_outside_records_and_preserves_corruption_and_sql_failure() {
+    let temp = Temp::new();
+    let mut writer = temp.store().begin().unwrap();
+    let g = fixture("genesis");
+    store_record(&mut writer, &fixture("revision")).unwrap();
+    store_record(&mut writer, &g).unwrap();
+    drop(writer);
+    let store = RecordStore::open(&temp.data(), crate::storage::Limits::default()).unwrap();
+    store
+        .conn
+        .execute_batch("DROP TRIGGER records_no_update; PRAGMA ignore_check_constraints=ON")
+        .unwrap();
+    for bytes in [
+        b"invalid cbor".to_vec(),
+        fixture("revision").bytes().to_vec(),
+        vec![0; crate::cbor::MAX_RECORD + 1],
+    ] {
+        store
+            .conn
+            .execute(
+                "UPDATE records SET bytes=?1 WHERE id=?2",
+                rusqlite::params![bytes, g.id().bytes.as_slice()],
+            )
+            .unwrap();
+        let before = logical_snapshot(&store.conn);
+        assert!(matches!(
+            inventory_request().inspect(&store, RevisionInventoryBudget::default()),
+            Err(StorageError::Corrupt)
+        ));
+        assert_eq!(logical_snapshot(&store.conn), before);
+    }
+    store
+        .conn
+        .execute_batch("ALTER TABLE records RENAME COLUMN bytes TO unreadable")
+        .unwrap();
+    let before = logical_snapshot(&store.conn);
+    assert!(matches!(
+        inventory_request().inspect(&store, RevisionInventoryBudget::default()),
+        Err(StorageError::Sql(_))
+    ));
+    assert_eq!(logical_snapshot(&store.conn), before);
+    assert_eq!(store.startup_state().unwrap(), StartupState::NeedsReview);
+}
+
+#[test]
+fn inventory_sql_interrupt_releases_handler_and_read_transaction_for_retry() {
+    let temp = Temp::new();
+    let mut writer = temp.store().begin().unwrap();
+    for n in 0..256 {
+        store_record(&mut writer, &with_references(&[], None, n)).unwrap();
+    }
+    writer.finish().unwrap();
+    let store = RecordStore::open(&temp.data(), crate::storage::Limits::default()).unwrap();
+    let before = logical_snapshot(&store.conn);
+    let budget = RevisionInventoryBudget {
+        sql_inspection: super::super::SqlInspectionBudget {
+            callbacks: 1,
+            ..super::super::SqlInspectionBudget::default()
+        },
+        ..RevisionInventoryBudget::default()
+    };
+    assert!(matches!(
+        inventory_request().inspect(&store, budget),
+        Err(StorageError::BudgetExceeded)
+    ));
+    assert_eq!(logical_snapshot(&store.conn), before);
+    assert!(store.conn.is_autocommit());
+    assert_eq!(
+        inventory_request()
+            .inspect(&store, RevisionInventoryBudget::default())
+            .unwrap()
+            .revisions
+            .len(),
+        256
+    );
+    assert_eq!(logical_snapshot(&store.conn), before);
+    // handler/transactionが残っていないことを後続の明示書込みでも確認する。
+    let mut writer = store.begin().unwrap();
+    store_record(&mut writer, &fixture("genesis")).unwrap();
+    writer.finish().unwrap();
+    let empty = Temp::new();
+    let store = empty.store();
+    let result = inventory_request()
+        .inspect(
+            &store,
+            RevisionInventoryBudget {
+                records: 0,
+                record_bytes: 0,
+                references: 0,
+                ..RevisionInventoryBudget::default()
+            },
+        )
+        .unwrap();
+    assert!(result.revisions.is_empty());
+}
+
 #[test]
 fn fixed_revision_lookup_matches_all_three_ids_without_fallback_or_writes() {
     use crate::id::Kind;
@@ -692,6 +934,26 @@ fn independent_python_checks_reference_views_including_absence_and_bounds() {
         with_references(&parents, Some(origins), 2),
         with_references(&[], Some(origin_forms()), 3),
     ];
+    let temp = Temp::new();
+    let mut writer = temp.store().begin().unwrap();
+    for record in records.iter().rev() {
+        store_record(&mut writer, record).unwrap();
+    }
+    writer.finish().unwrap();
+    let store = RecordStore::open(&temp.data(), crate::storage::Limits::default()).unwrap();
+    let inventory = inventory_request()
+        .inspect(&store, RevisionInventoryBudget::default())
+        .unwrap();
+    let mut expected: Vec<_> = records.iter().map(LocalRecord::id).collect();
+    expected.sort_by_key(|id| id.bytes);
+    assert_eq!(
+        inventory
+            .revisions
+            .iter()
+            .map(|v| v.record.id())
+            .collect::<Vec<_>>(),
+        expected
+    );
     let hex = |bytes: &[u8]| {
         use std::fmt::Write as _;
         let mut text = String::with_capacity(bytes.len() * 2);
@@ -700,12 +962,13 @@ fn independent_python_checks_reference_views_including_absence_and_bounds() {
         }
         text
     };
-    let cases: Vec<_> = records.iter().map(|record| {
-        let refs = record.revision_references().unwrap();
+    let cases: Vec<_> = inventory.revisions.iter().map(|saved| {
+        let record = &saved.record;
+        let refs = &saved.references;
         serde_json::json!({"seed": fixture_data()["seed_hex"], "body": hex(&cbor::encode(record.body()).unwrap()), "envelope": hex(record.bytes()),
             "reference_view": {"knowledge_id": refs.knowledge_id.to_string(), "genesis_record_id": refs.genesis_record_id.to_string(), "publisher_key_id": refs.publisher_key_id.to_string(),
                 "parents": refs.parents.iter().map(ToString::to_string).collect::<Vec<_>>(),
-                "origins": refs.origins.map(|origins| origins.iter().map(|origin| serde_json::json!({"knowledge_id": origin.knowledge_id.to_string(),
+                "origins": refs.origins.as_ref().map(|origins| origins.iter().map(|origin| serde_json::json!({"knowledge_id": origin.knowledge_id.to_string(),
                     "genesis_record_id": origin.genesis_record_id.map(|v| v.to_string()), "revision_record_id": origin.revision_record_id.map(|v| v.to_string())})).collect::<Vec<_>>())}})
     }).collect();
     let mut child = Command::new(
@@ -731,9 +994,10 @@ fn independent_python_checks_reference_views_including_absence_and_bounds() {
     let ids: Vec<String> = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(
         ids,
-        records
+        inventory
+            .revisions
             .iter()
-            .map(|r| r.id().to_string())
+            .map(|r| r.record.id().to_string())
             .collect::<Vec<_>>()
     );
 }
