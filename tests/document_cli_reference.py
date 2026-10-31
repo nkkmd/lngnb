@@ -46,20 +46,23 @@ def assert_preserved_after_retry(name):
     assert new["history"][:len(old["history"])]==old["history"],"past history changed"
     assert count_state(name)[0]=="running"
     assert {p.name:p.read_bytes() for p in (ROOT/name/"blobs").iterdir()}==files
-def args(name, extra=(), key_id=KEY_ID, payload=None, metadata=None, selection=None):
+def args(name, extra=(), key_id=KEY_ID, payload=None, metadata=None, selection=None, origins=None):
     command = [BINARY,"document","create","--data-dir",str(ROOT/name),"--key-dir",str(ROOT/"keys"),"--name","publisher","--expect-key-id",key_id,"--payload",str(payload or ROOT/"body"),"--metadata",str(metadata or ROOT/"metadata")]+list(extra)
     if selection is not None:
         command[2] = "revise"
         command += list(selection)
+    if origins is not None:
+        command[2] = "derive"
+        command += sum((["--origin-genesis",g,"--origin-revision",r] for g,r in origins),[])
     return command
-def invoke(name, password=PASS, expected=0, cancel=None, full=False, extra=(), key_id=KEY_ID, payload=None, metadata=None, before_password=None, after_password=None, no_prompt=False, selection=None):
+def invoke(name, password=PASS, expected=0, cancel=None, full=False, extra=(), key_id=KEY_ID, payload=None, metadata=None, before_password=None, after_password=None, no_prompt=False, selection=None, origins=None):
     master,slave=pty.openpty()
     before=termios.tcgetattr(slave);before[3]|=termios.ECHO|termios.ECHONL|termios.ICANON|termios.ISIG
     termios.tcsetattr(slave,termios.TCSANOW,before);before=termios.tcgetattr(slave)
     def setup():
         os.setsid();fcntl.ioctl(slave,termios.TIOCSCTTY,0)
     sink=open("/dev/full","wb") if full else subprocess.PIPE
-    child=subprocess.Popen(args(name,extra,key_id,payload,metadata,selection),stdin=subprocess.DEVNULL,stdout=sink,stderr=subprocess.PIPE,pass_fds=(slave,),preexec_fn=setup)
+    child=subprocess.Popen(args(name,extra,key_id,payload,metadata,selection,origins),stdin=subprocess.DEVNULL,stdout=sink,stderr=subprocess.PIPE,pass_fds=(slave,),preexec_fn=setup)
     captured=bytearray()
     try:
         if not no_prompt:
@@ -278,4 +281,99 @@ _,err=revision("revision-output",expected=1,full=True);assert "保存と正常�
 old=saved("revision-sql");revision("revision-sql",expected=3);assert saved("revision-sql")==old and count_state("revision-sql")[0]=="running"
 assert (ROOT/"keys/publisher").read_bytes()==original_key
 assert Path(parent).read_bytes()==parent_bytes and saved("ok")[rawid(base["genesis_id"])]==Path(gen).read_bytes()
+# R07: 明示由来から新Knowledge。元版の祖先/本文/保存は派生の必須依存ではない。
+def init(name):
+    r=subprocess.run([BINARY,"data","init","--data-dir",str(ROOT/name)],capture_output=True)
+    assert r.returncode==0,(name,r.stderr)
+for name in ["derived","derived-next","derived-sql","derived-finish","derived-output"]:init(name)
+def derive(name="derived", sources=None, **kwargs):
+    return invoke(name,payload=ROOT/"revision-body",metadata=ROOT/"revision-meta",
+                  origins=[(gen,parent)] if sources is None else sources,**kwargs)
+def fixture(body, signer, public, filename):
+    encoded=cbor2.dumps(body,canonical=True)
+    obj={"body":body,"signature":{"algorithm":"ed25519","public_key_bytes":public,
+         "key_id":hashlib.sha256(b"lngnb:key:ed25519:1\0"+public).digest(),
+         "signature_bytes":signer.sign(b"lngnb:signature:library-core-1\0"+encoded)}}
+    raw=cbor2.dumps(obj,canonical=True);path=ROOT/filename;path.write_bytes(raw)
+    return str(path),hashlib.sha256(b"lngnb:record:library-core-1\0"+raw).digest()
+# 公開試験seedのみ。異なる元発行鍵・欠落親/本文・既存由来を持つ元版。
+from cryptography.hazmat.primitives import serialization
+foreign=Ed25519PrivateKey.from_private_bytes(bytes([1])*32)
+foreign_public=foreign.public_key().public_bytes(serialization.Encoding.Raw,serialization.PublicFormat.Raw)
+gbody=cbor2.loads(Path(gen).read_bytes())["body"]
+gbody["knowledge_id"]=bytes([3])*32;gbody["publisher_public_key"]=foreign_public
+fg,fgid=fixture(gbody,foreign,foreign_public,"foreign-genesis")
+rbody=cbor2.loads(parent_bytes)["body"]
+rbody["knowledge_id"]=gbody["knowledge_id"];rbody["genesis_record_id"]=fgid
+rbody["parents"]=[bytes([9])*32]
+rbody["origins"]=[{"knowledge_id":bytes([8])*32}]
+fr,frid=fixture(rbody,foreign,foreign_public,"foreign-revision")
+def ref(g,r):
+    gb=cbor2.loads(Path(g).read_bytes())["body"]
+    return {"knowledge_id":gb["knowledge_id"],
+            "genesis_record_id":hashlib.sha256(b"lngnb:record:library-core-1\0"+Path(g).read_bytes()).digest(),
+            "revision_record_id":hashlib.sha256(b"lngnb:record:library-core-1\0"+Path(r).read_bytes()).digest()}
+def checked_derived(name,out,sources):
+    f=fields(out);rows=saved(name);bodies={}
+    for field in ["genesis_id","revision_id"]:
+        raw=rows[rawid(f[field])];obj=cbor2.loads(raw);body=obj["body"];sig=obj["signature"]
+        assert cbor2.dumps(obj,canonical=True)==raw
+        assert hashlib.sha256(b"lngnb:record:library-core-1\0"+raw).digest()==rawid(f[field])
+        assert sig["public_key_bytes"]==KEY and sig["key_id"]==hashlib.sha256(b"lngnb:key:ed25519:1\0"+KEY).digest()
+        Ed25519PublicKey.from_public_bytes(KEY).verify(sig["signature_bytes"],b"lngnb:signature:library-core-1\0"+cbor2.dumps(body,canonical=True))
+        bodies[field]=body
+    g=bodies["genesis_id"];r=bodies["revision_id"]
+    expected=sorted([ref(g,r) for g,r in sources],key=lambda v:cbor2.dumps(v,canonical=True))
+    assert g["record_kind"]=="genesis" and g["publisher_public_key"]==KEY
+    assert g["knowledge_id"]==r["knowledge_id"]==rawid(f["knowledge_id"])
+    assert all(r["knowledge_id"]!=v["knowledge_id"] for v in expected)
+    assert r["genesis_record_id"]==rawid(f["genesis_id"]) and r["parents"]==[]
+    assert r["origins"]==expected and "origins" not in g
+    assert r["metadata"]=={"information_type":{"namespace":"lngnb","code":0},"resource_type":"lngnb:unspecified"}
+    payload=(ROOT/"revision-body").read_bytes();bid=hashlib.sha256(b"lngnb:blob:1\0"+payload).digest()
+    assert r["payload"]=={"blob_id":bid,"byte_length":len(payload),"media_type":""}
+    assert (ROOT/name/"blobs"/bid.hex()).read_bytes()==payload and count_state(name)[0]=="clean"
+    return f
+sources=[(fg,fr),(gen,parent)];source_bytes={p:Path(p).read_bytes() for pair in sources for p in pair}
+source_state=snapshot("ok")
+(ROOT/"revision-body").write_bytes(b"explicit derived body")
+d,_=derive(sources=sources);df=checked_derived("derived",d,sources)
+assert len(saved("derived"))==2 and not any(ref(g,r)["revision_record_id"] in saved("derived") for g,r in sources)
+d2,_=derive(sources=list(reversed(sources)));df2=checked_derived("derived",d2,sources)
+assert df2["knowledge_id"]!=df["knowledge_id"] and len(saved("derived"))==4
+# 派生の派生も直接選んだ版だけを由来とし、元版のoriginsを継承しない。
+dg=export("derived",df["genesis_id"],"derived-genesis");dr=export("derived",df["revision_id"],"derived-revision")
+d3,_=derive("derived-next",sources=[(dg,dr)]);checked_derived("derived-next",d3,[(dg,dr)])
+# 入力拒否・取消しは保存前。元発行鍵とは別でもよいが、派生先の期待鍵は必須。
+for sig in [signal.SIGHUP,signal.SIGINT,signal.SIGQUIT,signal.SIGTERM,signal.SIGTSTP]:
+    old=snapshot("derived");derive(cancel=sig,expected=130);assert snapshot("derived")==old
+for kwargs in [{"password":b"public wrong password"},{"key_id":"ky1_"+"a"*52}]:
+    old=snapshot("derived");derive(expected=1,**kwargs);assert snapshot("derived")==old
+mismatch_body=cbor2.loads(parent_bytes)["body"]
+wrong_publisher,_=fixture(mismatch_body,foreign,foreign_public,"wrong-publisher")
+for chosen in [[(gen,wrong_publisher)],[(parent,parent)],[(gen,gen)],[(gen,fr)],[(fg,parent)],[(gen,parent),(gen,parent)],
+               [(gen,str(ROOT/"bad-record"))],[(gen,str(ROOT/"linked-parent"))],[(gen,str(ROOT/"oversize-parent"))]]:
+    old=snapshot("derived");derive(sources=chosen,expected=1,no_prompt=True);assert snapshot("derived")==old
+old=snapshot("derived");derive(extra=["--max-payload-bytes","0"],expected=1,no_prompt=True);assert snapshot("derived")==old
+old=snapshot("derived");_,err=derive(sources=[(gen,p) for p in large_parents],expected=1,no_prompt=True)
+assert b"record_input_limit" in err and snapshot("derived")==old
+# 128組を実CLIでも受理し、本文不保持を参照失敗へ読み替えない。
+maximum=[]
+for n in range(128):
+    body=cbor2.loads(parent_bytes)["body"];body["payload"]["byte_length"]=n
+    path,_=fixture(body,signing,KEY,"small-origin-"+str(n));maximum.append((gen,path))
+maximum_out,_=derive(sources=maximum);checked_derived("derived",maximum_out,maximum)
+# 読込み後のsource path差替えを署名対象へ反映しない。
+d4,_=derive(before_password=lambda:Path(parent).write_bytes(b"changed path"))
+Path(parent).write_bytes(parent_bytes);checked_derived("derived",d4,[(gen,parent)])
+# 共通保存の独立確定と保全停止。由来を保存先へ自動取込みしない。
+with db("derived-sql") as c:c.executescript("CREATE TRIGGER fail_derived BEFORE INSERT ON records WHEN (SELECT count(*) FROM records)=1 BEGIN SELECT RAISE(ABORT,'test'); END;")
+derive("derived-sql",expected=3);assert count_state("derived-sql")==("running",1,1)
+old=saved("derived-sql");derive("derived-sql",expected=3);assert saved("derived-sql")==old and count_state("derived-sql")[0]=="running"
+with db("derived-finish") as c:c.executescript("CREATE TRIGGER fail_derived_finish BEFORE UPDATE OF state ON storage_state WHEN NEW.state='clean' BEGIN SELECT RAISE(ABORT,'test'); END;")
+derive("derived-finish",expected=3);assert count_state("derived-finish")==("running",2,1)
+_,err=derive("derived-output",expected=1,full=True)
+assert "保存と正常終了は完了" in err.decode() and count_state("derived-output")==("clean",2,1)
+assert snapshot("ok")==source_state and all(Path(p).read_bytes()==raw for p,raw in source_bytes.items())
+assert (ROOT/"keys/publisher").read_bytes()==original_key
 print("DOCUMENT_CLI_CASES_OK")

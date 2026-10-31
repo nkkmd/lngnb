@@ -21,6 +21,9 @@ use std::{
 #[derive(Debug, PartialEq, Eq)]
 enum Action {
     Create,
+    Derive {
+        origins: Vec<(PathBuf, PathBuf)>,
+    },
     Revise {
         genesis: PathBuf,
         parents: Vec<PathBuf>,
@@ -39,11 +42,11 @@ pub struct Command {
     max_payload: usize,
 }
 pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
-    let usage = || AppError::Usage("document create/revise の操作と引数を確認してください");
+    let usage = || AppError::Usage("document create/revise/derive の操作と引数を確認してください");
     let [action, rest @ ..] = args else {
         return Err(usage());
     };
-    if action != "create" && action != "revise" {
+    if action != "create" && action != "revise" && action != "derive" {
         return Err(usage());
     }
     let mut data = None;
@@ -57,6 +60,8 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
     let mut genesis = None;
     let mut parents = Vec::new();
     let mut no_parents = false;
+    let mut origins = Vec::new();
+    let mut origin_genesis = None;
     let mut rest = rest.iter();
     while let Some(option) = rest.next() {
         if option == "--no-parents" {
@@ -71,6 +76,12 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
             return Err(usage());
         }
         match option.to_str() {
+            Some("--origin-genesis") if action == "derive" && origin_genesis.is_none() && origins.len() < 128 => {
+                origin_genesis = Some(PathBuf::from(value));
+            }
+            Some("--origin-revision") if action == "derive" && origin_genesis.is_some() => {
+                origins.push((origin_genesis.take().ok_or_else(usage)?, PathBuf::from(value)));
+            }
             Some("--genesis") if action == "revise" && genesis.is_none() => {
                 genesis = Some(PathBuf::from(value))
             }
@@ -121,7 +132,10 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
             _ => return Err(usage()),
         }
     }
-    let action = if action == "revise" {
+    let action = if action == "derive" {
+        if origins.is_empty() || origin_genesis.is_some() { return Err(usage()); }
+        Action::Derive { origins }
+    } else if action == "revise" {
         if no_parents != parents.is_empty() {
             return Err(usage());
         }
@@ -197,10 +211,14 @@ pub fn run(command: Command, output: &mut impl Write) -> Result<(), Error> {
         })
         .map_err(Error::File)?;
     let selected = match &command.action {
-        Action::Create => None,
+        Action::Create | Action::Derive { .. } => None,
         Action::Revise { genesis, parents } => {
             Some(read_revision_selection(genesis, parents, &signals)?)
         }
+    };
+    let origins = match &command.action {
+        Action::Derive { origins } => Some(read_origin_selection(origins, &signals)?),
+        _ => None,
     };
     let mut directory = KeyDirectory::open(&command.keys).map_err(Error::Key)?;
     if directory
@@ -241,9 +259,12 @@ pub fn run(command: Command, output: &mut impl Write) -> Result<(), Error> {
             parents.iter().map(LocalRecord::id).collect::<Vec<_>>(),
         )
     } else {
-        let pair =
+        let pair = if let Some(origins) = origins {
+            let sources: Vec<_> = origins.iter().map(|(genesis, revision)| authoring::DerivationSource { genesis, revision }).collect();
+            authoring::create_derived(&key, &sources, &payload, metadata, command.media.as_deref(), budget)
+        } else {
             authoring::create_initial(&key, &payload, metadata, command.media.as_deref(), budget)
-                .map_err(Error::Creation)?;
+        }.map_err(Error::Creation)?;
         let (genesis, revision) = pair.into_parts();
         (genesis, revision, true, vec![])
     };
@@ -251,7 +272,12 @@ pub fn run(command: Command, output: &mut impl Write) -> Result<(), Error> {
     drop(terminal);
     drop(directory);
     signals.check_cancelled().map_err(Error::Input)?;
-    let text = summary(&genesis, &revision, is_initial)?;
+    let label = match &command.action {
+        Action::Create => "新規資料",
+        Action::Revise { .. } => "改訂版",
+        Action::Derive { .. } => "派生資料",
+    };
+    let text = summary(&genesis, &revision, label)?;
     // 保存側へ渡すのは完成Recordと同じ所有本文だけ。秘密鍵/端末はここより前に破棄する。
     save(
         &command.data,
@@ -272,21 +298,13 @@ fn read_revision_selection(
     signals: &TerminalSignals,
 ) -> Result<(LocalRecord, Vec<LocalRecord>), Error> {
     let mut remaining = 16 * 1024 * 1024;
-    let mut read = |path: &std::path::Path| {
-        let bytes = authoring_input::read_record_file_limited(path, remaining, || {
-            signals.check_cancelled().is_err()
-        })
-        .map_err(Error::File)?;
-        remaining -= bytes.len();
-        LocalRecord::check(&bytes, None).map_err(|_| Error::Creation(CreationError::InvalidInput))
-    };
-    let genesis = read(genesis)?;
+    let genesis = read_selected_record(genesis, &mut remaining, signals)?;
     if genesis.kind() != RecordKind::Genesis {
         return Err(Error::Creation(CreationError::InvalidInput));
     }
     let mut records = Vec::with_capacity(parents.len());
     for path in parents {
-        let parent = read(path)?;
+        let parent = read_selected_record(path, &mut remaining, signals)?;
         parent
             .check_genesis(&genesis)
             .map_err(|_| Error::Creation(CreationError::InvalidInput))?;
@@ -296,6 +314,36 @@ fn read_revision_selection(
         records.push(parent);
     }
     Ok((genesis, records))
+}
+
+fn read_selected_record(
+    path: &std::path::Path,
+    remaining: &mut usize,
+    signals: &TerminalSignals,
+) -> Result<LocalRecord, Error> {
+    let bytes = authoring_input::read_record_file_limited(path, *remaining, || signals.check_cancelled().is_err()).map_err(Error::File)?;
+    *remaining -= bytes.len();
+    LocalRecord::check(&bytes, None).map_err(|_| Error::Creation(CreationError::InvalidInput))
+}
+
+// 由来は任意参照。入力組の局所照合だけを行い、保存先の保持・祖先・本文を要求しない。
+fn read_origin_selection(
+    paths: &[(PathBuf, PathBuf)],
+    signals: &TerminalSignals,
+) -> Result<Vec<(LocalRecord, LocalRecord)>, Error> {
+    if paths.is_empty() || paths.len() > 128 { return Err(Error::Creation(CreationError::InvalidInput)); }
+    let mut remaining = 16 * 1024 * 1024;
+    let mut origins: Vec<(LocalRecord, LocalRecord)> = Vec::with_capacity(paths.len());
+    for (g, r) in paths {
+        let genesis = read_selected_record(g, &mut remaining, signals)?;
+        let revision = read_selected_record(r, &mut remaining, signals)?;
+        revision.check_genesis(&genesis).map_err(|_| Error::Creation(CreationError::InvalidInput))?;
+        if origins.iter().any(|(g, r)| g.id() == genesis.id() && r.id() == revision.id()) {
+            return Err(Error::Creation(CreationError::InvalidInput));
+        }
+        origins.push((genesis, revision));
+    }
+    Ok(origins)
 }
 
 fn save(
@@ -353,7 +401,7 @@ fn save(
 fn summary(
     genesis: &LocalRecord,
     revision: &LocalRecord,
-    is_initial: bool,
+    label: &str,
 ) -> Result<String, Error> {
     let knowledge = match genesis.body() {
         lngnb::cbor::Value::Map(m) => {
@@ -372,11 +420,7 @@ fn summary(
     .ok_or(Error::Creation(CreationError::InvalidInput))?;
     Ok(format!(
         "{}の本文と署名Recordをローカル保存しました（pin・公開は未実装）。\nknowledge_id: {}\ngenesis_id: {}\nrevision_id: {}\n",
-        if is_initial {
-            "新規資料"
-        } else {
-            "改訂版"
-        },
+        label,
         Id {
             kind: Kind::Knowledge,
             bytes: knowledge
@@ -414,6 +458,38 @@ mod tests {
         .into_iter()
         .map(Into::into)
         .collect()
+    }
+    #[test]
+    fn derivation_requires_complete_explicit_origin_pairs_and_bounded_count() {
+        let mut a = args();
+        a[0] = "derive".into();
+        assert!(parse(&a).is_err());
+        a.extend(["--origin-genesis".into(), "g".into()]);
+        assert!(parse(&a).is_err());
+        let mut duplicate = a.clone();
+        duplicate.extend(["--origin-genesis".into(), "another".into()]);
+        assert!(parse(&duplicate).is_err());
+        a.extend(["--origin-revision".into(), "r".into()]);
+        assert!(matches!(parse(&a).unwrap().action, Action::Derive { origins } if origins.len() == 1));
+        let mut wrong = args();
+        wrong[0] = "derive".into();
+        wrong.extend(["--origin-revision".into(), "r".into()]);
+        assert!(parse(&wrong).is_err());
+        for pair in [["--genesis", "g"], ["--parent", "r"]] {
+            let mut wrong = a.clone(); wrong.extend(pair.map(OsString::from));
+            assert!(parse(&wrong).is_err());
+        }
+        let mut wrong = a.clone(); wrong.push("--no-parents".into());
+        assert!(parse(&wrong).is_err());
+        for _ in 1..128 { a.extend(["--origin-genesis".into(), "g".into(), "--origin-revision".into(), "r".into()]); }
+        assert!(parse(&a).is_ok());
+        a.extend(["--origin-genesis".into(), "g".into(), "--origin-revision".into(), "r".into()]);
+        assert!(parse(&a).is_err());
+        for action in ["create", "revise"] {
+            let mut wrong = args(); wrong[0] = action.into();
+            wrong.extend(["--origin-genesis".into(), "g".into(), "--origin-revision".into(), "r".into()]);
+            assert!(parse(&wrong).is_err());
+        }
     }
     #[test]
     fn revision_requires_explicit_genesis_and_parent_choice_with_bounded_count() {
@@ -472,7 +548,7 @@ mod tests {
             ["--max-payload-bytes", "-1"],
         ] {
             let mut a = args();
-            a.extend(pair.map(Into::into));
+            a.extend(pair.map(OsString::from));
             let e = parse(&a).unwrap_err();
             assert!(!e.to_string().contains("private marker"));
         }
