@@ -471,6 +471,124 @@ fn inventory_request() -> RevisionInventoryRequest {
 }
 
 #[test]
+fn saved_history_keeps_branches_merge_roots_and_origins_separate() {
+    let temp = Temp::new();
+    let mut writer = temp.store().begin().unwrap();
+    let root = fixture("revision");
+    let a = with_references(&[root.id().bytes], None, 101);
+    let b = with_references(&[root.id().bytes], Some(vec![]), 102);
+    let mut parents = [a.id().bytes, b.id().bytes];
+    parents.sort();
+    let merge = with_references(&parents, Some(origin_forms()), 103);
+    let other_root = with_references(&[], Some(origin_forms()), 104);
+    for record in [&merge, &other_root, &b, &a, &root] {
+        store_record(&mut writer, record).unwrap();
+    }
+    drop(writer);
+    let store = RecordStore::open(&temp.data(), crate::storage::Limits::default()).unwrap();
+    let before = logical_snapshot(&store.conn);
+    let history = inventory_request().inspect_history(&store, RevisionInventoryBudget::default()).unwrap();
+    let ticks = std::cell::Cell::new(0);
+    let interrupted = saved_relations(&history.inventory.revisions, &std::collections::BTreeMap::new(), &|| {
+        ticks.set(ticks.get() + 1);
+        if ticks.get() > 3 { Err(StorageError::BudgetExceeded) } else { Ok(()) }
+    });
+    assert!(matches!(interrupted, Err(StorageError::BudgetExceeded)));
+    assert_eq!(history.inventory.revisions.len(), 5);
+    let ids: Vec<_> = history.relations.iter().map(|r| r.revision_id.bytes).collect();
+    let mut sorted = ids.clone();
+    sorted.sort();
+    assert_eq!(ids, sorted);
+    let relation = |id| history.relations.iter().find(|r| r.revision_id == id).unwrap();
+    assert!(relation(root.id()).parents.is_empty());
+    assert_eq!(relation(root.id()).declared_children.iter().map(|id| id.bytes).collect::<Vec<_>>(), parents);
+    for branch in [&a, &b] {
+        assert_eq!(relation(branch.id()).parents, vec![SavedParentLink { parent_id: root.id(), target: SavedParentTarget::DirectMatch }]);
+        assert_eq!(relation(branch.id()).declared_children, vec![merge.id()]);
+    }
+    assert_eq!(relation(merge.id()).parents.len(), 2);
+    assert!(relation(merge.id()).declared_children.is_empty());
+    assert!(relation(other_root.id()).parents.is_empty());
+    assert!(relation(other_root.id()).declared_children.is_empty());
+    assert_eq!(logical_snapshot(&store.conn), before);
+    assert_eq!(store.startup_state().unwrap(), StartupState::NeedsReview);
+}
+
+#[test]
+fn saved_history_distinguishes_missing_kind_scope_and_direct_signer_mismatches() {
+    use crate::cbor::Value;
+    let temp = Temp::new();
+    let mut writer = temp.store().begin().unwrap();
+    let root = fixture("revision");
+    let genesis = fixture("genesis");
+    let outside = |field: &str| {
+        let Value::Map(mut body) = root.body().clone() else { unreachable!() };
+        body.iter_mut().find(|(k, _)| k == field).unwrap().1 = Value::Bytes(vec![55; 32]);
+        LocalRecord::sign(Value::Map(body), &signing_key()).unwrap()
+    };
+    let other_k = outside("knowledge_id");
+    let other_g = outside("genesis_record_id");
+    let other_key = LocalRecord::sign(root.body().clone(), &ed25519_dalek::SigningKey::from_bytes(&[1; 32])).unwrap();
+    let missing = Id { kind: crate::id::Kind::Record, bytes: [240; 32] };
+    let mut targets = vec![
+        (root.id(), SavedParentTarget::DirectMatch),
+        (genesis.id(), SavedParentTarget::NotRevision),
+        (other_k.id(), SavedParentTarget::DifferentKnowledge),
+        (other_g.id(), SavedParentTarget::DifferentGenesis),
+        (other_key.id(), SavedParentTarget::DifferentPublisher),
+        (missing, SavedParentTarget::Missing),
+    ];
+    targets.sort_by_key(|(id, _)| id.bytes);
+    let parents: Vec<_> = targets.iter().map(|(id, _)| id.bytes).collect();
+    let child = with_references(&parents, Some(origin_forms()), 105);
+    for record in [&genesis, &other_k, &other_g, &other_key, &root, &child] {
+        store_record(&mut writer, record).unwrap();
+    }
+    writer.finish().unwrap();
+    let store = RecordStore::open(&temp.data(), crate::storage::Limits::default()).unwrap();
+    let before = logical_snapshot(&store.conn);
+    let history = inventory_request().inspect_history(&store, RevisionInventoryBudget::default()).unwrap();
+    assert_eq!(history.inventory.revisions.len(), 3);
+    let relation = history.relations.iter().find(|r| r.revision_id == child.id()).unwrap();
+    assert_eq!(relation.parents, targets.into_iter().map(|(parent_id, target)| SavedParentLink { parent_id, target }).collect::<Vec<_>>());
+    // 不一致でも宣言を消さない。scope内の別鍵親への逆向き宣言も保持する。
+    for record in [&root, &other_key] {
+        assert_eq!(history.relations.iter().find(|r| r.revision_id == record.id()).unwrap().declared_children, vec![child.id()]);
+    }
+    assert_eq!(logical_snapshot(&store.conn), before);
+}
+
+#[test]
+fn saved_history_does_not_promote_known_invalid_or_clear_unavailable_evidence() {
+    use std::io::Cursor;
+    let temp = Temp::new();
+    let mut writer = temp.store().begin().unwrap();
+    let bad = with_references(&[], None, 1);
+    let child = with_references(&[bad.id().bytes], None, 14);
+    for record in [&fixture("genesis"), &bad, &child] {
+        store_record(&mut writer, record).unwrap();
+    }
+    let payload = unhex(fixture_data()["blob_hex"].as_str().unwrap());
+    let blob = crate::id::blob_id(&payload);
+    writer.put_blob(blob, Cursor::new(&payload)).unwrap();
+    writer.revalidate(EvaluationLimits::default()).unwrap();
+    drop(writer);
+    let name = super::super::blobs::hex(&blob.bytes);
+    // 根拠欠損の注入は使い捨てfixture内のみ。既知不正の記録を消さない。
+    std::fs::remove_file(temp.data().join("blobs").join(name)).unwrap();
+    let store = RecordStore::open(&temp.data(), crate::storage::Limits::default()).unwrap();
+    let before = logical_snapshot(&store.conn);
+    let history = inventory_request().inspect_history(&store, RevisionInventoryBudget::default()).unwrap();
+    assert_eq!(history.inventory.revisions.len(), 2);
+    assert_eq!(history.relations.iter().find(|r| r.revision_id == child.id()).unwrap().parents[0].target, SavedParentTarget::DirectMatch);
+    assert_eq!(logical_snapshot(&store.conn), before);
+    assert_eq!(store.startup_state().unwrap(), StartupState::NeedsReview);
+    let diagnostic = store.evaluate(EvaluationLimits::default()).unwrap();
+    assert!(diagnostic.records.iter().any(|a| a.reason == Some(crate::storage::Reason::EvidenceUnavailable)));
+    assert_eq!(logical_snapshot(&store.conn), before);
+}
+
+#[test]
 fn inventory_scopes_raw_saved_revisions_without_selecting_or_evaluating_heads() {
     use crate::cbor::Value;
     let temp = Temp::new();
@@ -598,9 +716,11 @@ fn inventory_budgets_are_all_or_error_and_do_not_release_manual_wait() {
             request.inspect(&store, budget),
             Err(StorageError::BudgetExceeded)
         ));
+        assert!(matches!(request.inspect_history(&store, budget), Err(StorageError::BudgetExceeded)));
         assert_eq!(logical_snapshot(&store.conn), before);
         assert_eq!(store.startup_state().unwrap(), StartupState::NeedsReview);
     }
+    assert_eq!(request.inspect_history(&store, exact).unwrap().relations.len(), 1);
     let result = request.inspect(&store, exact).unwrap();
     assert_eq!(result.revisions.len(), 1);
     assert_eq!(result.revisions[0].record.bytes(), r.bytes());
@@ -928,12 +1048,19 @@ fn independent_python_checks_reference_views_including_absence_and_bounds() {
             id
         })
         .collect();
-    let records = [
+    let mut records = vec![
         fixture("revision"),
         with_references(&[], Some(vec![]), 1),
         with_references(&parents, Some(origins), 2),
         with_references(&[], Some(origin_forms()), 3),
     ];
+    let a = with_references(&[records[0].id().bytes], None, 10);
+    let b = with_references(&[records[0].id().bytes], Some(vec![]), 11);
+    let mut merge_parents = [a.id().bytes, b.id().bytes];
+    merge_parents.sort();
+    records.push(with_references(&merge_parents, Some(origin_forms()), 12));
+    records.push(a);
+    records.push(b);
     let temp = Temp::new();
     let mut writer = temp.store().begin().unwrap();
     for record in records.iter().rev() {
@@ -941,9 +1068,10 @@ fn independent_python_checks_reference_views_including_absence_and_bounds() {
     }
     writer.finish().unwrap();
     let store = RecordStore::open(&temp.data(), crate::storage::Limits::default()).unwrap();
-    let inventory = inventory_request()
-        .inspect(&store, RevisionInventoryBudget::default())
+    let history = inventory_request()
+        .inspect_history(&store, RevisionInventoryBudget::default())
         .unwrap();
+    let inventory = &history.inventory;
     let mut expected: Vec<_> = records.iter().map(LocalRecord::id).collect();
     expected.sort_by_key(|id| id.bytes);
     assert_eq!(
@@ -966,6 +1094,9 @@ fn independent_python_checks_reference_views_including_absence_and_bounds() {
         let record = &saved.record;
         let refs = &saved.references;
         serde_json::json!({"seed": fixture_data()["seed_hex"], "body": hex(&cbor::encode(record.body()).unwrap()), "envelope": hex(record.bytes()),
+            "history_records": inventory.revisions.iter().map(|v| hex(v.record.bytes())).collect::<Vec<_>>(),
+            "history_view": {"parents": history.relations.iter().find(|r| r.revision_id == record.id()).unwrap().parents.iter().map(|p| serde_json::json!({"id": p.parent_id.to_string(), "target": format!("{:?}", p.target)})).collect::<Vec<_>>(),
+                "children": history.relations.iter().find(|r| r.revision_id == record.id()).unwrap().declared_children.iter().map(ToString::to_string).collect::<Vec<_>>()},
             "reference_view": {"knowledge_id": refs.knowledge_id.to_string(), "genesis_record_id": refs.genesis_record_id.to_string(), "publisher_key_id": refs.publisher_key_id.to_string(),
                 "parents": refs.parents.iter().map(ToString::to_string).collect::<Vec<_>>(),
                 "origins": refs.origins.as_ref().map(|origins| origins.iter().map(|origin| serde_json::json!({"knowledge_id": origin.knowledge_id.to_string(),
