@@ -13,9 +13,9 @@ mod data_cli;
 #[cfg(target_os = "linux")]
 mod document_cli;
 #[cfg(target_os = "linux")]
-mod document_inspect_cli;
-#[cfg(target_os = "linux")]
 mod document_history_cli;
+#[cfg(target_os = "linux")]
+mod document_inspect_cli;
 #[cfg(target_os = "linux")]
 mod key_cli;
 #[cfg(target_os = "linux")]

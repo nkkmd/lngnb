@@ -181,32 +181,70 @@ fn inspection_fixture(root: &std::path::Path, spec: &str) {
     writer.insert(&empty).unwrap();
     writer.finish().unwrap();
     // 直接対応と依存不正・既知不正根拠を分ける公開A13専用fixture。
-    let genesis = LocalRecord::check(&unhex(a13["genesis"]["envelope_cbor_hex"].as_str().unwrap()), None).unwrap();
-    let revision = |parents: &[[u8;32]], length: i64| {
-        let Value::Map(mut body) = source.body().clone() else {unreachable!()};
-        body.iter_mut().find(|(k,_)| k == "parents").unwrap().1 = Value::Array(parents.iter().map(|p| Value::Bytes(p.to_vec())).collect());
-        let Value::Map(payload) = &mut body.iter_mut().find(|(k,_)| k == "payload").unwrap().1 else {unreachable!()};
-        payload.iter_mut().find(|(k,_)| k == "byte_length").unwrap().1 = Value::Int(length);
+    let genesis = LocalRecord::check(
+        &unhex(a13["genesis"]["envelope_cbor_hex"].as_str().unwrap()),
+        None,
+    )
+    .unwrap();
+    let revision = |parents: &[[u8; 32]], length: i64| {
+        let Value::Map(mut body) = source.body().clone() else {
+            unreachable!()
+        };
+        body.iter_mut().find(|(k, _)| k == "parents").unwrap().1 =
+            Value::Array(parents.iter().map(|p| Value::Bytes(p.to_vec())).collect());
+        let Value::Map(payload) = &mut body.iter_mut().find(|(k, _)| k == "payload").unwrap().1
+        else {
+            unreachable!()
+        };
+        payload
+            .iter_mut()
+            .find(|(k, _)| k == "byte_length")
+            .unwrap()
+            .1 = Value::Int(length);
         LocalRecord::sign(Value::Map(body), &key).unwrap()
     };
-    let bad = revision(&[],1);
-    let child = revision(&[bad.id().bytes],14);
-    let wrong = LocalRecord::sign(source.body().clone(), &ed25519_dalek::SigningKey::from_bytes(&[1;32])).unwrap();
+    let bad = revision(&[], 1);
+    let child = revision(&[bad.id().bytes], 14);
+    let wrong = LocalRecord::sign(
+        source.body().clone(),
+        &ed25519_dalek::SigningKey::from_bytes(&[1; 32]),
+    )
+    .unwrap();
     let outside = |field: &str| {
-        let Value::Map(mut body) = source.body().clone() else {unreachable!()};
-        body.iter_mut().find(|(k,_)| k == field).unwrap().1 = Value::Bytes(vec![55;32]);
+        let Value::Map(mut body) = source.body().clone() else {
+            unreachable!()
+        };
+        body.iter_mut().find(|(k, _)| k == field).unwrap().1 = Value::Bytes(vec![55; 32]);
         LocalRecord::sign(Value::Map(body), &key).unwrap()
     };
     let other_k = outside("knowledge_id");
     let other_g = outside("genesis_record_id");
-    let mut parents = vec![source.id().bytes,genesis.id().bytes,wrong.id().bytes,other_k.id().bytes,other_g.id().bytes,[240;32]];
+    let mut parents = vec![
+        source.id().bytes,
+        genesis.id().bytes,
+        wrong.id().bytes,
+        other_k.id().bytes,
+        other_g.id().bytes,
+        [240; 32],
+    ];
     parents.sort();
-    let mixed = revision(&parents,14);
-    let pending = revision(&[[241;32]],14);
-    let mut writer = RecordStore::initialize(&root.join("history-diagnostics"), Limits::default()).unwrap().begin().unwrap();
-    for record in [&genesis,&source,&bad,&child,&wrong,&other_k,&other_g,&mixed,&pending] {writer.insert(record).unwrap();}
+    let mixed = revision(&parents, 14);
+    let pending = revision(&[[241; 32]], 14);
+    let mut writer = RecordStore::initialize(&root.join("history-diagnostics"), Limits::default())
+        .unwrap()
+        .begin()
+        .unwrap();
+    for record in [
+        &genesis, &source, &bad, &child, &wrong, &other_k, &other_g, &mixed, &pending,
+    ] {
+        writer.insert(record).unwrap();
+    }
     let payload = unhex(a13["blob_hex"].as_str().unwrap());
-    writer.put_blob(lngnb::id::blob_id(&payload),std::io::Cursor::new(&payload)).unwrap();
-    writer.revalidate(lngnb::storage::EvaluationLimits::default()).unwrap();
+    writer
+        .put_blob(lngnb::id::blob_id(&payload), std::io::Cursor::new(&payload))
+        .unwrap();
+    writer
+        .revalidate(lngnb::storage::EvaluationLimits::default())
+        .unwrap();
     writer.finish().unwrap();
 }
