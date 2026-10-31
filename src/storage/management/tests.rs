@@ -663,14 +663,22 @@ fn saved_history_does_not_promote_known_invalid_or_clear_unavailable_evidence() 
             .iter()
             .any(|a| a.reason == Some(crate::storage::Reason::EvidenceUnavailable))
     );
-    let diagnosed = inventory_request().inspect_diagnosed(
-        &store, RevisionInventoryBudget::default(), EvaluationLimits::default(),
-    ).unwrap();
+    let diagnosed = inventory_request()
+        .inspect_diagnosed(
+            &store,
+            RevisionInventoryBudget::default(),
+            EvaluationLimits::default(),
+        )
+        .unwrap();
     assert!(diagnosed.assessment.storage_fault);
-    assert!(diagnosed.assessment.revisions.iter().any(|a|
-        a.validation == Validation::Pending
-            && a.reason == Some(crate::storage::Reason::EvidenceUnavailable)
-    ));
+    assert!(
+        diagnosed
+            .assessment
+            .revisions
+            .iter()
+            .any(|a| a.validation == Validation::Pending
+                && a.reason == Some(crate::storage::Reason::EvidenceUnavailable))
+    );
     assert_eq!(logical_snapshot(&store.conn), before);
     assert_eq!(store.startup_state().unwrap(), StartupState::NeedsReview);
 }
@@ -686,25 +694,46 @@ fn diagnosed_history_keeps_all_saved_versions_and_separates_dependency_results()
     let wrong = LocalRecord::sign(
         root.body().clone(),
         &ed25519_dalek::SigningKey::from_bytes(&[1; 32]),
-    ).unwrap();
+    )
+    .unwrap();
     let child = with_references(&[wrong.id().bytes], None, 14);
-    for record in [&fixture("genesis"), &root, &branch, &pending, &wrong, &child] {
+    for record in [
+        &fixture("genesis"),
+        &root,
+        &branch,
+        &pending,
+        &wrong,
+        &child,
+    ] {
         store_record(&mut writer, record).unwrap();
     }
     drop(writer);
     let store = RecordStore::open(&temp.data(), crate::storage::Limits::default()).unwrap();
     let before = logical_snapshot(&store.conn);
-    let result = inventory_request().inspect_diagnosed(
-        &store, RevisionInventoryBudget::default(), EvaluationLimits::default(),
-    ).unwrap();
+    let result = inventory_request()
+        .inspect_diagnosed(
+            &store,
+            RevisionInventoryBudget::default(),
+            EvaluationLimits::default(),
+        )
+        .unwrap();
     let inventory = &result.history.inventory;
     assert_eq!(inventory.revisions.len(), 5);
     assert_eq!(result.assessment.generation, inventory.generation);
     assert!(!result.assessment.committed);
     assert!(!result.assessment.storage_fault);
     assert_eq!(
-        result.assessment.revisions.iter().map(|r| r.record_id).collect::<Vec<_>>(),
-        inventory.revisions.iter().map(|r| r.record.id()).collect::<Vec<_>>(),
+        result
+            .assessment
+            .revisions
+            .iter()
+            .map(|r| r.record_id)
+            .collect::<Vec<_>>(),
+        inventory
+            .revisions
+            .iter()
+            .map(|r| r.record.id())
+            .collect::<Vec<_>>(),
     );
     for (record, state, reason) in [
         (&root, Validation::Valid, None),
@@ -713,7 +742,12 @@ fn diagnosed_history_keeps_all_saved_versions_and_separates_dependency_results()
         (&wrong, Validation::Invalid, Some(Reason::WrongPublisher)),
         (&child, Validation::Invalid, Some(Reason::InvalidParent)),
     ] {
-        let a = result.assessment.revisions.iter().find(|a| a.record_id == record.id()).unwrap();
+        let a = result
+            .assessment
+            .revisions
+            .iter()
+            .find(|a| a.record_id == record.id())
+            .unwrap();
         assert_eq!(a.validation, state);
         assert_eq!(a.reason, reason);
         assert_eq!(a.payload_status, Some(PayloadStatus::Missing));
@@ -733,35 +767,66 @@ fn diagnosed_history_evaluation_budgets_fail_without_partial_results_or_writes()
         store_record(&mut writer, record).unwrap();
     }
     let payload = unhex(fixture_data()["blob_hex"].as_str().unwrap());
-    writer.put_blob(crate::id::blob_id(&payload), std::io::Cursor::new(&payload)).unwrap();
+    writer
+        .put_blob(crate::id::blob_id(&payload), std::io::Cursor::new(&payload))
+        .unwrap();
     drop(writer);
     let store = RecordStore::open(&temp.data(), crate::storage::Limits::default()).unwrap();
     let before = logical_snapshot(&store.conn);
     for limits in [
-        EvaluationLimits { records: 2, ..EvaluationLimits::default() },
-        EvaluationLimits { record_bytes: 0, ..EvaluationLimits::default() },
-        EvaluationLimits { edges: 0, ..EvaluationLimits::default() },
-        EvaluationLimits { blob_bytes: 0, ..EvaluationLimits::default() },
-        EvaluationLimits { elapsed: std::time::Duration::ZERO, ..EvaluationLimits::default() },
+        EvaluationLimits {
+            records: 2,
+            ..EvaluationLimits::default()
+        },
+        EvaluationLimits {
+            record_bytes: 0,
+            ..EvaluationLimits::default()
+        },
+        EvaluationLimits {
+            edges: 0,
+            ..EvaluationLimits::default()
+        },
+        EvaluationLimits {
+            blob_bytes: 0,
+            ..EvaluationLimits::default()
+        },
+        EvaluationLimits {
+            elapsed: std::time::Duration::ZERO,
+            ..EvaluationLimits::default()
+        },
     ] {
         // 空scopeでも全保存集合の評価予算を迂回しない。
-        for request in [inventory_request(), RevisionInventoryRequest {
-            genesis: child.id(), ..inventory_request()
-        }] {
-            assert!(matches!(request.inspect_diagnosed(
-                &store, RevisionInventoryBudget::default(), limits,
-            ), Err(StorageError::BudgetExceeded)));
+        for request in [
+            inventory_request(),
+            RevisionInventoryRequest {
+                genesis: child.id(),
+                ..inventory_request()
+            },
+        ] {
+            assert!(matches!(
+                request.inspect_diagnosed(&store, RevisionInventoryBudget::default(), limits,),
+                Err(StorageError::BudgetExceeded)
+            ));
             assert!(store.conn.is_autocommit());
             assert_eq!(logical_snapshot(&store.conn), before);
             assert_eq!(store.startup_state().unwrap(), StartupState::NeedsReview);
         }
     }
-    let result = inventory_request().inspect_diagnosed(
-        &store, RevisionInventoryBudget::default(), EvaluationLimits::default(),
-    ).unwrap();
-    assert!(result.assessment.revisions.iter().all(|a|
-        a.validation == Validation::Valid && a.payload_status == Some(PayloadStatus::Verified)
-    ));
+    let result = inventory_request()
+        .inspect_diagnosed(
+            &store,
+            RevisionInventoryBudget::default(),
+            EvaluationLimits::default(),
+        )
+        .unwrap();
+    assert!(
+        result
+            .assessment
+            .revisions
+            .iter()
+            .all(|a| a.validation == Validation::Valid
+                && a.payload_status == Some(PayloadStatus::Verified))
+    );
     assert!(store.conn.is_autocommit());
     assert_eq!(logical_snapshot(&store.conn), before);
 }
@@ -774,15 +839,20 @@ fn diagnosed_history_uses_one_wal_snapshot_across_both_reads() {
     drop(writer);
     let store = RecordStore::open(&temp.data(), crate::storage::Limits::default()).unwrap();
     let generation = store.generation().unwrap();
-    let result = inventory_request().inspect_inner(
-        &store, RevisionInventoryBudget::default(), true,
-        Some(EvaluationLimits::default()), || {
-            // 使い捨てfixtureで排他に従わない書込みを注入する。所有者攻撃耐性の保証ではない。
-            let conn = rusqlite::Connection::open(temp.data().join("database.sqlite"))?;
-            conn.execute("UPDATE storage_state SET generation=generation+1", [])?;
-            Ok(())
-        },
-    ).unwrap();
+    let result = inventory_request()
+        .inspect_inner(
+            &store,
+            RevisionInventoryBudget::default(),
+            true,
+            Some(EvaluationLimits::default()),
+            || {
+                // 使い捨てfixtureで排他に従わない書込みを注入する。所有者攻撃耐性の保証ではない。
+                let conn = rusqlite::Connection::open(temp.data().join("database.sqlite"))?;
+                conn.execute("UPDATE storage_state SET generation=generation+1", [])?;
+                Ok(())
+            },
+        )
+        .unwrap();
     assert_eq!(result.inventory.generation, generation);
     assert_eq!(result.assessment.unwrap().generation, generation);
     assert_eq!(store.generation().unwrap(), generation + 1);

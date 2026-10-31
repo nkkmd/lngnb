@@ -158,7 +158,9 @@ impl RevisionInventoryRequest {
         store: &RecordStore,
         budget: RevisionInventoryBudget,
     ) -> Result<RevisionInventory> {
-        Ok(self.inspect_inner(store, budget, false, None, || Ok(()))?.inventory)
+        Ok(self
+            .inspect_inner(store, budget, false, None, || Ok(()))?
+            .inventory)
     }
     /// 一覧と親参照先/子の直接関係を同じtransaction・予算内で取得する。
     /// 全祖先評価・本文/既知不正根拠の再検査・現在候補解決は実行しない。
@@ -294,17 +296,26 @@ impl RevisionInventoryRequest {
         after_inventory()?;
         let (inventory, relations) = inventory;
         let assessment = if let Some(mut limits) = evaluation {
-            limits.elapsed = limits.elapsed.min(budget.elapsed.saturating_sub(start.elapsed()));
+            limits.elapsed = limits
+                .elapsed
+                .min(budget.elapsed.saturating_sub(start.elapsed()));
             let (snapshot, storage_fault) = store.diagnostic_evaluation(limits)?;
             if snapshot.generation != inventory.generation || snapshot.committed {
                 return Err(StorageError::Corrupt);
             }
-            let mut assessed: std::collections::BTreeMap<_, _> = snapshot.records
-                .into_iter().map(|r| (r.record_id.bytes, r)).collect();
+            let mut assessed: std::collections::BTreeMap<_, _> = snapshot
+                .records
+                .into_iter()
+                .map(|r| (r.record_id.bytes, r))
+                .collect();
             let mut revisions = Vec::new();
             for saved in &inventory.revisions {
                 check()?;
-                revisions.push(assessed.remove(&saved.record.id().bytes).ok_or(StorageError::Corrupt)?);
+                revisions.push(
+                    assessed
+                        .remove(&saved.record.id().bytes)
+                        .ok_or(StorageError::Corrupt)?,
+                );
             }
             Some(SavedHistoryAssessment {
                 generation: snapshot.generation,
@@ -319,7 +330,11 @@ impl RevisionInventoryRequest {
         check()?;
         tx.commit()?;
         check()?;
-        Ok(HistoryRead { inventory, relations, assessment })
+        Ok(HistoryRead {
+            inventory,
+            relations,
+            assessment,
+        })
     }
 }
 
