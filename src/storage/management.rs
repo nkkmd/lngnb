@@ -55,6 +55,138 @@ impl RevisionRequest {
     }
 }
 
+/// ローカル保存範囲の明示指定。pin・公開範囲・現在候補を選択しない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RevisionInventoryRequest {
+    knowledge: Id,
+    genesis: Id,
+}
+/// 一回の全体読取り予算。規範上限や保存総量の制限ではない。
+#[derive(Debug, Clone, Copy)]
+pub struct RevisionInventoryBudget {
+    /// 対象外Genesis/Knowledgeも含む走査Record数と元bytesの合計。
+    pub records: u64,
+    pub record_bytes: u64,
+    /// 選択したRevisionの親と由来の宣言数。両者を履歴辺へ混ぜない。
+    pub references: u64,
+    pub sql_inspection: super::SqlInspectionBudget,
+    pub elapsed: std::time::Duration,
+}
+impl Default for RevisionInventoryBudget {
+    fn default() -> Self {
+        Self {
+            records: 10_000,
+            record_bytes: 64 * 1024 * 1024,
+            references: 100_000,
+            sql_inspection: super::SqlInspectionBudget::default(),
+            elapsed: std::time::Duration::from_secs(60),
+        }
+    }
+}
+/// この排他・読取りsnapshot内の保存版。世界の完全履歴やvalidな候補集合ではない。
+#[derive(Debug)]
+pub struct RevisionInventory {
+    pub knowledge_id: Id,
+    pub genesis_record_id: Id,
+    pub generation: i64,
+    /// 生Record ID昇順。局所署名の成功だけで発行鍵/祖先の有効性を認定しない。
+    pub revisions: Vec<SavedRevision>,
+}
+impl RevisionInventoryRequest {
+    pub fn check(knowledge: Id, genesis: Id) -> crate::Result<Self> {
+        use crate::id::Kind;
+        if knowledge.kind != Kind::Knowledge || genesis.kind != Kind::Record {
+            return Err(crate::Error::InvalidId);
+        }
+        Ok(Self { knowledge, genesis })
+    }
+    /// 同じ排他と一つのread transactionで一次Recordを再検査し、宣言の二IDで選別。
+    /// 予算不足/破損/SQL失敗では部分集合を返さない。参照先取得・依存評価・本文検査・
+    /// writer/finish・起動cursor更新・手動待ち解除なし。既存openの検査も迂回しない。
+    pub fn inspect(
+        self,
+        store: &RecordStore,
+        budget: RevisionInventoryBudget,
+    ) -> Result<RevisionInventory> {
+        use super::{StorageError, sql_inspection};
+        let start = std::time::Instant::now();
+        let check = || {
+            if start.elapsed() >= budget.elapsed {
+                Err(StorageError::BudgetExceeded)
+            } else {
+                Ok(())
+            }
+        };
+        check()?;
+        let tx = store.conn.unchecked_transaction()?;
+        let inventory = sql_inspection::run(
+            &tx,
+            budget.sql_inspection.within(start, budget.elapsed),
+            || {
+                let generation = store.generation()?;
+                let mut revisions = Vec::new();
+                let mut remaining_records = budget.records;
+                let mut remaining_bytes = budget.record_bytes;
+                let mut remaining_references = budget.references;
+                let mut statement = tx.prepare("SELECT id,length(bytes) FROM records ORDER BY id")?;
+                let mut rows = statement.query([])?;
+                while let Some(row) = rows.next()? {
+                    check()?;
+                    remaining_records = remaining_records
+                        .checked_sub(1)
+                        .ok_or(StorageError::BudgetExceeded)?;
+                    let raw: Vec<u8> = row.get(0)?;
+                    let id = Id {
+                        kind: crate::id::Kind::Record,
+                        bytes: raw.try_into().map_err(|_| StorageError::Corrupt)?,
+                    };
+                    let length: i64 = row.get(1)?;
+                    if length <= 0 || length > crate::cbor::MAX_RECORD as i64 {
+                        return Err(StorageError::Corrupt);
+                    }
+                    // 不足を検出してから、元bytesを確保する既存読取りへ進む。
+                    remaining_bytes = remaining_bytes
+                        .checked_sub(length as u64)
+                        .ok_or(StorageError::BudgetExceeded)?;
+                    let record = store.record(id)?.ok_or(StorageError::Corrupt)?;
+                    if record.kind() != crate::record::RecordKind::Revision {
+                        continue;
+                    }
+                    let identity = record.identity();
+                    if identity.knowledge != self.knowledge.bytes
+                        || record.genesis().map_err(|_| StorageError::Corrupt)?
+                            != self.genesis.bytes
+                    {
+                        continue;
+                    }
+                    // 一Recordの抽出はA2の256親/128由来で有界。累積は追加前に検査。
+                    let references = record
+                        .revision_references()
+                        .map_err(|_| StorageError::Corrupt)?;
+                    let count = references.parents.len()
+                        + references.origins.as_ref().map_or(0, Vec::len);
+                    remaining_references = remaining_references
+                        .checked_sub(count as u64)
+                        .ok_or(StorageError::BudgetExceeded)?;
+                    revisions.push(SavedRevision { record, references });
+                }
+                check()?;
+                Ok(RevisionInventory {
+                    knowledge_id: self.knowledge,
+                    genesis_record_id: self.genesis,
+                    generation,
+                    revisions,
+                })
+            },
+        )?;
+        // SQL進捗handlerはread群だけ。commit/rollbackへ残さない。
+        check()?;
+        tx.commit()?;
+        check()?;
+        Ok(inventory)
+    }
+}
+
 /// 内部IPCの要求は完成したRecordの生bytes一つだけ。秘密鍵・パスフレーズは受けない。
 pub struct RecordRequest(LocalRecord);
 impl RecordRequest {
