@@ -22,6 +22,8 @@ mod key_cli;
 mod record_cli;
 #[cfg(target_os = "linux")]
 mod recovery_cli;
+#[cfg(target_os = "linux")]
+mod resume_cli;
 
 const HELP: &str = "lngnb — 分散図書館・知識基盤（開発初期段階）
 
@@ -32,6 +34,7 @@ const HELP: &str = "lngnb — 分散図書館・知識基盤（開発初期段�
   lngnb data init --data-dir PATH
   lngnb data status --data-dir PATH
   lngnb data recovery-confirm --data-dir PATH --expect-generation N --restored TEXT --unconfirmed TEXT
+  lngnb data resume-local --data-dir PATH --source-generation N --review-generation N --checked-evidence N --confirm-restrictions-reapplied --confirmation TEXT
   lngnb admin probe --data-dir PATH
   lngnb admin status --data-dir PATH
   lngnb admin evaluate --data-dir PATH
@@ -69,6 +72,7 @@ restore-residue は期待鍵IDと照合し、同じ領域の空いている通�
 config show は設定候補の表示だけを行います。
 データ領域の初期化・設定の保存・既存設定の読込み・接続は行いません。
 data recovery-confirm は期待世代・復旧内容・未確認事項を指定して根拠を再検査・記録します。手動待ち解除・明示再開は行いません。
+data resume-local は最新の実確認履歴と現在の保存状態を再照合し、ローカル保存だけを明示再開して正常停止します。公開・IPCは再開しません。
 document history は明示Knowledge/Genesisの全保存版・親子宣言・同世代の管理用評価を表示します（現在候補・公開資格ではありません）。
 document inspect は完全固定の三IDで保存版の親・由来の宣言を確認します（鍵・端末入力不要）。
 参照先の取得・依存評価・本文出力・pin/公開判定・復旧解除を行わず、稼働中IPCへ切り替えません。
@@ -128,7 +132,7 @@ admin config-save は停止中の正常領域へ4項目すべてを明示保存�
 admin config-change は稼働中の専用socketへ4項目すべてを明示して保存・次操作へ反映します。起動分割件数は次回起動用です。
 送信前の失敗は終了1、送信開始後の確定不明は3、保存/適用確認後の出力失敗は1です。自動再送・直接DB保存・旧endpoint接続はしません。
 全管理状態・製品リレー起動は未実装です。
-保存版・分岐は document history、根拠復旧の確認記録は data recovery-confirm で確認します。pin・公開・製品リレー起動・明示再開CLIは未実装です。
+保存版・分岐は document history、根拠復旧の確認記録は data recovery-confirm で確認します。pin・公開・製品リレー起動は未実装です。ローカル保存の明示再開は data resume-local を使います。
 ";
 
 // 工程②は候補表示だけ。永続設定やリレー起動は対応工程で実装する。
@@ -170,6 +174,8 @@ enum Command {
     #[cfg(target_os = "linux")]
     RecoveryConfirm(recovery_cli::Command),
     #[cfg(target_os = "linux")]
+    ResumeLocal(resume_cli::Command),
+    #[cfg(target_os = "linux")]
     Data(data_cli::Command),
     #[cfg(target_os = "linux")]
     Record(record_cli::Command),
@@ -191,6 +197,8 @@ enum AppError {
     History(document_history_cli::Error),
     #[cfg(target_os = "linux")]
     RecoveryConfirm(recovery_cli::Error),
+    #[cfg(target_os = "linux")]
+    ResumeLocal(resume_cli::Error),
     #[cfg(target_os = "linux")]
     Data(data_cli::Error),
     #[cfg(target_os = "linux")]
@@ -214,6 +222,8 @@ impl AppError {
             Self::History(e) => e.exit_code(),
             #[cfg(target_os = "linux")]
             Self::RecoveryConfirm(e) => e.exit_code(),
+            #[cfg(target_os = "linux")]
+            Self::ResumeLocal(e) => e.exit_code(),
             #[cfg(target_os = "linux")]
             Self::Data(e) => e.exit_code(),
             #[cfg(target_os = "linux")]
@@ -240,6 +250,8 @@ impl fmt::Display for AppError {
             #[cfg(target_os = "linux")]
             Self::RecoveryConfirm(e) => e.fmt(f),
             #[cfg(target_os = "linux")]
+            Self::ResumeLocal(e) => e.fmt(f),
+            #[cfg(target_os = "linux")]
             Self::Data(e) => e.fmt(f),
             #[cfg(target_os = "linux")]
             Self::Record(e) => e.fmt(f),
@@ -264,6 +276,8 @@ impl std::error::Error for AppError {
             Self::History(_) => None,
             #[cfg(target_os = "linux")]
             Self::RecoveryConfirm(_) => None,
+            #[cfg(target_os = "linux")]
+            Self::ResumeLocal(_) => None,
             #[cfg(target_os = "linux")]
             Self::Data(_) => None,
             #[cfg(target_os = "linux")]
@@ -296,6 +310,10 @@ fn parse(args: &[OsString]) -> Result<Command, AppError> {
         #[cfg(target_os = "linux")]
         [group, action, rest @ ..] if group == "data" && action == "recovery-confirm" => {
             recovery_cli::parse(rest).map(Command::RecoveryConfirm)
+        }
+        #[cfg(target_os = "linux")]
+        [group, action, rest @ ..] if group == "data" && action == "resume-local" => {
+            resume_cli::parse(rest).map(Command::ResumeLocal)
         }
         #[cfg(target_os = "linux")]
         [group, rest @ ..] if group == "data" => data_cli::parse(rest).map(Command::Data),
@@ -345,6 +363,10 @@ fn run(args: &[OsString], output: &mut impl Write) -> Result<(), AppError> {
         #[cfg(target_os = "linux")]
         Command::RecoveryConfirm(command) => {
             return recovery_cli::run(command, output).map_err(AppError::RecoveryConfirm);
+        }
+        #[cfg(target_os = "linux")]
+        Command::ResumeLocal(command) => {
+            return resume_cli::run(command, output).map_err(AppError::ResumeLocal);
         }
         #[cfg(target_os = "linux")]
         Command::Data(command) => return data_cli::run(command, output).map_err(AppError::Data),
