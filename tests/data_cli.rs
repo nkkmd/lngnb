@@ -636,97 +636,327 @@ fn recovery_confirmation_missing_corrupt_or_sql_failure_preserves_primary_and_wa
     }
 }
 
-const RESUME_REASON:&str="未確定制限を確認/再適用済み。未解決障害なしと判断。PRIVATE CONFIRMATION";
-fn resume_command(path:&Path,source:i64,review:i64,count:u64)->Command {
-    let mut c=Command::new(env!("CARGO_BIN_EXE_lngnb"));
-    c.args(["data","resume-local","--data-dir"]).arg(path).args([
-        "--source-generation",&source.to_string(),"--review-generation",&review.to_string(),"--checked-evidence",&count.to_string(),
-        "--confirm-restrictions-reapplied","--confirmation",RESUME_REASON,
-    ]);c
+const RESUME_REASON: &str =
+    "未確定制限を確認/再適用済み。未解決障害なしと判断。PRIVATE CONFIRMATION";
+fn resume_command(path: &Path, source: i64, review: i64, count: u64) -> Command {
+    let mut c = Command::new(env!("CARGO_BIN_EXE_lngnb"));
+    c.args(["data", "resume-local", "--data-dir"])
+        .arg(path)
+        .args([
+            "--source-generation",
+            &source.to_string(),
+            "--review-generation",
+            &review.to_string(),
+            "--checked-evidence",
+            &count.to_string(),
+            "--confirm-restrictions-reapplied",
+            "--confirmation",
+            RESUME_REASON,
+        ]);
+    c
 }
-fn reviewed_fixture(t:&Temp)->(i64,i64,Vec<u8>) {
-    let body=recovery_fixture(t);let source=generation(t);
-    success(recovery_command(&t.data(),source).output().unwrap());
-    (source,generation(t),body)
+fn reviewed_fixture(t: &Temp) -> (i64, i64, Vec<u8>) {
+    let body = recovery_fixture(t);
+    let source = generation(t);
+    success(recovery_command(&t.data(), source).output().unwrap());
+    (source, generation(t), body)
 }
-fn resume_primary_unchanged(before:&[(String,Vec<String>)],after:&[(String,Vec<String>)]) {
-    for (name,rows) in before {
-        let current=&after.iter().find(|(n,_)|n==name).unwrap().1;
-        if !["history","storage_state","evaluation_state","evaluations","parent_edges"].contains(&name.as_str()) {assert_eq!(current,rows,"{name}");}
-        if name=="history" {assert_eq!(&current[..rows.len()],rows.as_slice());}
+fn resume_primary_unchanged(before: &[(String, Vec<String>)], after: &[(String, Vec<String>)]) {
+    for (name, rows) in before {
+        let current = &after.iter().find(|(n, _)| n == name).unwrap().1;
+        if ![
+            "history",
+            "storage_state",
+            "evaluation_state",
+            "evaluations",
+            "parent_edges",
+        ]
+        .contains(&name.as_str())
+        {
+            assert_eq!(current, rows, "{name}");
+        }
+        if name == "history" {
+            assert_eq!(&current[..rows.len()], rows.as_slice());
+        }
     }
 }
 #[test]
 fn explicit_local_resume_rechecks_actual_history_and_finishes_even_when_output_fails() {
     use std::io::Write;
-    for full in [false,true] {
-        let t=Temp::new();let(source,review,body)=reviewed_fixture(&t);let before=snapshot(&t.data());
-        let mut command=resume_command(&t.data(),source,review,1);
-        if full {command.stdout(fs::OpenOptions::new().write(true).open("/dev/full").unwrap()).stderr(Stdio::piped());}
-        let out=command.output().unwrap();
+    for full in [false, true] {
+        let t = Temp::new();
+        let (source, review, body) = reviewed_fixture(&t);
+        let before = snapshot(&t.data());
+        let mut command = resume_command(&t.data(), source, review, 1);
+        if full {
+            command
+                .stdout(
+                    fs::OpenOptions::new()
+                        .write(true)
+                        .open("/dev/full")
+                        .unwrap(),
+                )
+                .stderr(Stdio::piped());
+        }
+        let out = command.output().unwrap();
         assert!(!String::from_utf8_lossy(&out.stderr).contains("PRIVATE CONFIRMATION"));
-        let c=Connection::open(t.data().join("database.sqlite")).unwrap();
+        let c = Connection::open(t.data().join("database.sqlite")).unwrap();
         let (g,reason,actor,rules):(i64,String,String,String)=c.query_row("SELECT generation,reason,actor,rules FROM history WHERE reason LIKE 'explicit_local_resume:%'",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
-        assert_eq!(actor,format!("uid:{}",rustix::process::geteuid().as_raw()));assert_eq!(rules,"lngnb-validation-1");
-        assert_eq!(c.query_row("SELECT state FROM storage_state",[],|r|r.get::<_,String>(0)).unwrap(),"clean");
-        assert_eq!(c.query_row("SELECT dirty FROM evaluation_state",[],|r|r.get::<_,i64>(0)).unwrap(),0);
-        assert_eq!(c.query_row("SELECT count(*) FROM evaluations WHERE validation='invalid'",[],|r|r.get::<_,i64>(0)).unwrap(),1);
-        let latest:(i64,String)=c.query_row("SELECT generation,reason FROM history ORDER BY generation DESC LIMIT 1",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
-        assert_eq!(latest,(g+1,"finish_record_session".into()));
+        assert_eq!(
+            actor,
+            format!("uid:{}", rustix::process::geteuid().as_raw())
+        );
+        assert_eq!(rules, "lngnb-validation-1");
+        assert_eq!(
+            c.query_row("SELECT state FROM storage_state", [], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "clean"
+        );
+        assert_eq!(
+            c.query_row("SELECT dirty FROM evaluation_state", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            c.query_row(
+                "SELECT count(*) FROM evaluations WHERE validation='invalid'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        let latest: (i64, String) = c
+            .query_row(
+                "SELECT generation,reason FROM history ORDER BY generation DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(latest, (g + 1, "finish_record_session".into()));
         drop(c);
-        if full {assert_eq!(out.status.code(),Some(1));assert!(String::from_utf8(out.stderr).unwrap().contains("正常停止は確認"));} else {
-            let text=success(out);assert!(!text.contains("PRIVATE CONFIRMATION"));assert!(text.contains(&format!("resumed_generation: {g}\n")));assert!(text.contains("normal_stop_confirmed: true"));
+        if full {
+            assert_eq!(out.status.code(), Some(1));
+            assert!(
+                String::from_utf8(out.stderr)
+                    .unwrap()
+                    .contains("正常停止は確認")
+            );
+        } else {
+            let text = success(out);
+            assert!(!text.contains("PRIVATE CONFIRMATION"));
+            assert!(text.contains(&format!("resumed_generation: {g}\n")));
+            assert!(text.contains("normal_stop_confirmed: true"));
         }
         let mut checker=Command::new(std::env::var_os("LNGNB_REFERENCE_PYTHON").expect("independent checker required"))
             .args(["-c","import json,sys,cbor2; x=json.load(sys.stdin); raw=bytes.fromhex(x['reason'].removeprefix('explicit_local_resume:')); d=cbor2.loads(raw); assert cbor2.dumps(d,canonical=True)==raw; assert d=={'review_generation':x['review'],'confirmation':x['confirmation'],'scope':'local_storage_writes_only'}"])
             .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
         checker.stdin.take().unwrap().write_all(serde_json::to_string(&serde_json::json!({"reason":reason,"review":review,"confirmation":RESUME_REASON})).unwrap().as_bytes()).unwrap();
         assert!(checker.wait_with_output().unwrap().status.success());
-        resume_primary_unchanged(&before,&snapshot(&t.data()));
-        assert_eq!(fs::read(t.data().join("blobs").join(data_encoding::HEXLOWER.encode(&id::blob_id(&body).bytes))).unwrap(),body);
-        assert!(success(cli("status",&t.data())).contains("startup_state: clean\n"));
-        let before=snapshot(&t.data());reject(resume_command(&t.data(),source,review,1).output().unwrap(),3);assert_eq!(snapshot(&t.data()),before);
-        let writer=RecordStore::open(&t.data(),Limits::default()).unwrap().begin().unwrap();drop(writer);
+        resume_primary_unchanged(&before, &snapshot(&t.data()));
+        assert_eq!(
+            fs::read(
+                t.data()
+                    .join("blobs")
+                    .join(data_encoding::HEXLOWER.encode(&id::blob_id(&body).bytes))
+            )
+            .unwrap(),
+            body
+        );
+        assert!(success(cli("status", &t.data())).contains("startup_state: clean\n"));
+        let before = snapshot(&t.data());
+        reject(
+            resume_command(&t.data(), source, review, 1)
+                .output()
+                .unwrap(),
+            3,
+        );
+        assert_eq!(snapshot(&t.data()), before);
+        let writer = RecordStore::open(&t.data(), Limits::default())
+            .unwrap()
+            .begin()
+            .unwrap();
+        drop(writer);
     }
     // 通常のmissing/依存不足は保存障害や全件validと同義ではない。
-    let t=Temp::new();let mut w=RecordStore::initialize(&t.data(),Limits::default()).unwrap().begin().unwrap();w.insert(&record("revision")).unwrap();drop(w);
-    let source=generation(&t);success(recovery_command(&t.data(),source).output().unwrap());let review=generation(&t);
-    success(resume_command(&t.data(),source,review,0).output().unwrap());
-    assert!(success(cli("status",&t.data())).contains("diagnostic_pending: 1\n"));
+    let t = Temp::new();
+    let mut w = RecordStore::initialize(&t.data(), Limits::default())
+        .unwrap()
+        .begin()
+        .unwrap();
+    w.insert(&record("revision")).unwrap();
+    drop(w);
+    let source = generation(&t);
+    success(recovery_command(&t.data(), source).output().unwrap());
+    let review = generation(&t);
+    success(
+        resume_command(&t.data(), source, review, 0)
+            .output()
+            .unwrap(),
+    );
+    assert!(success(cli("status", &t.data())).contains("diagnostic_pending: 1\n"));
 }
 #[test]
 fn resume_local_requires_explicit_intent_and_does_not_trust_forged_or_stale_receipts() {
-    let absent=Temp::new();
-    let out=Command::new(env!("CARGO_BIN_EXE_lngnb")).args(["data","resume-local","--data-dir"]).arg(absent.data())
-        .args(["--source-generation","0","--review-generation","2","--checked-evidence","0","--confirmation",RESUME_REASON]).output().unwrap();reject(out,2);assert!(!absent.data().exists());
-    reject(resume_command(&absent.data(),0,2,0).output().unwrap(),3);assert!(!absent.data().exists());
-    success(cli("init",&absent.data()));let before=snapshot(&absent.data());reject(resume_command(&absent.data(),0,2,0).output().unwrap(),3);assert_eq!(snapshot(&absent.data()),before);
-    let t=Temp::new();let(source,review,_)=reviewed_fixture(&t);let before=snapshot(&t.data());
-    reject(resume_command(&t.data(),source,review,2).output().unwrap(),3);assert_eq!(snapshot(&t.data()),before);
-    let store=RecordStore::open(&t.data(),Limits::default()).unwrap();reject(resume_command(&t.data(),source,review,1).output().unwrap(),3);drop(store);assert_eq!(snapshot(&t.data()),before);
-    let link=t.0.join("linked");symlink(t.data(),&link).unwrap();reject(resume_command(&link,source,review,1).output().unwrap(),3);assert_eq!(snapshot(&t.data()),before);
-    success(recovery_command(&t.data(),review).output().unwrap());let before=snapshot(&t.data());reject(resume_command(&t.data(),source,review,1).output().unwrap(),3);assert_eq!(snapshot(&t.data()),before);
-    Connection::open(t.data().join("database.sqlite")).unwrap().pragma_update(None,"user_version",11).unwrap();let before=snapshot(&t.data());reject(resume_command(&t.data(),review,review+2,1).output().unwrap(),3);assert_eq!(snapshot(&t.data()),before);
+    let absent = Temp::new();
+    let out = Command::new(env!("CARGO_BIN_EXE_lngnb"))
+        .args(["data", "resume-local", "--data-dir"])
+        .arg(absent.data())
+        .args([
+            "--source-generation",
+            "0",
+            "--review-generation",
+            "2",
+            "--checked-evidence",
+            "0",
+            "--confirmation",
+            RESUME_REASON,
+        ])
+        .output()
+        .unwrap();
+    reject(out, 2);
+    assert!(!absent.data().exists());
+    reject(resume_command(&absent.data(), 0, 2, 0).output().unwrap(), 3);
+    assert!(!absent.data().exists());
+    success(cli("init", &absent.data()));
+    let before = snapshot(&absent.data());
+    reject(resume_command(&absent.data(), 0, 2, 0).output().unwrap(), 3);
+    assert_eq!(snapshot(&absent.data()), before);
+    let t = Temp::new();
+    let (source, review, _) = reviewed_fixture(&t);
+    let before = snapshot(&t.data());
+    reject(
+        resume_command(&t.data(), source, review, 2)
+            .output()
+            .unwrap(),
+        3,
+    );
+    assert_eq!(snapshot(&t.data()), before);
+    let store = RecordStore::open(&t.data(), Limits::default()).unwrap();
+    reject(
+        resume_command(&t.data(), source, review, 1)
+            .output()
+            .unwrap(),
+        3,
+    );
+    drop(store);
+    assert_eq!(snapshot(&t.data()), before);
+    let link = t.0.join("linked");
+    symlink(t.data(), &link).unwrap();
+    reject(
+        resume_command(&link, source, review, 1).output().unwrap(),
+        3,
+    );
+    assert_eq!(snapshot(&t.data()), before);
+    success(recovery_command(&t.data(), review).output().unwrap());
+    let before = snapshot(&t.data());
+    reject(
+        resume_command(&t.data(), source, review, 1)
+            .output()
+            .unwrap(),
+        3,
+    );
+    assert_eq!(snapshot(&t.data()), before);
+    Connection::open(t.data().join("database.sqlite"))
+        .unwrap()
+        .pragma_update(None, "user_version", 11)
+        .unwrap();
+    let before = snapshot(&t.data());
+    reject(
+        resume_command(&t.data(), review, review + 2, 1)
+            .output()
+            .unwrap(),
+        3,
+    );
+    assert_eq!(snapshot(&t.data()), before);
 }
 #[test]
 fn resume_local_storage_or_audit_or_finish_failure_never_reports_clean_success() {
-    for fault in ["missing","corrupt","orphan","staging","history","resume-sql","finish-sql"] {
-        let t=Temp::new();let(source,review,body)=reviewed_fixture(&t);
-        let blob=t.data().join("blobs").join(data_encoding::HEXLOWER.encode(&id::blob_id(&body).bytes));
+    for fault in [
+        "missing",
+        "corrupt",
+        "orphan",
+        "staging",
+        "history",
+        "resume-sql",
+        "finish-sql",
+    ] {
+        let t = Temp::new();
+        let (source, review, body) = reviewed_fixture(&t);
+        let blob = t
+            .data()
+            .join("blobs")
+            .join(data_encoding::HEXLOWER.encode(&id::blob_id(&body).bytes));
         match fault {
-            "missing"=>fs::remove_file(&blob).unwrap(),
-            "corrupt"=>fs::write(&blob,b"corrupt public fixture").unwrap(),
-            "orphan"|"staging"=>{let name=data_encoding::HEXLOWER.encode(&id::blob_id(b"extra").bytes);let path=if fault=="orphan" {t.data().join("blobs").join(name)}else{t.data().join("staging").join(format!("{name}.part"))};fs::write(&path,b"extra").unwrap();fs::set_permissions(path,fs::Permissions::from_mode(0o600)).unwrap();},
-            "history"=>{Connection::open(t.data().join("database.sqlite")).unwrap().execute("UPDATE history SET reason='evidence_recovery_review:00' WHERE generation=?1",[review]).unwrap();},
-            "resume-sql"=>{Connection::open(t.data().join("database.sqlite")).unwrap().execute_batch("CREATE TRIGGER deny_resume BEFORE INSERT ON history WHEN NEW.reason LIKE 'explicit_local_resume:%' BEGIN SELECT RAISE(ABORT,'test'); END;").unwrap();},
-            _=>{Connection::open(t.data().join("database.sqlite")).unwrap().execute_batch("CREATE TRIGGER deny_finish BEFORE UPDATE OF state ON storage_state WHEN NEW.state='clean' BEGIN SELECT RAISE(ABORT,'test'); END;").unwrap();},
+            "missing" => fs::remove_file(&blob).unwrap(),
+            "corrupt" => fs::write(&blob, b"corrupt public fixture").unwrap(),
+            "orphan" | "staging" => {
+                let name = data_encoding::HEXLOWER.encode(&id::blob_id(b"extra").bytes);
+                let path = if fault == "orphan" {
+                    t.data().join("blobs").join(name)
+                } else {
+                    t.data().join("staging").join(format!("{name}.part"))
+                };
+                fs::write(&path, b"extra").unwrap();
+                fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            "history" => {
+                Connection::open(t.data().join("database.sqlite")).unwrap().execute("UPDATE history SET reason='evidence_recovery_review:00' WHERE generation=?1",[review]).unwrap();
+            }
+            "resume-sql" => {
+                Connection::open(t.data().join("database.sqlite")).unwrap().execute_batch("CREATE TRIGGER deny_resume BEFORE INSERT ON history WHEN NEW.reason LIKE 'explicit_local_resume:%' BEGIN SELECT RAISE(ABORT,'test'); END;").unwrap();
+            }
+            _ => {
+                Connection::open(t.data().join("database.sqlite")).unwrap().execute_batch("CREATE TRIGGER deny_finish BEFORE UPDATE OF state ON storage_state WHEN NEW.state='clean' BEGIN SELECT RAISE(ABORT,'test'); END;").unwrap();
+            }
         }
-        let before=snapshot(&t.data());let out=resume_command(&t.data(),source,review,1).output().unwrap();assert!(!String::from_utf8_lossy(&out.stderr).contains("PRIVATE CONFIRMATION"));reject(out,3);
-        resume_primary_unchanged(&before,&snapshot(&t.data()));
-        let c=Connection::open(t.data().join("database.sqlite")).unwrap();assert_eq!(c.query_row("SELECT state FROM storage_state",[],|r|r.get::<_,String>(0)).unwrap(),"running");
-        let count=c.query_row("SELECT count(*) FROM history WHERE reason LIKE 'explicit_local_resume:%'",[],|r|r.get::<_,i64>(0)).unwrap();assert_eq!(count,if fault=="finish-sql"{1}else{0});drop(c);
-        if fault=="finish-sql" {let before=snapshot(&t.data());reject(resume_command(&t.data(),source,review,1).output().unwrap(),3);assert_eq!(snapshot(&t.data()),before);}
-        assert!(RecordStore::open(&t.data(),Limits::default()).unwrap().begin().is_err());
-        if fault=="missing"{assert!(!blob.exists());}else if fault=="corrupt"{assert_eq!(fs::read(&blob).unwrap(),b"corrupt public fixture");}else{assert_eq!(fs::read(&blob).unwrap(),body);}
+        let before = snapshot(&t.data());
+        let out = resume_command(&t.data(), source, review, 1)
+            .output()
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&out.stderr).contains("PRIVATE CONFIRMATION"));
+        reject(out, 3);
+        resume_primary_unchanged(&before, &snapshot(&t.data()));
+        let c = Connection::open(t.data().join("database.sqlite")).unwrap();
+        assert_eq!(
+            c.query_row("SELECT state FROM storage_state", [], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "running"
+        );
+        let count = c
+            .query_row(
+                "SELECT count(*) FROM history WHERE reason LIKE 'explicit_local_resume:%'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(count, if fault == "finish-sql" { 1 } else { 0 });
+        drop(c);
+        if fault == "finish-sql" {
+            let before = snapshot(&t.data());
+            reject(
+                resume_command(&t.data(), source, review, 1)
+                    .output()
+                    .unwrap(),
+                3,
+            );
+            assert_eq!(snapshot(&t.data()), before);
+        }
+        assert!(
+            RecordStore::open(&t.data(), Limits::default())
+                .unwrap()
+                .begin()
+                .is_err()
+        );
+        if fault == "missing" {
+            assert!(!blob.exists());
+        } else if fault == "corrupt" {
+            assert_eq!(fs::read(&blob).unwrap(), b"corrupt public fixture");
+        } else {
+            assert_eq!(fs::read(&blob).unwrap(), body);
+        }
     }
 }
