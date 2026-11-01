@@ -26,9 +26,13 @@ const MAX_TIMEOUT: Duration = Duration::from_secs(30);
 pub mod client;
 mod configuration;
 mod evaluation;
+mod inventory;
 mod status;
 pub use configuration::ConfigError;
 pub use evaluation::Snapshot as EvaluationStatus;
+pub use inventory::{
+    AdminSocketPathEntry, AdminSocketPathInventory, SocketPathKind, SocketPathMetadata,
+};
 pub use status::Snapshot as RuntimeStatus;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
