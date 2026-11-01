@@ -3308,7 +3308,9 @@ os.close(fd)
 
 fn socket_inventory_command(data: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_lngnb"));
-    command.args(["admin", "socket-inventory", "--data-dir"]).arg(data);
+    command
+        .args(["admin", "socket-inventory", "--data-dir"])
+        .arg(data);
     command
 }
 #[test]
@@ -3318,7 +3320,12 @@ fn socket_inventory_cli_observes_without_contact_or_repair_and_preserves_wait() 
     drop(RecordStore::initialize(&temp.data(), Limits::default()).unwrap());
     for review in [false, true] {
         if review {
-            drop(RecordStore::open(&temp.data(), Limits::default()).unwrap().begin().unwrap());
+            drop(
+                RecordStore::open(&temp.data(), Limits::default())
+                    .unwrap()
+                    .begin()
+                    .unwrap(),
+            );
         }
         let before = fs::read(temp.data().join("database.sqlite")).unwrap();
         let empty = socket_inventory_command(&temp.data()).output().unwrap();
@@ -3329,7 +3336,11 @@ fn socket_inventory_cli_observes_without_contact_or_repair_and_preserves_wait() 
         let anchored = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()));
         let listener = UnixListener::bind(anchored.join("admin.sock")).unwrap();
         listener.set_nonblocking(true).unwrap();
-        fs::set_permissions(temp.data().join("admin.sock"), fs::Permissions::from_mode(0o666)).unwrap();
+        fs::set_permissions(
+            temp.data().join("admin.sock"),
+            fs::Permissions::from_mode(0o666),
+        )
+        .unwrap();
         fs::write(temp.input(), b"PRIVATE INPUT").unwrap();
         fs::hard_link(temp.input(), temp.data().join("admin-status.sock")).unwrap();
         symlink(temp.input(), temp.data().join("admin-evaluate.sock")).unwrap();
@@ -3342,7 +3353,10 @@ fn socket_inventory_cli_observes_without_contact_or_repair_and_preserves_wait() 
             ("admin-status.sock", "regular_file"),
             ("admin-evaluate.sock", "symlink"),
             ("admin-config.sock", "directory"),
-        ].into_iter().enumerate() {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             assert!(live.contains(&format!("entry[{n}].name: {name}\n")));
             assert!(live.contains(&format!("entry[{n}].kind: {kind}\n")));
             let raw = fs::symlink_metadata(temp.data().join(name)).unwrap();
@@ -3354,24 +3368,34 @@ fn socket_inventory_cli_observes_without_contact_or_repair_and_preserves_wait() 
         assert!(live.contains("entry[1].links: 2\n"));
         assert!(live.contains("不使用・元socket・削除可否の判定ではありません"));
         assert!(!live.contains("PRIVATE INPUT"));
-        assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
         drop(listener);
         let dropped = socket_inventory_command(&temp.data()).output().unwrap();
         assert!(dropped.status.success());
         assert_eq!(String::from_utf8(dropped.stdout).unwrap(), live);
         let failed_output = socket_inventory_command(&temp.data())
             .stdout(fs::File::options().write(true).open("/dev/full").unwrap())
-            .output().unwrap();
+            .output()
+            .unwrap();
         assert_eq!(failed_output.status.code(), Some(1));
         assert!(String::from_utf8_lossy(&failed_output.stderr).contains("観測後、結果出力に失敗"));
-        assert_eq!(fs::read(temp.data().join("database.sqlite")).unwrap(), before);
+        assert_eq!(
+            fs::read(temp.data().join("database.sqlite")).unwrap(),
+            before
+        );
         assert_eq!(fs::read(temp.input()).unwrap(), b"PRIVATE INPUT");
         let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
-        assert_eq!(store.startup_state().unwrap(), if review {
-            lngnb::storage::StartupState::NeedsReview
-        } else {
-            lngnb::storage::StartupState::Clean
-        });
+        assert_eq!(
+            store.startup_state().unwrap(),
+            if review {
+                lngnb::storage::StartupState::NeedsReview
+            } else {
+                lngnb::storage::StartupState::Clean
+            }
+        );
         drop(store);
         // fixtureだけを次の試験条件へ戻す。製品操作は整理しない。
         for name in ["admin.sock", "admin-status.sock", "admin-evaluate.sock"] {
@@ -3383,14 +3407,27 @@ fn socket_inventory_cli_observes_without_contact_or_repair_and_preserves_wait() 
 #[test]
 fn socket_inventory_cli_rejects_invalid_missing_unsafe_old_and_locked_without_fallback() {
     let temp = Temp::new();
-    for extra in [vec!["--data-dir", "PRIVATE INPUT"], vec!["--delete", "PRIVATE INPUT"]] {
-        let output = socket_inventory_command(&temp.data()).args(extra).output().unwrap();
+    for extra in [
+        vec!["--data-dir", "PRIVATE INPUT"],
+        vec!["--delete", "PRIVATE INPUT"],
+    ] {
+        let output = socket_inventory_command(&temp.data())
+            .args(extra)
+            .output()
+            .unwrap();
         assert_eq!(output.status.code(), Some(2));
         assert!(output.stdout.is_empty());
         assert!(!String::from_utf8_lossy(&output.stderr).contains("PRIVATE INPUT"));
         assert!(!temp.data().exists());
     }
-    assert_eq!(socket_inventory_command(&temp.data()).output().unwrap().status.code(), Some(1));
+    assert_eq!(
+        socket_inventory_command(&temp.data())
+            .output()
+            .unwrap()
+            .status
+            .code(),
+        Some(1)
+    );
     assert!(!temp.data().exists());
     drop(RecordStore::initialize(&temp.data(), Limits::default()).unwrap());
     let mut server = Server::start(&temp);
@@ -3400,7 +3437,10 @@ fn socket_inventory_cli_rejects_invalid_missing_unsafe_old_and_locked_without_fa
     assert!(output.stdout.is_empty());
     let after = status_cli(&temp.data());
     for field in ["generation", "session_new_records"] {
-        assert_eq!(diagnostic_field(&before, field), diagnostic_field(&after, field));
+        assert_eq!(
+            diagnostic_field(&before, field),
+            diagnostic_field(&after, field)
+        );
     }
     server.signal("-TERM");
     assert!(server.wait().success());
@@ -3415,8 +3455,16 @@ fn socket_inventory_cli_rejects_invalid_missing_unsafe_old_and_locked_without_fa
             fs::set_permissions(temp.data(), fs::Permissions::from_mode(0o755)).unwrap();
         }
         if damage == "symlink" {
-            fs::rename(temp.data().join("database.sqlite"), temp.0.join("preserved.sqlite")).unwrap();
-            symlink(temp.0.join("preserved.sqlite"), temp.data().join("database.sqlite")).unwrap();
+            fs::rename(
+                temp.data().join("database.sqlite"),
+                temp.0.join("preserved.sqlite"),
+            )
+            .unwrap();
+            symlink(
+                temp.0.join("preserved.sqlite"),
+                temp.data().join("database.sqlite"),
+            )
+            .unwrap();
         }
         if damage == "corrupt" {
             fs::write(temp.data().join("database.sqlite"), b"PRIVATE INPUT").unwrap();
@@ -3426,7 +3474,10 @@ fn socket_inventory_cli_rejects_invalid_missing_unsafe_old_and_locked_without_fa
         assert_eq!(output.status.code(), Some(1));
         assert!(output.stdout.is_empty());
         assert!(!String::from_utf8_lossy(&output.stderr).contains("PRIVATE INPUT"));
-        assert_eq!(fs::read(temp.data().join("database.sqlite")).unwrap(), before);
+        assert_eq!(
+            fs::read(temp.data().join("database.sqlite")).unwrap(),
+            before
+        );
         assert!(!temp.data().join("admin.sock").exists());
     }
 }

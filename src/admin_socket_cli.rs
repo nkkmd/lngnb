@@ -43,8 +43,11 @@ fn report(
             SocketPathKind::Symlink => "symlink",
             SocketPathKind::Other => "other",
         };
-        writeln!(text, "entry[{n}].observed: present\nentry[{n}].kind: {kind}")
-            .expect("String write");
+        writeln!(
+            text,
+            "entry[{n}].observed: present\nentry[{n}].kind: {kind}"
+        )
+        .expect("String write");
         for (field, value) in [
             ("device", m.device),
             ("inode", m.inode),
@@ -87,10 +90,12 @@ mod tests {
                 "admin-evaluate.sock",
                 "admin-config.sock",
             ]
-            .map(|name| lngnb::storage::admin_transport::AdminSocketPathEntry {
-                name,
-                observed: None,
-            }),
+            .map(
+                |name| lngnb::storage::admin_transport::AdminSocketPathEntry {
+                    name,
+                    observed: None,
+                },
+            ),
         };
         struct Sink(bool);
         impl Write for Sink {
@@ -106,7 +111,8 @@ mod tests {
             }
         }
         for flush in [false, true] {
-            let error = report(&inventory, StartupState::NeedsReview, &mut Sink(flush)).unwrap_err();
+            let error =
+                report(&inventory, StartupState::NeedsReview, &mut Sink(flush)).unwrap_err();
             assert!(matches!(error, Error::SocketInventoryOutput));
             assert_eq!(error.exit_code(), 1);
             assert!(!error.to_string().contains("PRIVATE INPUT"));

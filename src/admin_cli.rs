@@ -719,7 +719,13 @@ mod config_tests {
             let invalid: Vec<_> = invalid.into_iter().map(OsString::from).collect();
             assert_eq!(parse(&invalid).unwrap_err().exit_code(), 2);
         }
-        for option in ["--data-dir", "--request-timeout-ms", "--socket", "--delete", "--unknown"] {
+        for option in [
+            "--data-dir",
+            "--request-timeout-ms",
+            "--socket",
+            "--delete",
+            "--unknown",
+        ] {
             let mut invalid = good.clone();
             invalid.extend([option.into(), "PRIVATE INPUT".into()]);
             let error = parse(&invalid).unwrap_err();

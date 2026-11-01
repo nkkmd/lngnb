@@ -7,9 +7,9 @@ use std::process::ExitCode;
 #[cfg(target_os = "linux")]
 mod admin_cli;
 #[cfg(target_os = "linux")]
-mod admin_socket_cli;
-#[cfg(target_os = "linux")]
 mod admin_server;
+#[cfg(target_os = "linux")]
+mod admin_socket_cli;
 #[cfg(target_os = "linux")]
 mod data_cli;
 #[cfg(target_os = "linux")]
