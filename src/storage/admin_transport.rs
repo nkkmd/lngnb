@@ -30,7 +30,9 @@ mod inventory;
 mod status;
 pub use configuration::ConfigError;
 pub use evaluation::Snapshot as EvaluationStatus;
-pub use inventory::{AdminSocketPathEntry, AdminSocketPathInventory, SocketPathKind, SocketPathMetadata};
+pub use inventory::{
+    AdminSocketPathEntry, AdminSocketPathInventory, SocketPathKind, SocketPathMetadata,
+};
 pub use status::Snapshot as RuntimeStatus;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
