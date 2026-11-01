@@ -475,6 +475,60 @@ impl RecoveryReviewRequest {
     }
 }
 
+/// ローカル保存だけの別の明示再開要求。受領値だけで資格を付与しない。
+#[derive(PartialEq, Eq)]
+pub struct LocalResumeRequest {
+    review: super::EvidenceRecoveryReview,
+    confirmation: String,
+}
+impl std::fmt::Debug for LocalResumeRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalResumeRequest")
+            .field("review", &self.review)
+            .finish_non_exhaustive()
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalResumeReceipt {
+    pub review_generation: i64,
+    /// 再開履歴の確定世代。finish後/出力時の現在世代ではない。
+    pub resumed_generation: i64,
+}
+impl LocalResumeRequest {
+    /// 呼出しは未確定制限の確認/再適用と未解決障害がないという管理者の明示判断を表す。
+    /// 申告を解析して未確認事項の解消を推測しない。所有copy前に検査する。
+    pub fn check(review: super::EvidenceRecoveryReview, confirmation: &str) -> Result<Self> {
+        if review.source_generation < 0
+            || review.source_generation.checked_add(2) != Some(review.recorded_generation)
+            || review.checked_evidence > i64::MAX as u64
+            || confirmation.trim().is_empty()
+            || confirmation.len() > 4096
+            || confirmation.contains('\0')
+        {
+            return Err(super::StorageError::InvalidRecoveryReview);
+        }
+        Ok(Self {
+            review,
+            confirmation: confirmation.into(),
+        })
+    }
+    /// 同じ排他で実際の最新履歴・全保存状態・台帳・根拠を既存APIに再照合させる。
+    /// ローカルwriterの再開後、他の保存操作をせずfinish。失敗/不確定を再試行しない。
+    pub fn resume_stopped(self, path: &std::path::Path) -> Result<LocalResumeReceipt> {
+        let writer = RecordStore::open(path, super::Limits::default())?.resume_local_writes(
+            self.review,
+            &self.confirmation,
+            EvaluationLimits::default(),
+        )?;
+        let resumed_generation = writer.store.generation()?;
+        writer.finish()?;
+        Ok(LocalResumeReceipt {
+            review_generation: self.review.recorded_generation,
+            resumed_generation,
+        })
+    }
+}
+
 /// 全4項目を明示した検査済み要求。内部型でありIPCのwire形式ではない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConfigRequest(super::AdminConfig);

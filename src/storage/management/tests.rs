@@ -1442,3 +1442,40 @@ fn recovery_review_request_checks_notes_before_owned_copy_and_redacts_debug() {
     }
     assert!(RecoveryReviewRequest::check(-1, "復旧", "未確認").is_err());
 }
+
+#[test]
+fn local_resume_request_requires_consistent_receipt_and_bounded_redacted_confirmation() {
+    let review = super::super::EvidenceRecoveryReview {
+        source_generation: 0,
+        recorded_generation: 2,
+        checked_evidence: 0,
+    };
+    let exact = "界".repeat(1365) + "x";
+    assert!(LocalResumeRequest::check(review, &exact).is_ok());
+    let request = LocalResumeRequest::check(review, "PRIVATE CONFIRMATION").unwrap();
+    assert!(!format!("{request:?}").contains("PRIVATE CONFIRMATION"));
+    for note in [
+        "".to_owned(),
+        " \n".into(),
+        "x".repeat(4097),
+        "bad\0note".into(),
+    ] {
+        assert!(LocalResumeRequest::check(review, &note).is_err());
+    }
+    for invalid in [
+        super::super::EvidenceRecoveryReview {
+            source_generation: -1,
+            ..review
+        },
+        super::super::EvidenceRecoveryReview {
+            recorded_generation: 3,
+            ..review
+        },
+        super::super::EvidenceRecoveryReview {
+            checked_evidence: u64::MAX,
+            ..review
+        },
+    ] {
+        assert!(LocalResumeRequest::check(invalid, "確認済み").is_err());
+    }
+}
