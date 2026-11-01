@@ -9,6 +9,8 @@ mod admin_cli;
 #[cfg(target_os = "linux")]
 mod admin_server;
 #[cfg(target_os = "linux")]
+mod admin_socket_cli;
+#[cfg(target_os = "linux")]
 mod data_cli;
 #[cfg(target_os = "linux")]
 mod document_cli;
@@ -35,6 +37,7 @@ const HELP: &str = "lngnb — 分散図書館・知識基盤（開発初期段�
   lngnb data status --data-dir PATH
   lngnb data recovery-confirm --data-dir PATH --expect-generation N --restored TEXT --unconfirmed TEXT
   lngnb data resume-local --data-dir PATH --source-generation N --review-generation N --checked-evidence N --confirm-restrictions-reapplied --confirmation TEXT
+  lngnb admin socket-inventory --data-dir PATH
   lngnb admin probe --data-dir PATH
   lngnb admin status --data-dir PATH
   lngnb admin evaluate --data-dir PATH
@@ -90,6 +93,7 @@ data status は排他中の保存状態・管理用再検査・容量を表示�
 保持本文の欠損等を新たに検出した場合は停止印と履歴を記録し、自動修復・削除・再開をしません。
 record submit は検査済みの完成署名Record一件だけを、認証したローカル管理socketへ送ります。
 入力は2 MiB以下の通常file。保存応答不明は終了3で保全し、自動再送・直接保存へ切り替えません。
+admin socket-inventory は停止中に固定4名の属性を観測します。不使用・元socket・削除可否は判定しません。
 admin probe は保存要求なしでsocket接続先の権限・UIDだけを照合します。受理準備や保存状態は判定しません。
 admin serve は前面で管理受理側だけを起動します。SIGINT/SIGTERMで受付停止と進行処理の終結を要求します。
 受信/応答の各期限は1〜30000 ms、新規Record上限は1〜10000件で、既定は各上限です。

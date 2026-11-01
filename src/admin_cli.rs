@@ -17,6 +17,7 @@ enum Action {
     Status,
     Evaluate,
     ShowConfig,
+    SocketInventory,
     Serve(Overrides),
     SaveConfig(Config),
     ChangeConfig(Config),
@@ -24,7 +25,7 @@ enum Action {
 pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
     let usage = || {
         AppError::Usage(
-            "admin probe/status/evaluate/serve/config-save/config-show/config-change の操作・明示領域・設定値を確認してください",
+            "admin probe/status/evaluate/serve/config-save/config-show/config-change/socket-inventory の操作・明示領域・設定値を確認してください",
         )
     };
     let [action, rest @ ..] = args else {
@@ -37,6 +38,7 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
         && action != "config-save"
         && action != "config-show"
         && action != "config-change"
+        && action != "socket-inventory"
     {
         return Err(usage());
     }
@@ -150,6 +152,8 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
         Action::Evaluate
     } else if action == "status" {
         Action::Status
+    } else if action == "socket-inventory" {
+        Action::SocketInventory
     } else if action == "config-show" {
         Action::ShowConfig
     } else {
@@ -218,6 +222,8 @@ pub enum Error {
     ConfigOutput,
     ConfigRead,
     ConfigReadOutput,
+    SocketInventory,
+    SocketInventoryOutput,
     ChangeConnection,
     ChangeUnknown,
     ChangeOutput,
@@ -237,6 +243,8 @@ impl fmt::Display for Error {
             return e.fmt(f);
         }
         f.write_str(match self {
+            Self::SocketInventory => "固定管理socket名の観測を完了できません。領域と残存物を保全してください。接続・整理・修復・再開は行いません。",
+            Self::SocketInventoryOutput => "固定管理socket名の観測後、結果出力に失敗しました。不使用・削除可否は判定せず、手動確認待ちは解除していません。",
             Self::ChangeConnection => "設定変更の送信前に接続・認証を確認できません。自動再送・直接DB保存・旧endpointへの接続は行いません。領域とsocketを保全して確認してください。",
             Self::ChangeUnknown => "設定変更の送信開始後、保存・適用を確認できません（確定不明）。保存済みの可能性があります。領域とsocketを保全し、再送・直接DB保存・socket削除・手動待ち解除をせず確認してください。",
             Self::ChangeOutput => "設定の保存・次操作への適用を確認後、結果出力に失敗しました。起動分割件数は次回起動用です。再送せず確認してください。正常停止・復旧完了の判定ではありません。",
@@ -256,6 +264,9 @@ impl fmt::Display for Error {
 }
 impl std::error::Error for Error {}
 pub fn run(command: Command, output: &mut impl Write) -> Result<(), Error> {
+    if command.action == Action::SocketInventory {
+        return super::admin_socket_cli::run(&command.data, output);
+    }
     if let Action::ChangeConfig(config) = command.action {
         let request = lngnb::storage::management::ConfigRequest::check(config.saved_values())
             .map_err(|_| Error::ChangeConnection)?;
@@ -693,6 +704,35 @@ mod evaluation_tests {
 #[cfg(test)]
 mod config_tests {
     use super::*;
+
+    #[test]
+    fn socket_inventory_requires_only_one_explicit_path() {
+        let good: Vec<OsString> = ["socket-inventory", "--data-dir", "資料 space"]
+            .map(Into::into)
+            .to_vec();
+        assert_eq!(parse(&good).unwrap().action, Action::SocketInventory);
+        for invalid in [
+            vec!["socket-inventory"],
+            vec!["socket-inventory", "--data-dir"],
+            vec!["socket-inventory", "--data-dir", ""],
+        ] {
+            let invalid: Vec<_> = invalid.into_iter().map(OsString::from).collect();
+            assert_eq!(parse(&invalid).unwrap_err().exit_code(), 2);
+        }
+        for option in [
+            "--data-dir",
+            "--request-timeout-ms",
+            "--socket",
+            "--delete",
+            "--unknown",
+        ] {
+            let mut invalid = good.clone();
+            invalid.extend([option.into(), "PRIVATE INPUT".into()]);
+            let error = parse(&invalid).unwrap_err();
+            assert_eq!(error.exit_code(), 2);
+            assert!(!error.to_string().contains("PRIVATE INPUT"));
+        }
+    }
 
     #[test]
     fn config_show_requires_only_one_explicit_path_without_runtime_options() {

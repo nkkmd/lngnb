@@ -347,4 +347,14 @@ lngnbに登録・保存・配布する資料の権利や利用条件は、資料
 
 領域/評価/SQLの既定予算（10,000 Record/64 MiB、全保持Blob10,000件/64 MiB、親辺100,000、評価の本文hash64 MiB/60秒）と既存容量予約を共有します。非保存の操作予算を保存4設定へ追加せず、OS I/O・一件の署名/hash・commitの強制中断や恒久的な無破損を保証しません。自動再開/修復/採用/削除、検査省略、直接SQL保存、IPCへの切替はありません。一般配信/公開資格や製品全体の復旧完了とは別で、残る管理接続・鍵/socket残存物の整理・安全な鍵置換も引き続き未完了です。
 
-管理socket残存物の整理に向け、同じ排他・directory fdの下で`admin.sock`、`admin-status.sock`、`admin-evaluate.sock`、`admin-config.sock`の種類・dev/inode・所有者・権限・link数・長さ/変更時刻を非破壊で観測する内部基盤を追加しています。固定名を二度NOFOLLOWで観測し、一致した結果だけを返します。metadataから利用中/不使用・残存元・削除資格は判定できず、接続・要求送信・採用・削除は行いません。利用者向けの残存socket診断/明示整理CLIは未接続です。既存名の保全と、元socket/鍵残存物の明示整理・鍵領域の停止解除/安全な置換が未完了である境界は維持します。
+固定管理socket名の属性を停止中に確認できます。
+
+```sh
+./target/release/lngnb admin socket-inventory --data-dir /path/to/existing-data
+```
+
+同じ排他・directory fdの下で`admin.sock`、`admin-status.sock`、`admin-evaluate.sock`、`admin-config.sock`を二度NOFOLLOWで観測し、一致した種類・dev/inode・所有者・権限・link数・長さ/変更時刻だけを表示します。不在はその観測だけの情報で、metadataから利用中/不使用・残存元・削除資格は判定できません。通常file・symlink等も追跡/修正せず、内容は読みません。接続・要求送信・採用・削除・writer/finish・手動待ち解除は行いません。
+
+明示領域が必須で、不正/重複/余分な引数は接触前に終了2。排他競合・領域検査失敗・観測不一致・予算不足は部分結果を出さず終了1、IPCへ切り替えません。観測は固定12回のmetadata取得と処理境界の30秒予算で、既存openのRecord/Blob/SQL検査予算とは別です。OS I/O強制中断や原子的namespace snapshot、返却後の不変は保証しません。表示まで排他を保持し、write/flush失敗も終了1で観測失敗と区別します。
+
+既存openは保持本文の異常等で停止印/履歴を記録し、SQLite WAL/SHMのI/Oもあり得ます。全fileの物理的不変や、表示したstartup_stateによる全起動検査完了・正常停止・公開・復旧完了は保証しません。元socket/鍵残存物の明示整理、鍵領域の停止解除/安全な置換は未実装です。
