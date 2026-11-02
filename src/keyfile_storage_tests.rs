@@ -1331,14 +1331,23 @@ fn preserved_recheck_rejects_same_key_reencryption_wrong_identity_and_authentica
         KeyFileError::UnexpectedPublicKey,
     );
     e(
-        s.verify_preserved_recovery_file(&residue, "public wrong password", &mut b, "exact", &public),
+        s.verify_preserved_recovery_file(
+            &residue,
+            "public wrong password",
+            &mut b,
+            "exact",
+            &public,
+        ),
         KeyError::AuthenticationFailed.into(),
     );
     assert_eq!(stdfs::read(source.0.join(&residue)).unwrap(), bytes);
     assert_eq!(stdfs::read(source.0.join("publisher")).unwrap(), bytes);
     assert_eq!(stdfs::read(backup.0.join("changed")).unwrap(), other);
     assert_eq!(stdfs::read(backup.0.join("exact")).unwrap(), bytes);
-    assert_eq!(KeyFileError::PreservationMismatch.to_string(), "key_preservation_mismatch");
+    assert_eq!(
+        KeyFileError::PreservationMismatch.to_string(),
+        "key_preservation_mismatch"
+    );
 }
 
 #[test]
@@ -1358,22 +1367,52 @@ fn preserved_recheck_rejects_unsafe_names_missing_files_and_unsafe_backup_withou
     backup.put("large", &vec![0; MAX_KEYFILE_BYTES + 1]);
     let mut s = KeyDirectory::open(&source.0).unwrap();
     let mut b = KeyDirectory::open(&backup.0).unwrap();
-    for (r, n) in [("publisher", "exact"), (&residue, "../escape"), (&residue, ".lngnb-key-reserved")] {
-        e(s.verify_preserved_recovery_file(r, &p, &mut b, n, &public), KeyFileError::UnsafePath);
+    for (r, n) in [
+        ("publisher", "exact"),
+        (&residue, "../escape"),
+        (&residue, ".lngnb-key-reserved"),
+    ] {
+        e(
+            s.verify_preserved_recovery_file(r, &p, &mut b, n, &public),
+            KeyFileError::UnsafePath,
+        );
     }
-    e(s.verify_preserved_recovery_file(&residue_name(2), &p, &mut b, "exact", &public), KeyFileError::Missing);
-    e(s.verify_preserved_recovery_file(&residue, &p, &mut b, "absent", &public), KeyFileError::Missing);
+    e(
+        s.verify_preserved_recovery_file(&residue_name(2), &p, &mut b, "exact", &public),
+        KeyFileError::Missing,
+    );
+    e(
+        s.verify_preserved_recovery_file(&residue, &p, &mut b, "absent", &public),
+        KeyFileError::Missing,
+    );
     for n in ["symlink", "hard", "wide"] {
-        e(s.verify_preserved_recovery_file(&residue, &p, &mut b, n, &public), KeyFileError::UnsafePath);
+        e(
+            s.verify_preserved_recovery_file(&residue, &p, &mut b, n, &public),
+            KeyFileError::UnsafePath,
+        );
     }
-    e(s.verify_preserved_recovery_file(&residue, &p, &mut b, "large", &public), KeyError::InvalidFormat.into());
+    e(
+        s.verify_preserved_recovery_file(&residue, &p, &mut b, "large", &public),
+        KeyError::InvalidFormat.into(),
+    );
     source.put(&residue_name(3), b"public incomplete ciphertext");
-    e(s.verify_preserved_recovery_file(&residue_name(3), &p, &mut b, "exact", &public), KeyError::InvalidFormat.into());
+    e(
+        s.verify_preserved_recovery_file(&residue_name(3), &p, &mut b, "exact", &public),
+        KeyError::InvalidFormat.into(),
+    );
     assert_eq!(stdfs::read(source.0.join(&residue)).unwrap(), bytes);
     assert_eq!(stdfs::read(backup.0.join("exact")).unwrap(), bytes);
-    assert!(stdfs::symlink_metadata(backup.0.join("symlink")).unwrap().file_type().is_symlink());
+    assert!(
+        stdfs::symlink_metadata(backup.0.join("symlink"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
     assert_eq!(stdfs::metadata(backup.0.join("hard")).unwrap().nlink(), 2);
-    assert_eq!(stdfs::metadata(backup.0.join("wide")).unwrap().mode() & 0o7777, 0o644);
+    assert_eq!(
+        stdfs::metadata(backup.0.join("wide")).unwrap().mode() & 0o7777,
+        0o644
+    );
 }
 
 #[test]
@@ -1388,26 +1427,47 @@ fn preserved_recheck_changes_or_injected_failure_never_restore_or_certify_the_co
         backup.put("saved", &bytes);
         let mut s = KeyDirectory::open(&source.0).unwrap();
         let mut b = KeyDirectory::open(&backup.0).unwrap();
-        let expected = if phase == 3 { KeyFileError::Io } else { KeyFileError::RecoveryChanged };
+        let expected = if phase == 3 {
+            KeyFileError::Io
+        } else {
+            KeyFileError::RecoveryChanged
+        };
         e(
-            s.verify_preserved_recovery_file_with(&residue, &p, &mut b, "saved", &public, &mut || {
-                match phase {
-                    0 => stdfs::write(source.0.join(&residue), b"public changed source").unwrap(),
-                    1 => stdfs::write(backup.0.join("saved"), b"public changed backup").unwrap(),
-                    2 => stdfs::remove_file(backup.0.join("saved")).unwrap(),
-                    _ => return Err(KeyFileError::Io),
-                }
-                Ok(())
-            }),
+            s.verify_preserved_recovery_file_with(
+                &residue,
+                &p,
+                &mut b,
+                "saved",
+                &public,
+                &mut || {
+                    match phase {
+                        0 => {
+                            stdfs::write(source.0.join(&residue), b"public changed source").unwrap()
+                        }
+                        1 => {
+                            stdfs::write(backup.0.join("saved"), b"public changed backup").unwrap()
+                        }
+                        2 => stdfs::remove_file(backup.0.join("saved")).unwrap(),
+                        _ => return Err(KeyFileError::Io),
+                    }
+                    Ok(())
+                },
+            ),
             expected,
         );
         if phase == 0 {
-            assert_eq!(stdfs::read(source.0.join(&residue)).unwrap(), b"public changed source");
+            assert_eq!(
+                stdfs::read(source.0.join(&residue)).unwrap(),
+                b"public changed source"
+            );
         } else {
             assert_eq!(stdfs::read(source.0.join(&residue)).unwrap(), bytes);
         }
         match phase {
-            1 => assert_eq!(stdfs::read(backup.0.join("saved")).unwrap(), b"public changed backup"),
+            1 => assert_eq!(
+                stdfs::read(backup.0.join("saved")).unwrap(),
+                b"public changed backup"
+            ),
             2 => assert!(!backup.0.join("saved").exists()),
             _ => assert_eq!(stdfs::read(backup.0.join("saved")).unwrap(), bytes),
         }
@@ -1422,7 +1482,10 @@ fn preserved_recheck_uses_both_directory_fds_after_rename_without_touching_repla
     let public = unlock(&bytes, &p).unwrap().public_key();
     let residue = residue_name(1);
     for n in ["source", "backup"] {
-        stdfs::DirBuilder::new().mode(0o700).create(area.0.join(n)).unwrap();
+        stdfs::DirBuilder::new()
+            .mode(0o700)
+            .create(area.0.join(n))
+            .unwrap();
     }
     area.put(&format!("source/{residue}"), &bytes);
     area.put("backup/saved", &bytes);
@@ -1430,14 +1493,30 @@ fn preserved_recheck_uses_both_directory_fds_after_rename_without_touching_repla
     let mut b = KeyDirectory::open(&area.0.join("backup")).unwrap();
     for n in ["source", "backup"] {
         stdfs::rename(area.0.join(n), area.0.join(format!("{n}-old"))).unwrap();
-        stdfs::DirBuilder::new().mode(0o700).create(area.0.join(n)).unwrap();
+        stdfs::DirBuilder::new()
+            .mode(0o700)
+            .create(area.0.join(n))
+            .unwrap();
     }
     area.put(&format!("source/{residue}"), b"public other source");
     area.put("backup/saved", b"public other backup");
-    assert_eq!(s.verify_preserved_recovery_file(&residue, &p, &mut b, "saved", &public).unwrap(), public);
-    assert_eq!(stdfs::read(area.0.join(format!("source/{residue}"))).unwrap(), b"public other source");
-    assert_eq!(stdfs::read(area.0.join("backup/saved")).unwrap(), b"public other backup");
-    assert_eq!(stdfs::read(area.0.join(format!("source-old/{residue}"))).unwrap(), bytes);
+    assert_eq!(
+        s.verify_preserved_recovery_file(&residue, &p, &mut b, "saved", &public)
+            .unwrap(),
+        public
+    );
+    assert_eq!(
+        stdfs::read(area.0.join(format!("source/{residue}"))).unwrap(),
+        b"public other source"
+    );
+    assert_eq!(
+        stdfs::read(area.0.join("backup/saved")).unwrap(),
+        b"public other backup"
+    );
+    assert_eq!(
+        stdfs::read(area.0.join(format!("source-old/{residue}"))).unwrap(),
+        bytes
+    );
     assert_eq!(stdfs::read(area.0.join("backup-old/saved")).unwrap(), bytes);
     e(s.create("later", &p), KeyFileError::PendingRecovery);
 }
