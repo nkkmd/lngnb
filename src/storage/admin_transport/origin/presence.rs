@@ -73,7 +73,7 @@ impl SocketOrigin {
                 .map_err(|_| SocketOriginError::Mismatch)?,
         );
         if (directory.dev(), directory.ino(), directory.uid())
-                != (i.directory_device, i.directory_inode, i.owner_uid)
+            != (i.directory_device, i.directory_inode, i.owner_uid)
             || path != i.path
             || path.kind != SocketPathKind::Socket
             || path.owner_uid != i.owner_uid
