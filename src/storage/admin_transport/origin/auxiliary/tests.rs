@@ -108,12 +108,7 @@ fn only_held_auxiliary_is_present_after_listener_drop_without_extending_fd_lifet
         let t = Temp::new();
         let (listener, origins) = all(&t);
         let before = logical_snapshot(&listener.access.store().conn);
-        let held = listener
-            .origin_socket(name)
-            .unwrap()
-            .0
-            .try_clone()
-            .unwrap();
+        let held = listener.origin_socket(name).unwrap().0.try_clone().unwrap();
         drop(listener);
         let store = RecordStore::open(&t.data(), Limits::default()).unwrap();
         for (index, origin) in origins.iter().enumerate() {
