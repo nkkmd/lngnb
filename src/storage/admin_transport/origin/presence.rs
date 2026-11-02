@@ -34,7 +34,10 @@ impl RecordStore {
         elapsed: Duration,
         after_query: impl FnOnce() -> OriginResult<()>,
     ) -> OriginResult<SocketPresence> {
-        let budget = Budget { start: Instant::now(), elapsed };
+        let budget = Budget {
+            start: Instant::now(),
+            elapsed,
+        };
         origin.check_current(self, &budget)?;
         let result = query(&origin.identity, &budget)?;
         after_query()?;
@@ -47,7 +50,10 @@ impl SocketOrigin {
     fn check_current(&self, store: &RecordStore, budget: &Budget) -> OriginResult<()> {
         budget.check()?;
         let i = &self.identity;
-        let ns = self.namespace.metadata().map_err(|_| SocketOriginError::Unavailable)?;
+        let ns = self
+            .namespace
+            .metadata()
+            .map_err(|_| SocketOriginError::Unavailable)?;
         let context = Context::read()?;
         if context.identity.boot != i.boot_id
             || context.identity.device != i.namespace_device
@@ -98,15 +104,32 @@ fn request(inode: u32, cookie: u64) -> OriginResult<[u8; 40]> {
 }
 
 fn word(bytes: &[u8], at: usize) -> OriginResult<u32> {
-    let value = bytes.get(at..at + 4).ok_or(SocketOriginError::InvalidResponse)?;
-    Ok(u32::from_ne_bytes(value.try_into().map_err(|_| SocketOriginError::InvalidResponse)?))
+    let value = bytes
+        .get(at..at + 4)
+        .ok_or(SocketOriginError::InvalidResponse)?;
+    Ok(u32::from_ne_bytes(
+        value
+            .try_into()
+            .map_err(|_| SocketOriginError::InvalidResponse)?,
+    ))
 }
 fn short(bytes: &[u8], at: usize) -> OriginResult<u16> {
-    let value = bytes.get(at..at + 2).ok_or(SocketOriginError::InvalidResponse)?;
-    Ok(u16::from_ne_bytes(value.try_into().map_err(|_| SocketOriginError::InvalidResponse)?))
+    let value = bytes
+        .get(at..at + 2)
+        .ok_or(SocketOriginError::InvalidResponse)?;
+    Ok(u16::from_ne_bytes(
+        value
+            .try_into()
+            .map_err(|_| SocketOriginError::InvalidResponse)?,
+    ))
 }
 
-fn decode(bytes: &[u8], port: u32, sent: &[u8; 40], expected_vfs: (u32,u32)) -> OriginResult<SocketPresence> {
+fn decode(
+    bytes: &[u8],
+    port: u32,
+    sent: &[u8; 40],
+    expected_vfs: (u32, u32),
+) -> OriginResult<SocketPresence> {
     let bad = SocketOriginError::InvalidResponse;
     if !(16..=LIMIT).contains(&bytes.len())
         || word(bytes, 0)? as usize != bytes.len()
@@ -117,22 +140,28 @@ fn decode(bytes: &[u8], port: u32, sent: &[u8; 40], expected_vfs: (u32,u32)) -> 
         return Err(bad);
     }
     let body = &bytes[16..];
-    if short(bytes, 4)? == 2 { // NLMSG_ERROR。元要求も完全一致を必須とする。
+    if short(bytes, 4)? == 2 {
+        // NLMSG_ERROR。元要求も完全一致を必須とする。
         if body.len() != 44 || body[4..] != sent[..] {
             return Err(bad);
         }
         return match word(body, 0)? as i32 {
-            -2 => Ok(SocketPresence::Missing), // Linux ENOENT
+            -2 => Ok(SocketPresence::Missing),          // Linux ENOENT
             -116 => Ok(SocketPresence::CookieMismatch), // Linux ESTALE
-            0 => Err(bad), // ACKを不在へ変換しない
+            0 => Err(bad),                              // ACKを不在へ変換しない
             value if value < 0 => Err(SocketOriginError::Unavailable),
             _ => Err(bad),
         };
     }
-    if short(bytes, 4)? != 20 || body.len() < 16
-        || body[0] != 1 || body[1] != 1 || !(1..=12).contains(&body[2]) || body[3] != 0
+    if short(bytes, 4)? != 20
+        || body.len() < 16
+        || body[0] != 1
+        || body[1] != 1
+        || !(1..=12).contains(&body[2])
+        || body[3] != 0
         || word(body, 4)? != word(sent, 24)?
-        || word(body, 8)? != word(sent, 32)? || word(body, 12)? != word(sent, 36)?
+        || word(body, 8)? != word(sent, 32)?
+        || word(body, 12)? != word(sent, 36)?
     {
         return Err(bad);
     }
@@ -148,19 +177,29 @@ fn decode(bytes: &[u8], port: u32, sent: &[u8; 40], expected_vfs: (u32,u32)) -> 
             return Err(bad);
         }
         if tag == 1 {
-            if size != 12 || (word(body,pos+4)?,word(body,pos+8)?) != expected_vfs { return Err(bad); }
+            if size != 12 || (word(body, pos + 4)?, word(body, pos + 8)?) != expected_vfs {
+                return Err(bad);
+            }
             vfs = true;
         }
         seen.push(tag);
         pos = aligned;
     }
-    if !vfs { return Err(bad); }
+    if !vfs {
+        return Err(bad);
+    }
     // VFS inodeはu32。完全path identityの証明へ流用せず、pathは別途完全照合する。
     Ok(SocketPresence::Present { state: body[2] })
 }
 
-fn received(bytes: &[u8], flags: MsgFlags, sender: Option<NetlinkAddr>, port: u32,
-    sent: &[u8; 40], expected_vfs: (u32,u32)) -> OriginResult<SocketPresence> {
+fn received(
+    bytes: &[u8],
+    flags: MsgFlags,
+    sender: Option<NetlinkAddr>,
+    port: u32,
+    sent: &[u8; 40],
+    expected_vfs: (u32, u32),
+) -> OriginResult<SocketPresence> {
     if !flags.is_empty() || sender != Some(NetlinkAddr::new(0, 0)) {
         return Err(SocketOriginError::InvalidResponse);
     }
@@ -169,45 +208,68 @@ fn received(bytes: &[u8], flags: MsgFlags, sender: Option<NetlinkAddr>, port: u3
 
 fn query(identity: &SocketOriginIdentity, budget: &Budget) -> OriginResult<SocketPresence> {
     let sent = request(identity.socket_inode, identity.socket_cookie)?;
-    let major=rustix::fs::major(identity.path.device);
-    let minor=rustix::fs::minor(identity.path.device);
-    if major >= (1 << 12) || minor >= (1 << 20) { return Err(SocketOriginError::Unavailable); }
+    let major = rustix::fs::major(identity.path.device);
+    let minor = rustix::fs::minor(identity.path.device);
+    if major >= (1 << 12) || minor >= (1 << 20) {
+        return Err(SocketOriginError::Unavailable);
+    }
     // kernel UAPIのVFS補助属性だけに用いる低32bit。完全path inodeは前後に別照合。
-    let vfs=(identity.path.inode as u32,(major << 20) | minor);
+    let vfs = (identity.path.inode as u32, (major << 20) | minor);
     budget.check()?;
-    let fd = socket::socket(AddressFamily::Netlink, SockType::Raw,
-        SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK, SockProtocol::NetlinkSockDiag)
-        .map_err(|_| SocketOriginError::Unavailable)?;
+    let fd = socket::socket(
+        AddressFamily::Netlink,
+        SockType::Raw,
+        SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK,
+        SockProtocol::NetlinkSockDiag,
+    )
+    .map_err(|_| SocketOriginError::Unavailable)?;
     socket::bind(fd.as_raw_fd(), &NetlinkAddr::new(0, 0))
         .map_err(|_| SocketOriginError::Unavailable)?;
-    let local: NetlinkAddr = socket::getsockname(fd.as_raw_fd())
-        .map_err(|_| SocketOriginError::Unavailable)?;
-    if local.pid() == 0 || local.groups() != 0 { return Err(SocketOriginError::Unavailable); }
+    let local: NetlinkAddr =
+        socket::getsockname(fd.as_raw_fd()).map_err(|_| SocketOriginError::Unavailable)?;
+    if local.pid() == 0 || local.groups() != 0 {
+        return Err(SocketOriginError::Unavailable);
+    }
     budget.check()?;
     // 同一同期呼出しthreadで作成前後のcontextを囲む。setnsしない。
     let context = Context::read()?;
     if context.identity.boot != identity.boot_id
         || (context.identity.device, context.identity.inode)
             != (identity.namespace_device, identity.namespace_inode)
-    { return Err(SocketOriginError::Mismatch); }
+    {
+        return Err(SocketOriginError::Mismatch);
+    }
     budget.check()?;
     let kernel = NetlinkAddr::new(0, 0);
     let count = socket::sendto(fd.as_raw_fd(), &sent, &kernel, MsgFlags::MSG_DONTWAIT)
         .map_err(|_| SocketOriginError::Unavailable)?;
-    if count != sent.len() { return Err(SocketOriginError::Unavailable); }
+    if count != sent.len() {
+        return Err(SocketOriginError::Unavailable);
+    }
     budget.check()?;
-    let remaining = budget.elapsed.checked_sub(budget.start.elapsed())
+    let remaining = budget
+        .elapsed
+        .checked_sub(budget.start.elapsed())
         .ok_or(SocketOriginError::BudgetExceeded)?;
-    let ms = remaining.as_millis().saturating_add(1).min(i32::MAX as u128) as i32;
+    let ms = remaining
+        .as_millis()
+        .saturating_add(1)
+        .min(i32::MAX as u128) as i32;
     let mut fds = [PollFd::new(&fd, PollFlags::IN)];
     let ready = event::poll(&mut fds, ms).map_err(|_| SocketOriginError::Unavailable)?;
     budget.check()?;
-    if ready == 0 { return Err(SocketOriginError::BudgetExceeded); }
+    if ready == 0 {
+        return Err(SocketOriginError::BudgetExceeded);
+    }
     let mut bytes = [0; LIMIT];
     let mut iov = [IoSliceMut::new(&mut bytes)];
-    let msg = socket::recvmsg::<NetlinkAddr>(fd.as_raw_fd(), &mut iov, None,
-        MsgFlags::MSG_DONTWAIT | MsgFlags::MSG_TRUNC)
-        .map_err(|_| SocketOriginError::Unavailable)?;
+    let msg = socket::recvmsg::<NetlinkAddr>(
+        fd.as_raw_fd(),
+        &mut iov,
+        None,
+        MsgFlags::MSG_DONTWAIT | MsgFlags::MSG_TRUNC,
+    )
+    .map_err(|_| SocketOriginError::Unavailable)?;
     if msg.bytes > LIMIT {
         return Err(SocketOriginError::InvalidResponse);
     }
