@@ -12,7 +12,6 @@ const SEQUENCE: u32 = 1; // 毎回新しい専用socket。一度だけ送信す�
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SocketPresence {
     Present { state: u8 },
-    Missing,
     CookieMismatch,
 }
 
@@ -146,7 +145,8 @@ fn decode(
             return Err(bad);
         }
         return match word(body, 0)? as i32 {
-            -2 => Ok(SocketPresence::Missing),          // Linux ENOENT
+            // ENOENTは診断handler未提供とも区別不能。
+            -2 => Err(SocketOriginError::Unavailable),
             -116 => Ok(SocketPresence::CookieMismatch), // Linux ESTALE
             0 => Err(bad),                              // ACKを不在へ変換しない
             value if value < 0 => Err(SocketOriginError::Unavailable),

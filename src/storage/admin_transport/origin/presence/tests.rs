@@ -91,7 +91,7 @@ fn contract_matches_independent_python_uapi_and_rejects_malformed_responses() {
     }
     assert_eq!(
         decode(&error(19, &sent, -2), 19, &sent),
-        Ok(SocketPresence::Missing)
+        Err(SocketOriginError::Unavailable)
     );
     assert_eq!(
         decode(&error(19, &sent, -116), 19, &sent),
@@ -196,8 +196,8 @@ fn live_duplicated_and_closed_socket_results_preserve_path_store_and_manual_hold
     child.0.stdin.as_mut().unwrap().write_all(b"x").unwrap();
     assert!(child.0.wait().unwrap().success());
     assert_eq!(
-        store.socket_origin_presence(&origin, ELAPSED).unwrap(),
-        SocketPresence::Missing
+        store.socket_origin_presence(&origin, ELAPSED),
+        Err(SocketOriginError::Unavailable)
     );
     super::super::tests::independent(&origin, &t, None);
     assert_eq!(store.startup_state().unwrap(), StartupState::NeedsReview);
@@ -225,8 +225,8 @@ fn query_uses_original_directory_fd_and_refuses_absent_or_hardlinked_path() {
     fs::create_dir(t.data()).unwrap();
     fs::write(t.data().join(NAME), b"KEEP").unwrap();
     assert_eq!(
-        store.socket_origin_presence(&origin, ELAPSED).unwrap(),
-        SocketPresence::Missing
+        store.socket_origin_presence(&origin, ELAPSED),
+        Err(SocketOriginError::Unavailable)
     );
     assert_eq!(fs::read(t.data().join(NAME)).unwrap(), b"KEEP");
     let path = moved.join(NAME);
