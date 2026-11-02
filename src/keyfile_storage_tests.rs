@@ -1820,25 +1820,40 @@ fn initial_hold_recovery_explicitly_completes_missing_guard_and_resyncs_existing
         a.put(".lngnb-key-unknown", b"public preserved marker");
         let id = [0x42; 32];
         let mut d = KeyDirectory::open(&a.0).unwrap();
-        d.initialize_recovery_hold_with(id, &mut |_, _| Ok(())).unwrap();
-        if missing_guard { stdfs::remove_file(a.0.join(GUARD)).unwrap(); }
+        d.initialize_recovery_hold_with(id, &mut |_, _| Ok(()))
+            .unwrap();
+        if missing_guard {
+            stdfs::remove_file(a.0.join(GUARD)).unwrap();
+        }
         let marker = stdfs::read(a.0.join(MARKER)).unwrap();
         let before = fingerprint(&stdfs::metadata(a.0.join(MARKER)).unwrap());
         drop(d);
         let mut d = KeyDirectory::open(&a.0).unwrap();
-        assert_eq!(d.recover_initial_hold(&id).unwrap(), KeyRecoveryHold::Held { area_id: id });
+        assert_eq!(
+            d.recover_initial_hold(&id).unwrap(),
+            KeyRecoveryHold::Held { area_id: id }
+        );
         e(KeyDirectory::open(&a.0), KeyFileError::Busy);
         e(d.create("later", &p), KeyFileError::PendingRecovery);
-        e(d.change_passphrase("publisher", &p, "new public pass"), KeyFileError::PendingRecovery);
+        e(
+            d.change_passphrase("publisher", &p, "new public pass"),
+            KeyFileError::PendingRecovery,
+        );
         assert_eq!(stdfs::read(a.0.join(MARKER)).unwrap(), marker);
-        assert_eq!(fingerprint(&stdfs::metadata(a.0.join(MARKER)).unwrap()), before);
+        assert_eq!(
+            fingerprint(&stdfs::metadata(a.0.join(MARKER)).unwrap()),
+            before
+        );
         assert_eq!(stdfs::read(a.0.join("publisher")).unwrap(), bytes);
         assert!(d.load("publisher", &p).is_ok());
         let guard = stdfs::read(a.0.join(GUARD)).unwrap();
         assert_eq!(guard.len(), 49);
         assert_eq!(&guard[..17], b"lngnb:key-hold:1\0");
         assert_eq!(&guard[17..], &id);
-        assert_eq!(stdfs::read(a.0.join(".lngnb-key-unknown")).unwrap(), b"public preserved marker");
+        assert_eq!(
+            stdfs::read(a.0.join(".lngnb-key-unknown")).unwrap(),
+            b"public preserved marker"
+        );
     }
 }
 
@@ -1853,25 +1868,43 @@ fn initial_hold_recovery_rejects_missing_invalid_marker_identity_and_existing_gu
     for phase in 0..7 {
         let a = Area::new();
         let mut d = KeyDirectory::open(&a.0).unwrap();
-        d.initialize_recovery_hold_with(id, &mut |_, _| Ok(())).unwrap();
+        d.initialize_recovery_hold_with(id, &mut |_, _| Ok(()))
+            .unwrap();
         let expected = match phase {
-            0 => { e(d.recover_initial_hold(&[0; 32]), KeyFileError::RecoveryStateInvalid); continue; }
-            1 => { stdfs::write(a.0.join(MARKER), b"public incomplete marker").unwrap(); KeyFileError::RecoveryStateInvalid }
-            2 => { stdfs::write(a.0.join(GUARD), b"public incomplete guard").unwrap(); KeyFileError::RecoveryStateInvalid }
+            0 => {
+                e(
+                    d.recover_initial_hold(&[0; 32]),
+                    KeyFileError::RecoveryStateInvalid,
+                );
+                continue;
+            }
+            1 => {
+                stdfs::write(a.0.join(MARKER), b"public incomplete marker").unwrap();
+                KeyFileError::RecoveryStateInvalid
+            }
+            2 => {
+                stdfs::write(a.0.join(GUARD), b"public incomplete guard").unwrap();
+                KeyFileError::RecoveryStateInvalid
+            }
             3 => {
-                let mut b = stdfs::read(a.0.join(GUARD)).unwrap(); b[17] ^= 1;
-                stdfs::write(a.0.join(GUARD), b).unwrap(); KeyFileError::RecoveryStateInvalid
+                let mut b = stdfs::read(a.0.join(GUARD)).unwrap();
+                b[17] ^= 1;
+                stdfs::write(a.0.join(GUARD), b).unwrap();
+                KeyFileError::RecoveryStateInvalid
             }
             4 => {
                 stdfs::remove_file(a.0.join(GUARD)).unwrap();
-                symlink(MARKER, a.0.join(GUARD)).unwrap(); KeyFileError::UnsafePath
+                symlink(MARKER, a.0.join(GUARD)).unwrap();
+                KeyFileError::UnsafePath
             }
             5 => {
                 stdfs::remove_file(a.0.join(GUARD)).unwrap();
-                stdfs::hard_link(a.0.join(MARKER), a.0.join(GUARD)).unwrap(); KeyFileError::UnsafePath
+                stdfs::hard_link(a.0.join(MARKER), a.0.join(GUARD)).unwrap();
+                KeyFileError::UnsafePath
             }
             _ => {
-                stdfs::set_permissions(a.0.join(GUARD), stdfs::Permissions::from_mode(0o644)).unwrap();
+                stdfs::set_permissions(a.0.join(GUARD), stdfs::Permissions::from_mode(0o644))
+                    .unwrap();
                 KeyFileError::UnsafePath
             }
         };
@@ -1880,7 +1913,10 @@ fn initial_hold_recovery_rejects_missing_invalid_marker_identity_and_existing_gu
         e(d.recover_initial_hold(&id), expected);
         assert_eq!(stdfs::read(a.0.join(MARKER)).unwrap(), marker);
         assert_eq!(stdfs::read(a.0.join(GUARD)).unwrap(), guard);
-        e(d.create("later", "public pass"), KeyFileError::PendingRecovery);
+        e(
+            d.create("later", "public pass"),
+            KeyFileError::PendingRecovery,
+        );
     }
 }
 
@@ -1888,24 +1924,48 @@ fn initial_hold_recovery_rejects_missing_invalid_marker_identity_and_existing_gu
 fn initial_hold_recovery_failed_boundaries_retain_stop_and_do_not_overwrite_partial_guard() {
     use recovery_hold::{GUARD, InitialRecoveryStage as S, MARKER};
     let id = [0x42; 32];
-    for stage in [S::MarkerFileSynced, S::MarkerDirectorySynced, S::GuardCreated, S::GuardWritten, S::GuardFileSynced, S::GuardDirectorySynced] {
+    for stage in [
+        S::MarkerFileSynced,
+        S::MarkerDirectorySynced,
+        S::GuardCreated,
+        S::GuardWritten,
+        S::GuardFileSynced,
+        S::GuardDirectorySynced,
+    ] {
         let a = Area::new();
         let mut d = KeyDirectory::open(&a.0).unwrap();
-        d.initialize_recovery_hold_with(id, &mut |_, _| Ok(())).unwrap();
+        d.initialize_recovery_hold_with(id, &mut |_, _| Ok(()))
+            .unwrap();
         stdfs::remove_file(a.0.join(GUARD)).unwrap();
-        e(d.recover_initial_hold_with(&id, &mut |s| {
-            if s == stage { Err(KeyFileError::Io) } else { Ok(()) }
-        }), KeyFileError::RecoveryHoldUncertain);
+        e(
+            d.recover_initial_hold_with(&id, &mut |s| {
+                if s == stage {
+                    Err(KeyFileError::Io)
+                } else {
+                    Ok(())
+                }
+            }),
+            KeyFileError::RecoveryHoldUncertain,
+        );
         assert!(a.0.join(MARKER).exists());
         drop(d);
         let mut d = KeyDirectory::open(&a.0).unwrap();
-        e(d.create("later", "public pass"), KeyFileError::PendingRecovery);
+        e(
+            d.create("later", "public pass"),
+            KeyFileError::PendingRecovery,
+        );
         if stage == S::GuardCreated {
             assert_eq!(stdfs::read(a.0.join(GUARD)).unwrap(), b"");
-            e(d.recover_initial_hold(&id), KeyFileError::RecoveryStateInvalid);
+            e(
+                d.recover_initial_hold(&id),
+                KeyFileError::RecoveryStateInvalid,
+            );
             assert_eq!(stdfs::read(a.0.join(GUARD)).unwrap(), b"");
         } else {
-            assert_eq!(d.recover_initial_hold(&id).unwrap(), KeyRecoveryHold::Held { area_id: id });
+            assert_eq!(
+                d.recover_initial_hold(&id).unwrap(),
+                KeyRecoveryHold::Held { area_id: id }
+            );
         }
     }
 }
@@ -1917,24 +1977,39 @@ fn initial_hold_recovery_rejects_same_bytes_replacement_and_guard_creation_race(
     for phase in 0..3 {
         let a = Area::new();
         let mut d = KeyDirectory::open(&a.0).unwrap();
-        d.initialize_recovery_hold_with(id, &mut |_, _| Ok(())).unwrap();
-        if phase == 2 { stdfs::remove_file(a.0.join(GUARD)).unwrap(); }
-        e(d.recover_initial_hold_with(&id, &mut |s| {
-            if s == S::MarkerDirectorySynced {
-                match phase {
-                    0 | 1 => {
-                        let n = if phase == 0 { MARKER } else { GUARD };
-                        let b = stdfs::read(a.0.join(n)).unwrap();
-                        stdfs::rename(a.0.join(n), a.0.join("public-preserved-original")).unwrap();
-                        a.put(n, &b);
+        d.initialize_recovery_hold_with(id, &mut |_, _| Ok(()))
+            .unwrap();
+        if phase == 2 {
+            stdfs::remove_file(a.0.join(GUARD)).unwrap();
+        }
+        e(
+            d.recover_initial_hold_with(&id, &mut |s| {
+                if s == S::MarkerDirectorySynced {
+                    match phase {
+                        0 | 1 => {
+                            let n = if phase == 0 { MARKER } else { GUARD };
+                            let b = stdfs::read(a.0.join(n)).unwrap();
+                            stdfs::rename(a.0.join(n), a.0.join("public-preserved-original"))
+                                .unwrap();
+                            a.put(n, &b);
+                        }
+                        _ => a.put(GUARD, b"public racing entry"),
                     }
-                    _ => a.put(GUARD, b"public racing entry"),
                 }
-            }
-            Ok(())
-        }), KeyFileError::RecoveryHoldUncertain);
-        if phase == 2 { assert_eq!(stdfs::read(a.0.join(GUARD)).unwrap(), b"public racing entry"); }
-        e(d.create("later", "public pass"), KeyFileError::PendingRecovery);
+                Ok(())
+            }),
+            KeyFileError::RecoveryHoldUncertain,
+        );
+        if phase == 2 {
+            assert_eq!(
+                stdfs::read(a.0.join(GUARD)).unwrap(),
+                b"public racing entry"
+            );
+        }
+        e(
+            d.create("later", "public pass"),
+            KeyFileError::PendingRecovery,
+        );
     }
 }
 
@@ -1946,17 +2021,27 @@ fn initial_hold_recovery_is_bound_to_directory_fd_and_rejects_copied_marker() {
     stdfs::DirBuilder::new().mode(0o700).create(&path).unwrap();
     let mut d = KeyDirectory::open(&path).unwrap();
     let id = [0x42; 32];
-    d.initialize_recovery_hold_with(id, &mut |_, _| Ok(())).unwrap();
+    d.initialize_recovery_hold_with(id, &mut |_, _| Ok(()))
+        .unwrap();
     stdfs::remove_file(path.join(GUARD)).unwrap();
     stdfs::rename(&path, a.0.join("moved")).unwrap();
     stdfs::DirBuilder::new().mode(0o700).create(&path).unwrap();
     a.put("source/public-marker", b"public replacement directory");
-    assert_eq!(d.recover_initial_hold(&id).unwrap(), KeyRecoveryHold::Held { area_id: id });
+    assert_eq!(
+        d.recover_initial_hold(&id).unwrap(),
+        KeyRecoveryHold::Held { area_id: id }
+    );
     assert_eq!(stdfs::read_dir(&path).unwrap().count(), 1);
     let b = Area::new();
-    b.put(MARKER, &stdfs::read(a.0.join("moved").join(MARKER)).unwrap());
+    b.put(
+        MARKER,
+        &stdfs::read(a.0.join("moved").join(MARKER)).unwrap(),
+    );
     let mut other = KeyDirectory::open(&b.0).unwrap();
-    e(other.recover_initial_hold(&id), KeyFileError::RecoveryStateInvalid);
+    e(
+        other.recover_initial_hold(&id),
+        KeyFileError::RecoveryStateInvalid,
+    );
     assert!(!b.0.join(GUARD).exists());
 }
 
@@ -1965,28 +2050,43 @@ fn initial_hold_recovery_process_kill_keeps_stop_and_requires_explicit_recovery(
     use recovery_hold::{GUARD, InitialRecoveryStage as S};
     if let Some(path) = std::env::var_os("LNGNB_PUBLIC_INITIAL_RECOVERY_AREA") {
         let path = PathBuf::from(path);
-        assert!(path.file_name().unwrap().to_string_lossy().starts_with("lngnb-keytest-"));
-        assert_eq!(stdfs::read(path.join("fixture-marker")).unwrap(), b"public initial recovery fixture");
+        assert!(
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("lngnb-keytest-")
+        );
+        assert_eq!(
+            stdfs::read(path.join("fixture-marker")).unwrap(),
+            b"public initial recovery fixture"
+        );
         let point = std::env::var("LNGNB_PUBLIC_INITIAL_RECOVERY_POINT").unwrap();
         let mut d = KeyDirectory::open(&path).unwrap();
         let _ = d.recover_initial_hold_with(&[0x42; 32], &mut |s| {
             if format!("{s:?}") == point {
                 println!("READY");
                 std::io::stdout().flush().unwrap();
-                loop { std::thread::park(); }
+                loop {
+                    std::thread::park();
+                }
             }
             Ok(())
         });
         panic!("kill point not reached");
     }
     let (bytes, p) = fixture();
-    for point in [S::MarkerDirectorySynced, S::GuardCreated, S::GuardDirectorySynced] {
+    for point in [
+        S::MarkerDirectorySynced,
+        S::GuardCreated,
+        S::GuardDirectorySynced,
+    ] {
         let a = Area::new();
         a.put("publisher", &bytes);
         a.put("fixture-marker", b"public initial recovery fixture");
         {
             let mut d = KeyDirectory::open(&a.0).unwrap();
-            d.initialize_recovery_hold_with([0x42; 32], &mut |_, _| Ok(())).unwrap();
+            d.initialize_recovery_hold_with([0x42; 32], &mut |_, _| Ok(()))
+                .unwrap();
         }
         stdfs::remove_file(a.0.join(GUARD)).unwrap();
         let mut child = Command::new(std::env::current_exe().unwrap())
@@ -1999,7 +2099,9 @@ fn initial_hold_recovery_process_kill_keeps_stop_and_requires_explicit_recovery(
         loop {
             line.clear();
             assert!(stdout.read_line(&mut line).unwrap() > 0);
-            if line.trim() == "READY" { break; }
+            if line.trim() == "READY" {
+                break;
+            }
         }
         child.kill().unwrap();
         assert!(!child.wait().unwrap().success());
@@ -2008,9 +2110,17 @@ fn initial_hold_recovery_process_kill_keeps_stop_and_requires_explicit_recovery(
         assert!(d.load("publisher", &p).is_ok());
         assert_eq!(stdfs::read(a.0.join("publisher")).unwrap(), bytes);
         if point == S::GuardCreated {
-            e(d.recover_initial_hold(&[0x42; 32]), KeyFileError::RecoveryStateInvalid);
+            e(
+                d.recover_initial_hold(&[0x42; 32]),
+                KeyFileError::RecoveryStateInvalid,
+            );
         } else {
-            assert_eq!(d.recover_initial_hold(&[0x42; 32]).unwrap(), KeyRecoveryHold::Held { area_id: [0x42; 32] });
+            assert_eq!(
+                d.recover_initial_hold(&[0x42; 32]).unwrap(),
+                KeyRecoveryHold::Held {
+                    area_id: [0x42; 32]
+                }
+            );
         }
         e(d.create("later", &p), KeyFileError::PendingRecovery);
     }

@@ -71,10 +71,7 @@ impl KeyDirectory {
     /// 完全markerと期待area_idを確認し、初期停止だけを明示復旧する。
     /// 不在guardだけを新規作成し、既存guardは完全一致を必須とする。
     /// 過去の初期化成功を推定せず、今回のfsyncを行う。解除/鍵整理はしない。
-    pub fn recover_initial_hold(
-        &mut self,
-        expected_area_id: &[u8; 32],
-    ) -> Result<KeyRecoveryHold> {
+    pub fn recover_initial_hold(&mut self, expected_area_id: &[u8; 32]) -> Result<KeyRecoveryHold> {
         self.recover_initial_hold_with(expected_area_id, &mut |_| Ok(()))
     }
 
@@ -111,7 +108,11 @@ impl KeyDirectory {
                     let fd = os(fs::openat(
                         &self.dir,
                         GUARD,
-                        OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                        OFlags::RDWR
+                            | OFlags::CREATE
+                            | OFlags::EXCL
+                            | OFlags::NOFOLLOW
+                            | OFlags::CLOEXEC,
                         Mode::RUSR | Mode::WUSR,
                     ))?;
                     let mut file = File::from(fd);
