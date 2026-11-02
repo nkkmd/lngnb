@@ -208,4 +208,6 @@ mod tests;
 #[path = "keyfile_storage.rs"]
 mod files;
 #[cfg(target_os = "linux")]
-pub use files::{KeyDirectory, KeyFileError, KeyRecoveryEntry, KeyRecoveryHold, KeyRecoveryInventory};
+pub use files::{
+    KeyDirectory, KeyFileError, KeyRecoveryEntry, KeyRecoveryHold, KeyRecoveryInventory,
+};

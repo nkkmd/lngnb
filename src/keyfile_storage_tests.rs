@@ -1534,9 +1534,16 @@ fn explicit_hold_layout_reopen_and_last_residue_loss_keep_normal_changes_blocked
     let held = KeyRecoveryHold::Held { area_id };
     {
         let mut d = KeyDirectory::open(&a.0).unwrap();
-        assert_eq!(d.recovery_hold_status().unwrap(), KeyRecoveryHold::NotInitialized);
+        assert_eq!(
+            d.recovery_hold_status().unwrap(),
+            KeyRecoveryHold::NotInitialized
+        );
         assert!(!a.0.join(MARKER).exists());
-        assert_eq!(d.initialize_recovery_hold_with(area_id, &mut |_, _| Ok(())).unwrap(), held);
+        assert_eq!(
+            d.initialize_recovery_hold_with(area_id, &mut |_, _| Ok(()))
+                .unwrap(),
+            held
+        );
         e(KeyDirectory::open(&a.0), KeyFileError::Busy);
         e(d.initialize_recovery_hold(), KeyFileError::Exists);
     }
@@ -1563,16 +1570,28 @@ fn explicit_hold_layout_reopen_and_last_residue_loss_keep_normal_changes_blocked
     let mut d = KeyDirectory::open(&a.0).unwrap();
     assert_eq!(d.recovery_hold_status().unwrap(), held);
     e(d.create("later", &p), KeyFileError::PendingRecovery);
-    e(d.change_passphrase("publisher", &p, "new public pass"), KeyFileError::PendingRecovery);
-    assert_eq!(d.load("publisher", &p).unwrap().public_key(), unlock(&bytes, &p).unwrap().public_key());
+    e(
+        d.change_passphrase("publisher", &p, "new public pass"),
+        KeyFileError::PendingRecovery,
+    );
+    assert_eq!(
+        d.load("publisher", &p).unwrap().public_key(),
+        unlock(&bytes, &p).unwrap().public_key()
+    );
     assert_eq!(stdfs::read(a.0.join("publisher")).unwrap(), bytes);
-    assert_eq!(fingerprint(&stdfs::metadata(a.0.join("publisher")).unwrap()), original);
+    assert_eq!(
+        fingerprint(&stdfs::metadata(a.0.join("publisher")).unwrap()),
+        original
+    );
     assert_eq!(stdfs::read(a.0.join(MARKER)).unwrap(), marker);
     assert_eq!(stdfs::read(a.0.join(GUARD)).unwrap(), guard);
     assert_eq!(d.recovery_inventory().unwrap().unrecognized_entries, 2);
     let fresh = Area::new();
     let mut fresh_dir = KeyDirectory::open(&fresh.0).unwrap();
-    assert!(matches!(fresh_dir.initialize_recovery_hold().unwrap(), KeyRecoveryHold::Held { .. }));
+    assert!(matches!(
+        fresh_dir.initialize_recovery_hold().unwrap(),
+        KeyRecoveryHold::Held { .. }
+    ));
 }
 
 #[test]
@@ -1585,7 +1604,10 @@ fn explicit_hold_never_adopts_or_overwrites_existing_control_names() {
         let mut d = KeyDirectory::open(&a.0).unwrap();
         e(d.initialize_recovery_hold(), KeyFileError::Exists);
         e(d.recovery_hold_status(), KeyFileError::RecoveryStateInvalid);
-        assert_eq!(stdfs::read(a.0.join(n)).unwrap(), b"public existing contents");
+        assert_eq!(
+            stdfs::read(a.0.join(n)).unwrap(),
+            b"public existing contents"
+        );
         assert_eq!(fingerprint(&stdfs::metadata(a.0.join(n)).unwrap()), before);
         assert_eq!(a.pending().len(), 1);
     }
@@ -1598,13 +1620,17 @@ fn explicit_hold_never_adopts_or_overwrites_existing_control_names() {
             2 => stdfs::create_dir(a.0.join(MARKER)).unwrap(),
             _ => {
                 a.put(MARKER, b"public wide mode");
-                stdfs::set_permissions(a.0.join(MARKER), stdfs::Permissions::from_mode(0o644)).unwrap();
+                stdfs::set_permissions(a.0.join(MARKER), stdfs::Permissions::from_mode(0o644))
+                    .unwrap();
             }
         }
         let mut d = KeyDirectory::open(&a.0).unwrap();
         e(d.initialize_recovery_hold(), KeyFileError::Exists);
         e(d.recovery_hold_status(), KeyFileError::UnsafePath);
-        assert_eq!(stdfs::read(a.0.join("target")).unwrap(), b"public unrelated file");
+        assert_eq!(
+            stdfs::read(a.0.join("target")).unwrap(),
+            b"public unrelated file"
+        );
         assert!(!a.0.join(GUARD).exists());
     }
 }
@@ -1615,7 +1641,8 @@ fn explicit_hold_rejects_incomplete_unknown_mismatched_and_other_directory_state
     for phase in 0..5 {
         let a = Area::new();
         let mut d = KeyDirectory::open(&a.0).unwrap();
-        d.initialize_recovery_hold_with([0x24; 32], &mut |_, _| Ok(())).unwrap();
+        d.initialize_recovery_hold_with([0x24; 32], &mut |_, _| Ok(()))
+            .unwrap();
         match phase {
             0 => stdfs::remove_file(a.0.join(GUARD)).unwrap(),
             1 => stdfs::remove_file(a.0.join(MARKER)).unwrap(),
@@ -1634,14 +1661,23 @@ fn explicit_hold_rejects_incomplete_unknown_mismatched_and_other_directory_state
                 b.put(MARKER, &stdfs::read(a.0.join(MARKER)).unwrap());
                 b.put(GUARD, &stdfs::read(a.0.join(GUARD)).unwrap());
                 let mut other = KeyDirectory::open(&b.0).unwrap();
-                e(other.recovery_hold_status(), KeyFileError::RecoveryStateInvalid);
-                e(other.create("later", "public pass"), KeyFileError::PendingRecovery);
+                e(
+                    other.recovery_hold_status(),
+                    KeyFileError::RecoveryStateInvalid,
+                );
+                e(
+                    other.create("later", "public pass"),
+                    KeyFileError::PendingRecovery,
+                );
                 continue;
             }
         }
         e(d.recovery_hold_status(), KeyFileError::RecoveryStateInvalid);
         e(d.initialize_recovery_hold(), KeyFileError::Exists);
-        e(d.create("later", "public pass"), KeyFileError::PendingRecovery);
+        e(
+            d.create("later", "public pass"),
+            KeyFileError::PendingRecovery,
+        );
     }
 }
 
@@ -1649,20 +1685,38 @@ fn explicit_hold_rejects_incomplete_unknown_mismatched_and_other_directory_state
 fn explicit_hold_all_creation_boundaries_preserve_files_and_block_after_reopen() {
     use recovery_hold::{HoldStage, MARKER};
     for index in 0..2 {
-        for stage in [HoldStage::Created, HoldStage::Written, HoldStage::FileSynced, HoldStage::DirectorySynced] {
+        for stage in [
+            HoldStage::Created,
+            HoldStage::Written,
+            HoldStage::FileSynced,
+            HoldStage::DirectorySynced,
+        ] {
             let a = Area::new();
             a.put("publisher", b"public preserved ciphertext stand-in");
             {
                 let mut d = KeyDirectory::open(&a.0).unwrap();
-                e(d.initialize_recovery_hold_with([0x42; 32], &mut |i, s| {
-                    if i == index && s == stage { Err(KeyFileError::Io) } else { Ok(()) }
-                }), KeyFileError::RecoveryHoldUncertain);
+                e(
+                    d.initialize_recovery_hold_with([0x42; 32], &mut |i, s| {
+                        if i == index && s == stage {
+                            Err(KeyFileError::Io)
+                        } else {
+                            Ok(())
+                        }
+                    }),
+                    KeyFileError::RecoveryHoldUncertain,
+                );
             }
             assert!(a.0.join(MARKER).exists());
             let mut d = KeyDirectory::open(&a.0).unwrap();
-            e(d.create("later", "public pass"), KeyFileError::PendingRecovery);
+            e(
+                d.create("later", "public pass"),
+                KeyFileError::PendingRecovery,
+            );
             e(d.initialize_recovery_hold(), KeyFileError::Exists);
-            assert_eq!(stdfs::read(a.0.join("publisher")).unwrap(), b"public preserved ciphertext stand-in");
+            assert_eq!(
+                stdfs::read(a.0.join("publisher")).unwrap(),
+                b"public preserved ciphertext stand-in"
+            );
         }
     }
 }
@@ -1675,12 +1729,21 @@ fn explicit_hold_directory_fd_binding_preserves_replacement_directory() {
     let mut d = KeyDirectory::open(&path).unwrap();
     stdfs::rename(&path, a.0.join("moved")).unwrap();
     stdfs::DirBuilder::new().mode(0o700).create(&path).unwrap();
-    d.initialize_recovery_hold_with([0x42; 32], &mut |_, _| Ok(())).unwrap();
+    d.initialize_recovery_hold_with([0x42; 32], &mut |_, _| Ok(()))
+        .unwrap();
     assert!(stdfs::read_dir(&path).unwrap().next().is_none());
     drop(d);
     let mut moved = KeyDirectory::open(&a.0.join("moved")).unwrap();
-    assert_eq!(moved.recovery_hold_status().unwrap(), KeyRecoveryHold::Held { area_id: [0x42; 32] });
-    e(moved.create("later", "public pass"), KeyFileError::PendingRecovery);
+    assert_eq!(
+        moved.recovery_hold_status().unwrap(),
+        KeyRecoveryHold::Held {
+            area_id: [0x42; 32]
+        }
+    );
+    e(
+        moved.create("later", "public pass"),
+        KeyFileError::PendingRecovery,
+    );
 }
 
 #[test]
@@ -1688,15 +1751,25 @@ fn explicit_hold_process_kill_preserves_stop_and_existing_key() {
     use recovery_hold::MARKER;
     if let Some(path) = std::env::var_os("LNGNB_PUBLIC_HOLD_KILL_AREA") {
         let path = PathBuf::from(path);
-        assert!(path.file_name().unwrap().to_string_lossy().starts_with("lngnb-keytest-"));
-        assert_eq!(stdfs::read(path.join("fixture-marker")).unwrap(), b"public hold fixture");
+        assert!(
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("lngnb-keytest-")
+        );
+        assert_eq!(
+            stdfs::read(path.join("fixture-marker")).unwrap(),
+            b"public hold fixture"
+        );
         let point = std::env::var("LNGNB_PUBLIC_HOLD_KILL_POINT").unwrap();
         let mut d = KeyDirectory::open(&path).unwrap();
         let _ = d.initialize_recovery_hold_with([0x42; 32], &mut |i, s| {
             if format!("{i}:{s:?}") == point {
                 println!("READY");
                 std::io::stdout().flush().unwrap();
-                loop { std::thread::park(); }
+                loop {
+                    std::thread::park();
+                }
             }
             Ok(())
         });
@@ -1708,16 +1781,24 @@ fn explicit_hold_process_kill_preserves_stop_and_existing_key() {
         a.put("publisher", &bytes);
         a.put("fixture-marker", b"public hold fixture");
         let mut child = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "keyfile::files::tests::explicit_hold_process_kill_preserves_stop_and_existing_key", "--nocapture"])
+            .args([
+                "--exact",
+                "keyfile::files::tests::explicit_hold_process_kill_preserves_stop_and_existing_key",
+                "--nocapture",
+            ])
             .env("LNGNB_PUBLIC_HOLD_KILL_AREA", &a.0)
             .env("LNGNB_PUBLIC_HOLD_KILL_POINT", point)
-            .stdout(Stdio::piped()).spawn().unwrap();
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
         let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
         let mut line = String::new();
         loop {
             line.clear();
             assert!(stdout.read_line(&mut line).unwrap() > 0);
-            if line.trim() == "READY" { break; }
+            if line.trim() == "READY" {
+                break;
+            }
         }
         child.kill().unwrap();
         assert!(!child.wait().unwrap().success());
