@@ -1,6 +1,8 @@
 //! 明示した新規bindに限る、非永続の作成時根拠。削除/不使用の資格ではない。
 use super::*;
 use std::fs::File;
+mod auxiliary;
+use auxiliary::known_name;
 mod presence;
 pub use presence::SocketPresence;
 
@@ -163,15 +165,15 @@ impl Listener {
         budget.check()?;
         let listener = bind().map_err(SocketOriginError::Bind)?;
         after_bind(&listener)?;
-        let identity = listener.observe_origin(&context.identity, &budget, || Ok(()))?;
+        let identity = listener.observe_origin(NAME, &context.identity, &budget, || Ok(()))?;
         let origin = SocketOrigin {
             identity,
             namespace: context.namespace,
         };
         Ok((listener, origin))
     }
-    /// 現在保持する主受付fd/領域/path/contextと、取得済み根拠の一致だけを確認。
-    /// 不使用診断・永続作成来歴・再開/整理資格へ変換せず、他のendpointは検査しない。
+    /// 根拠の固定名に対応する保持fd/領域/path/contextとの一致だけを確認。
+    /// 不使用診断・永続作成来歴・再開/整理資格へ変換せず、全4名の一括検査ではない。
     pub fn verify_socket_origin(
         &self,
         origin: &SocketOrigin,
@@ -204,7 +206,7 @@ impl Listener {
         {
             return Err(SocketOriginError::Mismatch);
         }
-        let current = self.observe_origin(&expected, &budget, between)?;
+        let current = self.observe_origin(origin.identity.name, &expected, &budget, between)?;
         if current != origin.identity {
             return Err(SocketOriginError::Mismatch);
         }
@@ -212,6 +214,7 @@ impl Listener {
     }
     fn observe_origin(
         &self,
+        name: &'static str,
         expected: &ContextIdentity,
         budget: &Budget,
         between: impl FnOnce() -> OriginResult<()>,
@@ -223,26 +226,25 @@ impl Listener {
                 return Err(SocketOriginError::Mismatch);
             }
             budget.check()?;
-            self.check_endpoint()
-                .map_err(|_| SocketOriginError::Mismatch)?;
+            let (socket, created) = self.origin_socket(name)?;
             let directory = std::fs::metadata(anchored(&self.access.store().dir, "."))
                 .map_err(|_| SocketOriginError::Unavailable)?;
             let path = SocketPathMetadata::from_metadata(
-                &std::fs::symlink_metadata(anchored(&self.access.store().dir, NAME))
+                &std::fs::symlink_metadata(anchored(&self.access.store().dir, name))
                     .map_err(|_| SocketOriginError::Mismatch)?,
             );
             if path.kind != SocketPathKind::Socket
                 || path.mode != 0o600
                 || path.owner_uid != self.owner
                 || path.links != 1
-                || (path.device, path.inode) != self.identity
+                || (path.device, path.inode) != created
             {
                 return Err(SocketOriginError::Mismatch);
             }
             budget.check()?;
-            let fd = rustix::fs::fstat(&self.socket).map_err(|_| SocketOriginError::Unavailable)?;
+            let fd = rustix::fs::fstat(socket).map_err(|_| SocketOriginError::Unavailable)?;
             let inode = u32::try_from(fd.st_ino).map_err(|_| SocketOriginError::Unavailable)?;
-            let cookie = rustix::net::sockopt::get_socket_cookie(&self.socket)
+            let cookie = rustix::net::sockopt::get_socket_cookie(socket)
                 .map_err(|_| SocketOriginError::Unavailable)?;
             if inode == 0 || cookie == 0 || cookie == u64::MAX {
                 return Err(SocketOriginError::Unavailable);
@@ -255,7 +257,7 @@ impl Listener {
                 directory_device: directory.dev(),
                 directory_inode: directory.ino(),
                 owner_uid: directory.uid(),
-                name: NAME,
+                name,
                 socket_device: fd.st_dev,
                 socket_inode: inode,
                 socket_cookie: cookie,

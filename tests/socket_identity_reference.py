@@ -229,7 +229,8 @@ def check_origin(expected, closed):
     require([ns.st_dev, ns.st_ino] == expected["namespace"])
     directory = os.stat(expected["directory_path"])
     require([directory.st_dev, directory.st_ino, directory.st_uid] == expected["directory"])
-    require(expected["name"] == "admin.sock")
+    require(expected["name"] in ("admin.sock", "admin-status.sock",
+                                 "admin-evaluate.sock", "admin-config.sock"))
     m = os.stat(os.path.join(expected["directory_path"], expected["name"]),
                 follow_symlinks=False)
     require([m.st_dev, m.st_ino, m.st_uid, m.st_gid, m.st_mode & 0o7777,

@@ -49,6 +49,9 @@ impl SocketOrigin {
     fn check_current(&self, store: &RecordStore, budget: &Budget) -> OriginResult<()> {
         budget.check()?;
         let i = &self.identity;
+        if !known_name(i.name) {
+            return Err(SocketOriginError::Mismatch);
+        }
         let ns = self
             .namespace
             .metadata()
@@ -66,12 +69,11 @@ impl SocketOrigin {
         let directory = std::fs::metadata(anchored(&store.dir, "."))
             .map_err(|_| SocketOriginError::Unavailable)?;
         let path = SocketPathMetadata::from_metadata(
-            &std::fs::symlink_metadata(anchored(&store.dir, NAME))
+            &std::fs::symlink_metadata(anchored(&store.dir, i.name))
                 .map_err(|_| SocketOriginError::Mismatch)?,
         );
-        if i.name != NAME
-            || (directory.dev(), directory.ino(), directory.uid())
-                != (i.directory_device, i.directory_inode, i.owner_uid)
+        if (directory.dev(), directory.ino(), directory.uid())
+            != (i.directory_device, i.directory_inode, i.owner_uid)
             || path != i.path
             || path.kind != SocketPathKind::Socket
             || path.owner_uid != i.owner_uid

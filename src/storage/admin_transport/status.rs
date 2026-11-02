@@ -75,6 +75,10 @@ pub(super) struct Endpoint {
     name: &'static str,
 }
 impl Endpoint {
+    /// 追跡付き観測用の読取り専用借用。admin_transportの外へfdを公開しない。
+    pub(super) fn origin_parts(&self) -> (&UnixListener, (u64, u64)) {
+        (&self.socket, self.identity)
+    }
     pub(super) fn bind(store: &RecordStore, owner: u32, name: &'static str) -> Result<Self> {
         check_area(&store.dir).map_err(|_| Error::UnsafeEndpoint)?;
         let path = anchored(&store.dir, name);

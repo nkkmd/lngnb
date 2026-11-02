@@ -14,6 +14,10 @@ use std::{
 const ELAPSED: Duration = Duration::from_secs(60);
 
 pub(super) fn independent(origin: &SocketOrigin, t: &Temp, listener: Option<&Listener>) {
+    independent_socket(origin, t, listener.map(|listener| &listener.socket));
+}
+
+pub(super) fn independent_socket(origin: &SocketOrigin, t: &Temp, socket: Option<&UnixListener>) {
     let i = origin.identity();
     let p = i.path;
     let expected = serde_json::json!({
@@ -37,9 +41,9 @@ pub(super) fn independent(origin: &SocketOrigin, t: &Temp, listener: Option<&Lis
         env!("CARGO_MANIFEST_DIR"),
         "/tests/socket_identity_reference.py"
     ));
-    if let Some(listener) = listener {
+    if let Some(socket) = socket {
         child.arg("--check-origin");
-        let fd: OwnedFd = listener.socket.try_clone().unwrap().into();
+        let fd: OwnedFd = socket.try_clone().unwrap().into();
         child.stdin(Stdio::from(fd));
     } else {
         child.arg("--check-closed-origin").stdin(Stdio::null());
