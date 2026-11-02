@@ -1,5 +1,6 @@
 //! A11/R34: Linuxの所有者専用ディレクトリ内での鍵ファイル操作。
-//! ファイルは暗号化bytesだけ。DB・HTTP・IPC・端末操作には接続しない。
+//! 鍵は暗号化bytesだけ。秘密を含まない明示停止状態は別の予約名へ分離する。
+//! DB・HTTP・IPC・端末操作には接続しない。
 use super::{KeyError, MAX_KEYFILE_BYTES, UnlockedKey, generate, unlock};
 use rustix::fs::{self, AtFlags, CWD, FlockOperation, Mode, OFlags, RenameFlags};
 use std::{
@@ -12,6 +13,9 @@ use std::{
 type Result<T> = std::result::Result<T, KeyFileError>;
 const PREFIX: &str = ".lngnb-key-";
 const SCAN_LIMIT: usize = 10_000;
+#[path = "keyfile_recovery_hold.rs"]
+mod recovery_hold;
+pub use recovery_hold::KeyRecoveryHold;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyFileError {
     UnsafePath,
@@ -31,6 +35,10 @@ pub enum KeyFileError {
     UnexpectedPublicKey,
     /// 認証した残存暗号文と、指定保全先の現在の完全bytesが一致しない。
     PreservationMismatch,
+    /// 明示停止の二fileが不完全/不正/別領域に束縛されている。
+    RecoveryStateInvalid,
+    /// 明示停止の作成開始後。保存確定/未保存を断定せず全fileを保持する。
+    RecoveryHoldUncertain,
     /// 交換/配置済みだがdirectory fsync成功を確認できない。成功/rollbackを断定しない。
     CommitUncertain,
     /// 新鍵の永続化確認済み。旧暗号文の整理だけが未完了/不確実。
@@ -57,6 +65,8 @@ impl std::fmt::Display for KeyFileError {
             Self::RestorationReviewRequired => "key_restoration_committed_review_required",
             Self::UnexpectedPublicKey => "key_unexpected_public_key",
             Self::PreservationMismatch => "key_preservation_mismatch",
+            Self::RecoveryStateInvalid => "key_recovery_state_invalid",
+            Self::RecoveryHoldUncertain => "key_recovery_hold_uncertain",
             Self::CommitUncertain => "key_commit_uncertain",
             Self::CleanupUncertain => "key_committed_cleanup_uncertain",
             Self::Key(e) => return e.fmt(f),
