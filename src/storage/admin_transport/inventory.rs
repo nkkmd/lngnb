@@ -139,6 +139,52 @@ mod tests {
     };
     const ELAPSED: Duration = Duration::from_secs(60);
     #[test]
+    fn released_store_lock_does_not_prove_listener_descriptors_are_closed() {
+        let t = Temp::new();
+        drop(t.store().begin().unwrap());
+        let store = RecordStore::open(&t.data(), Limits::default()).unwrap();
+        let listener = Listener::bind(store, MAX_FRAME, MAX_TIMEOUT).unwrap();
+        // 試験だけでfdを複製する。製品APIがfdを外へ貸すという意味ではない。
+        let retained = listener.socket.try_clone().unwrap();
+        let live = listener
+            .access
+            .store()
+            .admin_socket_inventory(ELAPSED)
+            .unwrap();
+        drop(listener);
+
+        // Storeの排他を取り直せても、別に保持した受付fdは生存し得る。
+        let store = RecordStore::open(&t.data(), Limits::default()).unwrap();
+        let before = logical_snapshot(&store.conn);
+        assert_eq!(store.startup_state().unwrap(), StartupState::NeedsReview);
+        assert_eq!(store.admin_socket_inventory(ELAPSED).unwrap(), live);
+        assert!(RecordStore::open(&t.data(), Limits::default()).is_err());
+        assert_eq!(
+            retained.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        // 明示した試験接続を実際にacceptし、metadataとは独立に生存を確認する。
+        let client = UnixStream::connect(anchored(&store.dir, NAME)).unwrap();
+        let (accepted, _) = retained.accept().unwrap();
+        drop(accepted);
+        drop(client);
+        drop(retained);
+        assert_eq!(store.admin_socket_inventory(ELAPSED).unwrap(), live);
+        assert_eq!(logical_snapshot(&store.conn), before);
+        assert_eq!(store.startup_state().unwrap(), StartupState::NeedsReview);
+        let raw = fs::symlink_metadata(anchored(&store.dir, NAME)).unwrap();
+        let observed = live.entries[0].observed.unwrap();
+        assert_eq!((raw.dev(), raw.ino()), (observed.device, observed.inode));
+        // 全fd close後も、残った名前をbindで自動整理しない。
+        assert!(matches!(
+            Listener::bind(store, MAX_FRAME, MAX_TIMEOUT),
+            Err(Error::EndpointExists)
+        ));
+        let store = RecordStore::open(&t.data(), Limits::default()).unwrap();
+        assert_eq!(store.admin_socket_inventory(ELAPSED).unwrap(), live);
+        assert_eq!(logical_snapshot(&store.conn), before);
+    }
+    #[test]
     fn fixed_paths_observe_live_and_dropped_sockets_without_contact_or_state_change() {
         let t = Temp::new();
         drop(t.store().begin().unwrap());
