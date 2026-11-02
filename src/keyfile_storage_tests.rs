@@ -1257,3 +1257,266 @@ fn preserved_copy_can_be_used_after_reopen_without_clearing_or_rewriting_source_
     );
     assert_eq!(d.load("publisher", new).unwrap().public_key(), public);
 }
+
+#[test]
+fn preserved_recheck_is_read_only_explicit_and_keeps_both_locks_and_pending() {
+    let source = Area::new();
+    let backup = Area::new();
+    let (bytes, p) = fixture();
+    let public = unlock(&bytes, &p).unwrap().public_key();
+    let residue = residue_name(1);
+    source.put(&residue, &bytes);
+    source.put("publisher", &bytes);
+    source.put(".lngnb-key-unknown", b"public source marker");
+    backup.put("saved", &bytes);
+    backup.put(".lngnb-key-unknown", b"public backup marker");
+    let snapshot: Vec<_> = [source.0.clone(), backup.0.clone()]
+        .into_iter()
+        .flat_map(|dir| stdfs::read_dir(dir).unwrap())
+        .map(|entry| {
+            let path = entry.unwrap().path();
+            let bytes = stdfs::read(&path).unwrap();
+            let meta = fingerprint(&stdfs::metadata(&path).unwrap());
+            (path, bytes, meta)
+        })
+        .collect();
+    for _ in 0..2 {
+        let mut s = KeyDirectory::open(&source.0).unwrap();
+        let mut b = KeyDirectory::open(&backup.0).unwrap();
+        assert_eq!(
+            s.verify_preserved_recovery_file(&residue, &p, &mut b, "saved", &public)
+                .unwrap(),
+            public
+        );
+        e(KeyDirectory::open(&source.0), KeyFileError::Busy);
+        e(KeyDirectory::open(&backup.0), KeyFileError::Busy);
+        e(s.create("later", &p), KeyFileError::PendingRecovery);
+        e(b.create("later", &p), KeyFileError::PendingRecovery);
+        assert_eq!(s.load("publisher", &p).unwrap().public_key(), public);
+        assert!(s.recovery_inventory().unwrap().has_residues());
+        assert!(b.recovery_inventory().unwrap().has_residues());
+    }
+    for (path, bytes, meta) in snapshot {
+        assert_eq!(stdfs::read(&path).unwrap(), bytes);
+        assert_eq!(fingerprint(&stdfs::metadata(path).unwrap()), meta);
+    }
+    assert!(!source.0.join("later").exists());
+    assert!(!backup.0.join("later").exists());
+}
+
+#[test]
+fn preserved_recheck_rejects_same_key_reencryption_wrong_identity_and_authentication() {
+    let source = Area::new();
+    let backup = Area::new();
+    let (bytes, p) = fixture();
+    let key = unlock(&bytes, &p).unwrap();
+    let public = key.public_key();
+    // 公開fixtureのseedだけ。同じ鍵/パスフレーズでも別salt/nonceなら同一保全ではない。
+    let other = super::super::encrypt_with(&key, &p, [0x42; 16], [0x24; 12]).unwrap();
+    assert_ne!(bytes, other);
+    assert_eq!(unlock(&other, &p).unwrap().public_key(), public);
+    let residue = residue_name(1);
+    source.put(&residue, &bytes);
+    source.put("publisher", &bytes);
+    backup.put("changed", &other);
+    backup.put("exact", &bytes);
+    let mut s = KeyDirectory::open(&source.0).unwrap();
+    let mut b = KeyDirectory::open(&backup.0).unwrap();
+    e(
+        s.verify_preserved_recovery_file(&residue, &p, &mut b, "changed", &public),
+        KeyFileError::PreservationMismatch,
+    );
+    e(
+        s.verify_preserved_recovery_file(&residue, &p, &mut b, "exact", &[0; 32]),
+        KeyFileError::UnexpectedPublicKey,
+    );
+    e(
+        s.verify_preserved_recovery_file(
+            &residue,
+            "public wrong password",
+            &mut b,
+            "exact",
+            &public,
+        ),
+        KeyError::AuthenticationFailed.into(),
+    );
+    assert_eq!(stdfs::read(source.0.join(&residue)).unwrap(), bytes);
+    assert_eq!(stdfs::read(source.0.join("publisher")).unwrap(), bytes);
+    assert_eq!(stdfs::read(backup.0.join("changed")).unwrap(), other);
+    assert_eq!(stdfs::read(backup.0.join("exact")).unwrap(), bytes);
+    assert_eq!(
+        KeyFileError::PreservationMismatch.to_string(),
+        "key_preservation_mismatch"
+    );
+}
+
+#[test]
+fn preserved_recheck_rejects_unsafe_names_missing_files_and_unsafe_backup_without_writing() {
+    let source = Area::new();
+    let backup = Area::new();
+    let (bytes, p) = fixture();
+    let public = unlock(&bytes, &p).unwrap().public_key();
+    let residue = residue_name(1);
+    source.put(&residue, &bytes);
+    backup.put("exact", &bytes);
+    symlink("exact", backup.0.join("symlink")).unwrap();
+    backup.put("hard", &bytes);
+    stdfs::hard_link(backup.0.join("hard"), backup.0.join("alias")).unwrap();
+    backup.put("wide", &bytes);
+    stdfs::set_permissions(backup.0.join("wide"), stdfs::Permissions::from_mode(0o644)).unwrap();
+    backup.put("large", &vec![0; MAX_KEYFILE_BYTES + 1]);
+    let mut s = KeyDirectory::open(&source.0).unwrap();
+    let mut b = KeyDirectory::open(&backup.0).unwrap();
+    for (r, n) in [
+        ("publisher", "exact"),
+        (&residue, "../escape"),
+        (&residue, ".lngnb-key-reserved"),
+    ] {
+        e(
+            s.verify_preserved_recovery_file(r, &p, &mut b, n, &public),
+            KeyFileError::UnsafePath,
+        );
+    }
+    e(
+        s.verify_preserved_recovery_file(&residue_name(2), &p, &mut b, "exact", &public),
+        KeyFileError::Missing,
+    );
+    e(
+        s.verify_preserved_recovery_file(&residue, &p, &mut b, "absent", &public),
+        KeyFileError::Missing,
+    );
+    for n in ["symlink", "hard", "wide"] {
+        e(
+            s.verify_preserved_recovery_file(&residue, &p, &mut b, n, &public),
+            KeyFileError::UnsafePath,
+        );
+    }
+    e(
+        s.verify_preserved_recovery_file(&residue, &p, &mut b, "large", &public),
+        KeyError::InvalidFormat.into(),
+    );
+    source.put(&residue_name(3), b"public incomplete ciphertext");
+    e(
+        s.verify_preserved_recovery_file(&residue_name(3), &p, &mut b, "exact", &public),
+        KeyError::InvalidFormat.into(),
+    );
+    assert_eq!(stdfs::read(source.0.join(&residue)).unwrap(), bytes);
+    assert_eq!(stdfs::read(backup.0.join("exact")).unwrap(), bytes);
+    assert!(
+        stdfs::symlink_metadata(backup.0.join("symlink"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(stdfs::metadata(backup.0.join("hard")).unwrap().nlink(), 2);
+    assert_eq!(
+        stdfs::metadata(backup.0.join("wide")).unwrap().mode() & 0o7777,
+        0o644
+    );
+}
+
+#[test]
+fn preserved_recheck_changes_or_injected_failure_never_restore_or_certify_the_copy() {
+    let (bytes, p) = fixture();
+    let public = unlock(&bytes, &p).unwrap().public_key();
+    for phase in 0..4 {
+        let source = Area::new();
+        let backup = Area::new();
+        let residue = residue_name(1);
+        source.put(&residue, &bytes);
+        backup.put("saved", &bytes);
+        let mut s = KeyDirectory::open(&source.0).unwrap();
+        let mut b = KeyDirectory::open(&backup.0).unwrap();
+        let expected = if phase == 3 {
+            KeyFileError::Io
+        } else {
+            KeyFileError::RecoveryChanged
+        };
+        e(
+            s.verify_preserved_recovery_file_with(
+                &residue,
+                &p,
+                &mut b,
+                "saved",
+                &public,
+                &mut || {
+                    match phase {
+                        0 => {
+                            stdfs::write(source.0.join(&residue), b"public changed source").unwrap()
+                        }
+                        1 => {
+                            stdfs::write(backup.0.join("saved"), b"public changed backup").unwrap()
+                        }
+                        2 => stdfs::remove_file(backup.0.join("saved")).unwrap(),
+                        _ => return Err(KeyFileError::Io),
+                    }
+                    Ok(())
+                },
+            ),
+            expected,
+        );
+        if phase == 0 {
+            assert_eq!(
+                stdfs::read(source.0.join(&residue)).unwrap(),
+                b"public changed source"
+            );
+        } else {
+            assert_eq!(stdfs::read(source.0.join(&residue)).unwrap(), bytes);
+        }
+        match phase {
+            1 => assert_eq!(
+                stdfs::read(backup.0.join("saved")).unwrap(),
+                b"public changed backup"
+            ),
+            2 => assert!(!backup.0.join("saved").exists()),
+            _ => assert_eq!(stdfs::read(backup.0.join("saved")).unwrap(), bytes),
+        }
+        e(s.create("later", &p), KeyFileError::PendingRecovery);
+    }
+}
+
+#[test]
+fn preserved_recheck_uses_both_directory_fds_after_rename_without_touching_replacements() {
+    let area = Area::new();
+    let (bytes, p) = fixture();
+    let public = unlock(&bytes, &p).unwrap().public_key();
+    let residue = residue_name(1);
+    for n in ["source", "backup"] {
+        stdfs::DirBuilder::new()
+            .mode(0o700)
+            .create(area.0.join(n))
+            .unwrap();
+    }
+    area.put(&format!("source/{residue}"), &bytes);
+    area.put("backup/saved", &bytes);
+    let mut s = KeyDirectory::open(&area.0.join("source")).unwrap();
+    let mut b = KeyDirectory::open(&area.0.join("backup")).unwrap();
+    for n in ["source", "backup"] {
+        stdfs::rename(area.0.join(n), area.0.join(format!("{n}-old"))).unwrap();
+        stdfs::DirBuilder::new()
+            .mode(0o700)
+            .create(area.0.join(n))
+            .unwrap();
+    }
+    area.put(&format!("source/{residue}"), b"public other source");
+    area.put("backup/saved", b"public other backup");
+    assert_eq!(
+        s.verify_preserved_recovery_file(&residue, &p, &mut b, "saved", &public)
+            .unwrap(),
+        public
+    );
+    assert_eq!(
+        stdfs::read(area.0.join(format!("source/{residue}"))).unwrap(),
+        b"public other source"
+    );
+    assert_eq!(
+        stdfs::read(area.0.join("backup/saved")).unwrap(),
+        b"public other backup"
+    );
+    assert_eq!(
+        stdfs::read(area.0.join(format!("source-old/{residue}"))).unwrap(),
+        bytes
+    );
+    assert_eq!(stdfs::read(area.0.join("backup-old/saved")).unwrap(), bytes);
+    e(s.create("later", &p), KeyFileError::PendingRecovery);
+}
