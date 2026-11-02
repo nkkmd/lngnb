@@ -26,7 +26,7 @@ pub struct SocketPathMetadata {
     pub changed_nanoseconds: i64,
 }
 impl SocketPathMetadata {
-    fn from_metadata(m: &std::fs::Metadata) -> Self {
+    pub(super) fn from_metadata(m: &std::fs::Metadata) -> Self {
         let kind = if m.file_type().is_socket() {
             SocketPathKind::Socket
         } else if m.file_type().is_symlink() {
