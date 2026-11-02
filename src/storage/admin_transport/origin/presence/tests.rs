@@ -53,7 +53,7 @@ fn contract_matches_independent_python_uapi_and_rejects_malformed_responses() {
     // 独立Pythonのstruct形式で要求とfixture応答を構築/解釈する。
     let python = std::env::var_os("LNGNB_REFERENCE_PYTHON").unwrap_or("python3".into());
     let output = std::process::Command::new(python).arg("-c").arg(
-        "import struct,sys,json; from pathlib import Path; sys.path.insert(0,str(Path(sys.argv[1])/'tests')); import socket_identity_reference as r; x=json.loads(sys.argv[2]); s=bytes(x['sent']); g=bytes(x['good']); assert s==r.request(7,9,1); assert r.decode(g,0,(0,0),19,s,7,9)==(10,(13,17)); print('query_contract_passed')"
+        "import sys,json; sys.dont_write_bytecode=True; from pathlib import Path; sys.path.insert(0,str(Path(sys.argv[1])/'tests')); import socket_identity_reference as r; x=json.loads(sys.argv[2]); s=bytes(x['sent']); g=bytes(x['good']); assert s==r.request(7,9,1); assert r.decode(g,0,(0,0),19,s,7,9)==(10,(13,17)); print('query_contract_passed')"
     ).arg(env!("CARGO_MANIFEST_DIR"))
         .arg(serde_json::json!({"sent":sent.as_slice(), "good":good}).to_string())
         .output().unwrap();
