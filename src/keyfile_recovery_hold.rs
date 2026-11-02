@@ -23,7 +23,136 @@ pub(super) enum HoldStage {
     DirectorySynced,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum InitialRecoveryStage {
+    MarkerFileSynced,
+    MarkerDirectorySynced,
+    GuardCreated,
+    GuardWritten,
+    GuardFileSynced,
+    GuardDirectorySynced,
+}
+
 impl KeyDirectory {
+    fn checked_hold_handle(&self, n: &str, bytes: &[u8]) -> Result<(File, std::fs::Metadata)> {
+        let fd = os(fs::openat(
+            &self.dir,
+            n,
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ))?;
+        let file = File::from(fd);
+        let m = io(file.metadata())?;
+        self.recheck_hold_handle(n, bytes, &file, &m)?;
+        Ok((file, m))
+    }
+
+    fn recheck_hold_handle(
+        &self,
+        n: &str,
+        bytes: &[u8],
+        file: &File,
+        before: &std::fs::Metadata,
+    ) -> Result<()> {
+        self.secure()?;
+        let current = io(file.metadata())?;
+        private_file(&current, rustix::process::geteuid().as_raw())?;
+        let path = os(fs::statat(&self.dir, n, AtFlags::SYMLINK_NOFOLLOW))?;
+        if fingerprint(&current) != fingerprint(before)
+            || path.st_dev != current.dev()
+            || path.st_ino != current.ino()
+            || self.read(n)? != bytes
+        {
+            return Err(KeyFileError::RecoveryChanged);
+        }
+        Ok(())
+    }
+
+    /// 完全markerと期待area_idを確認し、初期停止だけを明示復旧する。
+    /// 不在guardだけを新規作成し、既存guardは完全一致を必須とする。
+    /// 過去の初期化成功を推定せず、今回のfsyncを行う。解除/鍵整理はしない。
+    pub fn recover_initial_hold(&mut self, expected_area_id: &[u8; 32]) -> Result<KeyRecoveryHold> {
+        self.recover_initial_hold_with(expected_area_id, &mut |_| Ok(()))
+    }
+
+    pub(super) fn recover_initial_hold_with(
+        &mut self,
+        expected_area_id: &[u8; 32],
+        hook: &mut impl FnMut(InitialRecoveryStage) -> Result<()>,
+    ) -> Result<KeyRecoveryHold> {
+        let marker = self.read(MARKER)?;
+        let area_id = self.marker_area_id(&marker)?;
+        if &area_id != expected_area_id {
+            return Err(KeyFileError::RecoveryStateInvalid);
+        }
+        let mut guard = GUARD_MAGIC.to_vec();
+        guard.extend_from_slice(&area_id);
+        let existing = match self.read(GUARD) {
+            Ok(bytes) if bytes == guard => Some(self.checked_hold_handle(GUARD, &guard)?),
+            Ok(_) => return Err(KeyFileError::RecoveryStateInvalid),
+            Err(KeyFileError::Missing) => None,
+            Err(e) => return Err(e),
+        };
+        let (marker_file, marker_meta) = self.checked_hold_handle(MARKER, &marker)?;
+        // ここから現在の保存確認を開始。失敗時も全fileを保持する。
+        let recovered = (|| -> Result<KeyRecoveryHold> {
+            io(marker_file.sync_all())?;
+            hook(InitialRecoveryStage::MarkerFileSynced)?;
+            self.recheck_hold_handle(MARKER, &marker, &marker_file, &marker_meta)?;
+            io(self.dir.sync_all())?;
+            hook(InitialRecoveryStage::MarkerDirectorySynced)?;
+            self.recheck_hold_handle(MARKER, &marker, &marker_file, &marker_meta)?;
+            let (guard_file, guard_meta) = match existing {
+                Some(pair) => pair,
+                None => {
+                    let fd = os(fs::openat(
+                        &self.dir,
+                        GUARD,
+                        OFlags::RDWR
+                            | OFlags::CREATE
+                            | OFlags::EXCL
+                            | OFlags::NOFOLLOW
+                            | OFlags::CLOEXEC,
+                        Mode::RUSR | Mode::WUSR,
+                    ))?;
+                    let mut file = File::from(fd);
+                    os(fs::fchmod(&file, Mode::RUSR | Mode::WUSR))?;
+                    hook(InitialRecoveryStage::GuardCreated)?;
+                    io(file.write_all(&guard))?;
+                    hook(InitialRecoveryStage::GuardWritten)?;
+                    let meta = io(file.metadata())?;
+                    (file, meta)
+                }
+            };
+            self.recheck_hold_handle(GUARD, &guard, &guard_file, &guard_meta)?;
+            io(guard_file.sync_all())?;
+            hook(InitialRecoveryStage::GuardFileSynced)?;
+            self.recheck_hold_handle(GUARD, &guard, &guard_file, &guard_meta)?;
+            io(self.dir.sync_all())?;
+            hook(InitialRecoveryStage::GuardDirectorySynced)?;
+            self.recheck_hold_handle(MARKER, &marker, &marker_file, &marker_meta)?;
+            self.recheck_hold_handle(GUARD, &guard, &guard_file, &guard_meta)?;
+            Ok(KeyRecoveryHold::Held { area_id })
+        })();
+        recovered.map_err(|_| KeyFileError::RecoveryHoldUncertain)
+    }
+
+    fn marker_area_id(&self, marker: &[u8]) -> Result<[u8; 32]> {
+        let m = io(self.dir.metadata())?;
+        let mut suffix = Vec::new();
+        suffix.extend_from_slice(&m.dev().to_be_bytes());
+        suffix.extend_from_slice(&m.ino().to_be_bytes());
+        suffix.extend_from_slice(&m.uid().to_be_bytes());
+        if marker.len() != MARKER_MAGIC.len() + 32 + suffix.len()
+            || !marker.starts_with(MARKER_MAGIC)
+            || marker[MARKER_MAGIC.len() + 32..] != suffix
+        {
+            return Err(KeyFileError::RecoveryStateInvalid);
+        }
+        marker[MARKER_MAGIC.len()..MARKER_MAGIC.len() + 32]
+            .try_into()
+            .map_err(|_| KeyFileError::RecoveryStateInvalid)
+    }
     /// 同じ排他/fdの下で二名を読むだけ。open/診断では状態を作成・補完しない。
     pub fn recovery_hold_status(&mut self) -> Result<KeyRecoveryHold> {
         let read = |n| match self.read(n) {
@@ -40,20 +169,7 @@ impl KeyDirectory {
         match (marker, guard) {
             (None, None) => Ok(KeyRecoveryHold::NotInitialized),
             (Some(marker), Some(guard)) => {
-                let m = io(self.dir.metadata())?;
-                let mut suffix = Vec::new();
-                suffix.extend_from_slice(&m.dev().to_be_bytes());
-                suffix.extend_from_slice(&m.ino().to_be_bytes());
-                suffix.extend_from_slice(&m.uid().to_be_bytes());
-                if marker.len() != MARKER_MAGIC.len() + 32 + suffix.len()
-                    || !marker.starts_with(MARKER_MAGIC)
-                    || marker[MARKER_MAGIC.len() + 32..] != suffix
-                {
-                    return Err(KeyFileError::RecoveryStateInvalid);
-                }
-                let area_id: [u8; 32] = marker[MARKER_MAGIC.len()..MARKER_MAGIC.len() + 32]
-                    .try_into()
-                    .map_err(|_| KeyFileError::RecoveryStateInvalid)?;
+                let area_id = self.marker_area_id(&marker)?;
                 let mut expected = GUARD_MAGIC.to_vec();
                 expected.extend_from_slice(&area_id);
                 if guard != expected {
