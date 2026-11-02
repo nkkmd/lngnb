@@ -29,6 +29,8 @@ pub enum KeyFileError {
     RestorationReviewRequired,
     /// 呼出し元が明示した公開鍵と認証復号した鍵が一致しない。
     UnexpectedPublicKey,
+    /// 認証した残存暗号文と、指定保全先の現在の完全bytesが一致しない。
+    PreservationMismatch,
     /// 交換/配置済みだがdirectory fsync成功を確認できない。成功/rollbackを断定しない。
     CommitUncertain,
     /// 新鍵の永続化確認済み。旧暗号文の整理だけが未完了/不確実。
@@ -54,6 +56,7 @@ impl std::fmt::Display for KeyFileError {
             Self::PreservationReviewRequired => "key_preservation_committed_review_required",
             Self::RestorationReviewRequired => "key_restoration_committed_review_required",
             Self::UnexpectedPublicKey => "key_unexpected_public_key",
+            Self::PreservationMismatch => "key_preservation_mismatch",
             Self::CommitUncertain => "key_commit_uncertain",
             Self::CleanupUncertain => "key_committed_cleanup_uncertain",
             Self::Key(e) => return e.fmt(f),
@@ -347,6 +350,62 @@ impl KeyDirectory {
         }
         Ok(public)
     }
+    /// 指定した残存暗号文と保全先通常名の、現在の完全bytesと期待公開鍵を再照合。
+    /// 両領域の排他/fd固定・既存の読取り/認証上限を共有し、書換え/fsyncを行わない。
+    /// 永続化確認・削除/停止解除/置換資格や、過去の新旧/更新結果の証明ではない。
+    pub fn verify_preserved_recovery_file(
+        &mut self,
+        residue: &str,
+        passphrase: &str,
+        backup: &mut KeyDirectory,
+        backup_name: &str,
+        expected_public_key: &[u8; 32],
+    ) -> Result<[u8; 32]> {
+        self.verify_preserved_recovery_file_with(
+            residue,
+            passphrase,
+            backup,
+            backup_name,
+            expected_public_key,
+            &mut || Ok(()),
+        )
+    }
+    fn verify_preserved_recovery_file_with(
+        &mut self,
+        residue: &str,
+        passphrase: &str,
+        backup: &mut KeyDirectory,
+        backup_name: &str,
+        expected_public_key: &[u8; 32],
+        hook: &mut impl FnMut() -> Result<()>,
+    ) -> Result<[u8; 32]> {
+        if !recovery_name(residue) {
+            return Err(KeyFileError::UnsafePath);
+        }
+        name(backup_name)?;
+        let input = self.read(residue)?;
+        let public = unlock(&input, passphrase)?.public_key();
+        if &public != expected_public_key {
+            return Err(KeyFileError::UnexpectedPublicKey);
+        }
+        if backup.read(backup_name)? != input {
+            return Err(KeyFileError::PreservationMismatch);
+        }
+        hook()?;
+        if self
+            .read(residue)
+            .map_err(|_| KeyFileError::RecoveryChanged)?
+            != input
+            || backup
+                .read(backup_name)
+                .map_err(|_| KeyFileError::RecoveryChanged)?
+                != input
+        {
+            return Err(KeyFileError::RecoveryChanged);
+        }
+        Ok(public)
+    }
+
     /// 選択した残存暗号文を、同じ領域の存在しない通常名へ明示復元する。
     /// 認証した公開鍵と呼出し元が別途指定した期待公開鍵の一致を必須とする。
     /// 元名/新旧/過去の更新結果は推測しない。全残存物を保持し、PendingRecoveryも解除しない。
