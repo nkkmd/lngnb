@@ -88,11 +88,17 @@ impl Context {
             .read_to_end(&mut bytes)
             .map_err(|_| SocketOriginError::Unavailable)?;
         let boot = boot_id(&bytes)?;
-        let namespace = File::open("/proc/thread-self/ns/net")
+        let namespace =
+            File::open("/proc/thread-self/ns/net").map_err(|_| SocketOriginError::Unavailable)?;
+        let meta = namespace
+            .metadata()
             .map_err(|_| SocketOriginError::Unavailable)?;
-        let meta = namespace.metadata().map_err(|_| SocketOriginError::Unavailable)?;
         Ok(Self {
-            identity: ContextIdentity { boot, device: meta.dev(), inode: meta.ino() },
+            identity: ContextIdentity {
+                boot,
+                device: meta.dev(),
+                inode: meta.ino(),
+            },
             namespace,
         })
     }
@@ -120,7 +126,11 @@ impl Listener {
         timeout: Duration,
         elapsed: Duration,
     ) -> OriginResult<(Self, SocketOrigin)> {
-        Self::bind_origin_inner(|| Self::bind(store, max_frame, timeout), elapsed, |_| Ok(()))
+        Self::bind_origin_inner(
+            || Self::bind(store, max_frame, timeout),
+            elapsed,
+            |_| Ok(()),
+        )
     }
     /// 明示起動検査済みwriterの既存資格を引き継ぐ。根拠取得は保存/finishではない。
     pub fn bind_writer_with_origin(
@@ -129,26 +139,40 @@ impl Listener {
         timeout: Duration,
         elapsed: Duration,
     ) -> OriginResult<(Self, SocketOrigin)> {
-        Self::bind_origin_inner(|| Self::bind_writer(writer, max_frame, timeout), elapsed, |_| Ok(()))
+        Self::bind_origin_inner(
+            || Self::bind_writer(writer, max_frame, timeout),
+            elapsed,
+            |_| Ok(()),
+        )
     }
     fn bind_origin_inner(
         bind: impl FnOnce() -> Result<Self>,
         elapsed: Duration,
         after_bind: impl FnOnce(&Self) -> OriginResult<()>,
     ) -> OriginResult<(Self, SocketOrigin)> {
-        let budget = Budget { start: Instant::now(), elapsed };
+        let budget = Budget {
+            start: Instant::now(),
+            elapsed,
+        };
         budget.check()?;
         let context = Context::read()?;
         budget.check()?;
         let listener = bind().map_err(SocketOriginError::Bind)?;
         after_bind(&listener)?;
         let identity = listener.observe_origin(&context.identity, &budget, || Ok(()))?;
-        let origin = SocketOrigin { identity, namespace: context.namespace };
+        let origin = SocketOrigin {
+            identity,
+            namespace: context.namespace,
+        };
         Ok((listener, origin))
     }
     /// 現在保持する主受付fd/領域/path/contextと、取得済み根拠の一致だけを確認。
     /// 不使用診断・永続作成来歴・再開/整理資格へ変換せず、他のendpointは検査しない。
-    pub fn verify_socket_origin(&self, origin: &SocketOrigin, elapsed: Duration) -> OriginResult<()> {
+    pub fn verify_socket_origin(
+        &self,
+        origin: &SocketOrigin,
+        elapsed: Duration,
+    ) -> OriginResult<()> {
         self.verify_origin_inner(origin, elapsed, || Ok(()))
     }
     fn verify_origin_inner(
@@ -157,16 +181,23 @@ impl Listener {
         elapsed: Duration,
         between: impl FnOnce() -> OriginResult<()>,
     ) -> OriginResult<()> {
-        let budget = Budget { start: Instant::now(), elapsed };
+        let budget = Budget {
+            start: Instant::now(),
+            elapsed,
+        };
         budget.check()?;
-        let ns = origin.namespace.metadata().map_err(|_| SocketOriginError::Unavailable)?;
+        let ns = origin
+            .namespace
+            .metadata()
+            .map_err(|_| SocketOriginError::Unavailable)?;
         let expected = ContextIdentity {
             boot: origin.identity.boot_id.clone(),
             device: ns.dev(),
             inode: ns.ino(),
         };
         if expected.device != origin.identity.namespace_device
-            || expected.inode != origin.identity.namespace_inode {
+            || expected.inode != origin.identity.namespace_inode
+        {
             return Err(SocketOriginError::Mismatch);
         }
         let current = self.observe_origin(&expected, &budget, between)?;
@@ -188,15 +219,20 @@ impl Listener {
                 return Err(SocketOriginError::Mismatch);
             }
             budget.check()?;
-            self.check_endpoint().map_err(|_| SocketOriginError::Mismatch)?;
+            self.check_endpoint()
+                .map_err(|_| SocketOriginError::Mismatch)?;
             let directory = std::fs::metadata(anchored(&self.access.store().dir, "."))
                 .map_err(|_| SocketOriginError::Unavailable)?;
             let path = SocketPathMetadata::from_metadata(
                 &std::fs::symlink_metadata(anchored(&self.access.store().dir, NAME))
-                    .map_err(|_| SocketOriginError::Mismatch)?);
-            if path.kind != SocketPathKind::Socket || path.mode != 0o600
-                || path.owner_uid != self.owner || path.links != 1
-                || (path.device, path.inode) != self.identity {
+                    .map_err(|_| SocketOriginError::Mismatch)?,
+            );
+            if path.kind != SocketPathKind::Socket
+                || path.mode != 0o600
+                || path.owner_uid != self.owner
+                || path.links != 1
+                || (path.device, path.inode) != self.identity
+            {
                 return Err(SocketOriginError::Mismatch);
             }
             budget.check()?;
