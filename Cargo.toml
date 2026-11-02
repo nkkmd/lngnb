@@ -20,6 +20,7 @@ zeroize = "=1.9.1"
 
 rusqlite = { version = "=0.32.1", features = ["bundled", "hooks"] }
 rustix = { version = "=0.38.44", features = ["fs", "process", "termios", "event", "net"] }
+nix = { version = "=0.31.3", default-features = false, features = ["socket", "uio"] }
 signal-hook = { version = "=0.3.18", default-features = false }
 
 [dev-dependencies]

@@ -363,4 +363,4 @@ lngnbに登録・保存・配布する資料の権利や利用条件は、資料
 
 保持中socketの個別inode/cookie照会方式は、[実装計画書§5.88](docs/implementation-plan.md#588-工程⑤inodecookieによる保持socket照会の非破壊方式検証)の試験専用probeで検証します。製品の診断/整理操作ではなく、作成元の永続来歴や削除資格はまだ提供しません。
 
-明示した新規主socketに限る、非永続の作成根拠取得/現在照合の内部APIを追加しています（[計画書§5.89](docs/implementation-plan.md#589-工程⑤明示した新規主socketの非永続作成根拠と現在照合)）。製品CLI・補助3socketの追跡・永続来歴・不使用診断・削除資格には未接続です。
+明示した新規主socketに限る、非永続の作成根拠取得/現在照合の内部APIを追加しています（[計画書§5.89](docs/implementation-plan.md#589-工程⑤明示した新規主socketの非永続作成根拠と現在照合)）。同じ根拠/context/pathに束縛した期限付きkernel個別照会も内部APIへ接続しています（[計画書§5.90](docs/implementation-plan.md#590-工程⑤非永続根拠に束縛した期限付きkernel個別照会)）。製品CLI・補助3socketの追跡・永続来歴・削除資格には未接続です。ENOENTは対象不在と診断機能未提供を区別できないため取得不能として拒否し、不在の成功値や整理許可を返しません。

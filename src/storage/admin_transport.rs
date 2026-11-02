@@ -34,7 +34,7 @@ pub use evaluation::Snapshot as EvaluationStatus;
 pub use inventory::{
     AdminSocketPathEntry, AdminSocketPathInventory, SocketPathKind, SocketPathMetadata,
 };
-pub use origin::{SocketOrigin, SocketOriginError, SocketOriginIdentity};
+pub use origin::{SocketOrigin, SocketOriginError, SocketOriginIdentity, SocketPresence};
 pub use status::Snapshot as RuntimeStatus;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -13,7 +13,7 @@ use std::{
 };
 const ELAPSED: Duration = Duration::from_secs(60);
 
-fn independent(origin: &SocketOrigin, t: &Temp, listener: Option<&Listener>) {
+pub(super) fn independent(origin: &SocketOrigin, t: &Temp, listener: Option<&Listener>) {
     let i = origin.identity();
     let p = i.path;
     let expected = serde_json::json!({
