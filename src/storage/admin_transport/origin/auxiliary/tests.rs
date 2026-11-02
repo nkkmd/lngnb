@@ -104,12 +104,12 @@ fn four_tracked_names_match_independent_kernel_and_keep_explicit_close_finish() 
 
 #[test]
 fn only_held_auxiliary_is_present_after_listener_drop_without_extending_fd_lifetime() {
-    for selected in 1..4 {
+    for (selected, name) in NAMES.into_iter().enumerate().skip(1) {
         let t = Temp::new();
         let (listener, origins) = all(&t);
         let before = logical_snapshot(&listener.access.store().conn);
         let held = listener
-            .origin_socket(NAMES[selected])
+            .origin_socket(name)
             .unwrap()
             .0
             .try_clone()
