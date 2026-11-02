@@ -139,6 +139,29 @@ mod tests {
     };
     const ELAPSED: Duration = Duration::from_secs(60);
     #[test]
+    fn kernel_identity_probe_is_independent_of_path_inventory_and_preserves_store() {
+        let t = Temp::new();
+        drop(t.store().begin().unwrap());
+        let store = RecordStore::open(&t.data(), Limits::default()).unwrap();
+        let before = logical_snapshot(&store.conn);
+        let inventory = store.admin_socket_inventory(ELAPSED).unwrap();
+        let python = std::env::var_os("LNGNB_REFERENCE_PYTHON").unwrap_or("python3".into());
+        let output = std::process::Command::new(python)
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/socket_identity_reference.py"
+            ))
+            .arg(&t.root)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output);
+        assert_eq!(output.stdout, b"socket_identity_probe_passed\n");
+        assert_eq!(store.admin_socket_inventory(ELAPSED).unwrap(), inventory);
+        assert_eq!(logical_snapshot(&store.conn), before);
+        assert_eq!(store.startup_state().unwrap(), StartupState::NeedsReview);
+        assert!(RecordStore::open(&t.data(), Limits::default()).is_err());
+    }
+    #[test]
     fn released_store_lock_does_not_prove_listener_descriptors_are_closed() {
         let t = Temp::new();
         drop(t.store().begin().unwrap());
