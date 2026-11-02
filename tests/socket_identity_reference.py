@@ -6,6 +6,7 @@ include/uapi/linux/unix_diag.h, include/uapi/asm-generic/socket.h。
 namespaceの変更・全socket列挙・要求先socketへの接続・削除は行わない。
 """
 import errno
+import json
 import os
 import platform
 import select
@@ -219,9 +220,47 @@ def probe(root):
     print("socket_identity_probe_passed")
 
 
+def check_origin(expected, closed):
+    # Rustが明示的に新規bindしたfd/根拠を、別のsyscall経路で照合する。
+    require(platform.system() == "Linux" and platform.machine() == "x86_64")
+    with open("/proc/sys/kernel/random/boot_id", "rb") as boot:
+        require(boot.read(38) == expected["boot_id"].encode("ascii") + b"\n")
+    ns = os.stat("/proc/thread-self/ns/net")
+    require([ns.st_dev, ns.st_ino] == expected["namespace"])
+    directory = os.stat(expected["directory_path"])
+    require([directory.st_dev, directory.st_ino, directory.st_uid] == expected["directory"])
+    require(expected["name"] == "admin.sock")
+    m = os.stat(os.path.join(expected["directory_path"], expected["name"]),
+                follow_symlinks=False)
+    require([m.st_dev, m.st_ino, m.st_uid, m.st_gid, m.st_mode & 0o7777,
+             m.st_nlink, m.st_size, m.st_mtime_ns // 1000000000,
+             m.st_mtime_ns % 1000000000, m.st_ctime_ns // 1000000000,
+             m.st_ctime_ns % 1000000000] == expected["path"])
+    inode, identity = expected["socket_inode"], expected["socket_cookie"]
+    with socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, 4) as diag:
+        diag.settimeout(10)
+        diag.bind((0, 0))
+        diag.connect((0, 0))
+        namespace = cookie(diag, SO_NETNS_COOKIE)
+        if closed:
+            require(query(diag, inode, identity, 1, namespace) == (-errno.ENOENT, None))
+        else:
+            with socket.socket(fileno=os.dup(0)) as original:
+                require(os.fstat(original.fileno()).st_dev == expected["socket_device"])
+                require(os.fstat(original.fileno()).st_ino == inode)
+                require(cookie(original, SO_COOKIE) == identity)
+                require(cookie(original, SO_NETNS_COOKIE) == namespace)
+                require(query(diag, inode, identity, 1, namespace)[0] == 10)
+                require(select.select([original], [], [], 0)[0] == [])
+    print("socket_origin_reference_passed")
+
+
 if __name__ == "__main__":
     if len(sys.argv) == 3 and sys.argv[1] == "--hold":
         hold(int(sys.argv[2]))
+    elif len(sys.argv) == 3 and sys.argv[1] in ("--check-origin", "--check-closed-origin"):
+        parser_checks()
+        check_origin(json.loads(sys.argv[2]), sys.argv[1] == "--check-closed-origin")
     else:
         parser_checks()
         if sys.argv[1:] == ["--parser-only"]:

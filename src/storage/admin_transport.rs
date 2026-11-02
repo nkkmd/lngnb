@@ -27,12 +27,14 @@ pub mod client;
 mod configuration;
 mod evaluation;
 mod inventory;
+mod origin;
 mod status;
 pub use configuration::ConfigError;
 pub use evaluation::Snapshot as EvaluationStatus;
 pub use inventory::{
     AdminSocketPathEntry, AdminSocketPathInventory, SocketPathKind, SocketPathMetadata,
 };
+pub use origin::{SocketOrigin, SocketOriginError, SocketOriginIdentity};
 pub use status::Snapshot as RuntimeStatus;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
