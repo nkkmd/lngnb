@@ -1,12 +1,15 @@
 //! 明示した新規bindに限る、非永続の作成時根拠。削除/不使用の資格ではない。
 use super::*;
 use std::fs::File;
+mod presence;
+pub use presence::SocketPresence;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SocketOriginError {
     BudgetExceeded,
     Unavailable,
     Mismatch,
+    InvalidResponse,
     Bind(Error),
 }
 impl fmt::Display for SocketOriginError {
@@ -15,6 +18,7 @@ impl fmt::Display for SocketOriginError {
             Self::BudgetExceeded => "admin_socket_origin_budget_exceeded",
             Self::Unavailable => "admin_socket_origin_unavailable",
             Self::Mismatch => "admin_socket_origin_mismatch",
+            Self::InvalidResponse => "admin_socket_origin_invalid_response",
             Self::Bind(_) => "admin_socket_origin_bind_failed",
         })
     }
