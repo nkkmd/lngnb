@@ -16,7 +16,7 @@ pub(in super::super) enum CleanupRecoveryStage {
     OldSnapshotRemoved,
     CleanupSynced,
 }
-fn field<'a>(v: &'a Value, key: &str) -> Result<&'a Value> {
+pub(super) fn field<'a>(v: &'a Value, key: &str) -> Result<&'a Value> {
     if let Value::Map(m) = v {
         if let Some((_, value)) = m.iter().find(|(k, _)| k == key) {
             return Ok(value);
@@ -24,11 +24,11 @@ fn field<'a>(v: &'a Value, key: &str) -> Result<&'a Value> {
     }
     invalid()
 }
-fn equal(a: &Value, b: &Value) -> Result<bool> {
+pub(super) fn equal(a: &Value, b: &Value) -> Result<bool> {
     let encode = |v: &Value| cbor::encode(v).map_err(|_| KeyFileError::RecoveryStateInvalid);
     Ok(encode(a)? == encode(b)?)
 }
-fn absent(dir: &KeyDirectory, name: &str) -> Result<()> {
+pub(super) fn absent(dir: &KeyDirectory, name: &str) -> Result<()> {
     match fs::statat(&dir.dir, name, AtFlags::SYMLINK_NOFOLLOW) {
         Err(rustix::io::Errno::NOENT) => Ok(()),
         _ => invalid(),
