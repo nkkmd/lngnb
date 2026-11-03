@@ -50,9 +50,9 @@ pub enum KeyFileError {
     RecoveryStateInvalid,
     /// 明示停止の作成開始後。保存確定/未保存を断定せず全fileを保持する。
     RecoveryHoldUncertain,
-    /// 履歴導入/追記開始後。保存確定/未保存を断定せず全fileを保持する。
+    /// 履歴導入/追記/その復旧開始後。保存確定/未保存を断定せず全fileを保持する。
     RecoveryStateUncertain,
-    /// 履歴導入/追記の保存確認後、一時名整理・最終照合等が未完了/不確実。
+    /// 履歴導入/追記/その復旧の保存確認後、一時名整理・最終照合等が未完了/不確実。
     RecoveryStateCleanupUncertain,
     /// 交換/配置済みだがdirectory fsync成功を確認できない。成功/rollbackを断定しない。
     CommitUncertain,

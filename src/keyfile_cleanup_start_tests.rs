@@ -763,3 +763,6 @@ fn cleanup_start_rechecks_changes_at_exchange_and_old_snapshot_cleanup_boundarie
         }
     }
 }
+
+#[path = "keyfile_cleanup_recovery_tests.rs"]
+mod recovery_tests;
