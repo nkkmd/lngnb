@@ -48,7 +48,13 @@ impl KeyDirectory {
         intent: &KeyCleanupStart,
     ) -> Result<KeyStateDiagnostic> {
         self.recover_residue_cleanup_start_with(
-            residue, passphrase, backup, backup_name, expected, intent, &mut |_| Ok(()),
+            residue,
+            passphrase,
+            backup,
+            backup_name,
+            expected,
+            intent,
+            &mut |_| Ok(()),
         )
     }
 
@@ -75,9 +81,10 @@ impl KeyDirectory {
             || intent.before.state != KeyHistoryState::Held
             || intent.after.initial != intent.before.initial
             || intent.before.generation.checked_add(1) != Some(intent.after.generation)
-            || intent.after.state != (KeyHistoryState::Active {
-                started_operation_id: intent.operation_id,
-            })
+            || intent.after.state
+                != (KeyHistoryState::Active {
+                    started_operation_id: intent.operation_id,
+                })
             || KeyDirectoryIdentity::from_metadata(&io(backup.dir.metadata())?)
                 != expected.preserved_directory
             || source_identity == expected.preserved_directory
@@ -117,7 +124,9 @@ impl KeyDirectory {
         let fixed_state = decode(&fixed.bytes)?;
         let needs_exchange = fixed_state == intent.before;
         let new_bytes = if needs_exchange {
-            let Some(t) = &temporary else { return invalid() };
+            let Some(t) = &temporary else {
+                return invalid();
+            };
             if decode(&t.bytes)? != intent.after {
                 return invalid();
             }
@@ -135,8 +144,11 @@ impl KeyDirectory {
         };
         // 全prefixの値とhashを検査するためだけに旧snapshotを再構成する。
         // このbytesを保存・欠損補完には決して使わない。
-        let mut prefix = cbor::decode(&new_bytes).map_err(|_| KeyFileError::RecoveryStateInvalid)?;
-        let Value::Map(m) = &mut prefix else { return invalid() };
+        let mut prefix =
+            cbor::decode(&new_bytes).map_err(|_| KeyFileError::RecoveryStateInvalid)?;
+        let Value::Map(m) = &mut prefix else {
+            return invalid();
+        };
         let Some((_, Value::Array(events))) = m.iter_mut().find(|(k, _)| k == "events") else {
             return invalid();
         };
@@ -163,43 +175,78 @@ impl KeyDirectory {
         }
         if field(&event, "kind")? != &text("residue_cleanup_started")
             || field(&event, "operation_id")? != &bytes(intent.operation_id)
-            || !equal(field(&event, "target")?, &map(vec![
-                ("name", text(residue)),
-                ("identity", expected.target.value()),
-                ("ciphertext_sha256", bytes(<[u8; 32]>::from(Sha256::digest(&target.bytes)))),
-                ("public_key", bytes(expected.public_key)),
-            ]))?
-            || !equal(field(&event, "preserved")?, &map(vec![
-                ("directory", expected.preserved_directory.value()),
-                ("name", text(backup_name)),
-                ("identity", expected.preserved.value()),
-            ]))?
+            || !equal(
+                field(&event, "target")?,
+                &map(vec![
+                    ("name", text(residue)),
+                    ("identity", expected.target.value()),
+                    (
+                        "ciphertext_sha256",
+                        bytes(<[u8; 32]>::from(Sha256::digest(&target.bytes))),
+                    ),
+                    ("public_key", bytes(expected.public_key)),
+                ]),
+            )?
+            || !equal(
+                field(&event, "preserved")?,
+                &map(vec![
+                    ("directory", expected.preserved_directory.value()),
+                    ("name", text(backup_name)),
+                    ("identity", expected.preserved.value()),
+                ]),
+            )?
         {
             return invalid();
         }
         let context = PreparedKeyCleanup {
-            source: self, backup, target_name: residue.into(), preserved_name: backup_name.into(),
-            expected: *expected, source_identity, target, preserved, marker, guard,
-            state: fixed, new_bytes, receipt: *intent,
+            source: self,
+            backup,
+            target_name: residue.into(),
+            preserved_name: backup_name.into(),
+            expected: *expected,
+            source_identity,
+            target,
+            preserved,
+            marker,
+            guard,
+            state: fixed,
+            new_bytes,
+            receipt: *intent,
         };
         let mut exchanged = false;
         let mut removed = temporary.is_none();
         let check = |exchanged: bool, removed: bool| -> Result<()> {
             context.recheck()?;
             context.source.only_cleanup_update(&temp)?;
-            let fixed_name = if exchanged { temp.as_str() } else { initial_state::STATE };
+            let fixed_name = if exchanged {
+                temp.as_str()
+            } else {
+                initial_state::STATE
+            };
             // 交換によるctime変更は許すが、fd/path/全bytes・private属性は再検査する。
             if !exchanged || !removed {
-                context.state.check(context.source, fixed_name, !exchanged)?;
+                context
+                    .state
+                    .check(context.source, fixed_name, !exchanged)?;
             }
             if let Some(t) = &temporary {
                 if !removed {
-                    t.check(context.source, if exchanged { initial_state::STATE } else { &temp }, !exchanged)?;
+                    t.check(
+                        context.source,
+                        if exchanged {
+                            initial_state::STATE
+                        } else {
+                            &temp
+                        },
+                        !exchanged,
+                    )?;
                 } else if exchanged {
                     t.check(context.source, initial_state::STATE, false)?;
                 }
             }
-            if removed { absent(context.source, &temp)?; }
+            if removed {
+                absent(context.source, &temp)?;
+            }
             Ok(())
         };
         check(exchanged, removed)?;
@@ -218,7 +265,9 @@ impl KeyDirectory {
             context.guard.sync()?;
             hook(S::ControlsSynced)?;
             context.state.sync()?;
-            if let Some(t) = &temporary { t.sync()?; }
+            if let Some(t) = &temporary {
+                t.sync()?;
+            }
             hook(S::SnapshotsSynced)?;
             check(exchanged, removed)?;
             io(context.source.dir.sync_all())?;
@@ -227,8 +276,13 @@ impl KeyDirectory {
             if needs_exchange {
                 hook(S::BeforeExchange)?;
                 check(exchanged, removed)?;
-                os(fs::renameat_with(&context.source.dir, temp.as_str(), &context.source.dir,
-                    initial_state::STATE, RenameFlags::EXCHANGE))?;
+                os(fs::renameat_with(
+                    &context.source.dir,
+                    temp.as_str(),
+                    &context.source.dir,
+                    initial_state::STATE,
+                    RenameFlags::EXCHANGE,
+                ))?;
                 exchanged = true;
                 hook(S::Exchanged)?;
                 check(exchanged, removed)?;
@@ -241,22 +295,32 @@ impl KeyDirectory {
             check(exchanged, removed)?;
             if !removed {
                 // Aではfixedの旧fd、Bではtemporaryの旧fdを直前照合した一名だけ。
-                os(fs::unlinkat(&context.source.dir, temp.as_str(), AtFlags::empty()))?;
+                os(fs::unlinkat(
+                    &context.source.dir,
+                    temp.as_str(),
+                    AtFlags::empty(),
+                ))?;
                 removed = true;
                 hook(S::OldSnapshotRemoved)?;
             }
             io(context.source.dir.sync_all())?;
             hook(S::CleanupSynced)?;
             check(exchanged, removed)?;
-            if context.source.key_state_history(&initial.area_id)? != intent.after {
+            context.source.reject_state_artifacts(true)?;
+            let installed = context
+                .source
+                .state_bytes(initial_state::STATE, initial_state::STATE_LIMIT)?;
+            if decode(&installed)? != intent.after {
                 return invalid();
             }
             Ok(intent.after)
         })();
-        recovered.map_err(|_| if durable {
-            KeyFileError::RecoveryStateCleanupUncertain
-        } else {
-            KeyFileError::RecoveryStateUncertain
+        recovered.map_err(|_| {
+            if durable {
+                KeyFileError::RecoveryStateCleanupUncertain
+            } else {
+                KeyFileError::RecoveryStateUncertain
+            }
         })
     }
 }
