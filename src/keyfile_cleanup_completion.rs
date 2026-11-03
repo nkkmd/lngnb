@@ -1,8 +1,11 @@
-//! §5.104: 不在専用の明示完了。対象鍵unlink・停止解除は提供しない。
+//! §5.104: 不在/正常整理に共通する資格と完了追記。停止解除なし。
 use super::recovery::{absent, equal, field};
 use super::*;
 #[path = "keyfile_completion_recovery.rs"]
 mod completion_recovery;
+#[path = "keyfile_cleanup_remove.rs"]
+pub(super) mod removal;
+pub use removal::PreparedResidueRemoval;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyCleanupDisposition {
@@ -73,7 +76,7 @@ fn active_id(state: &KeyStateDiagnostic) -> Result<[u8; 32]> {
     }
 }
 
-struct AbsentContext<'a> {
+struct CompletionContext<'a> {
     source: &'a mut KeyDirectory,
     backup: &'a mut KeyDirectory,
     residue: String,
@@ -83,8 +86,9 @@ struct AbsentContext<'a> {
     preserved: HeldFile,
     marker: HeldFile,
     guard: HeldFile,
+    removed_target: Option<removal::RemovedTarget>,
 }
-impl<'a> AbsentContext<'a> {
+impl<'a> CompletionContext<'a> {
     fn open(
         source: &'a mut KeyDirectory,
         backup: &'a mut KeyDirectory,
@@ -94,13 +98,28 @@ impl<'a> AbsentContext<'a> {
         expected: &KeyCleanupExpected,
         active_bytes: &[u8],
     ) -> Result<Self> {
+        if !recovery_name(residue) { return Err(KeyFileError::UnsafePath); }
+        name(backup_name)?;
+        source.secure()?;
+        backup.secure()?;
+        absent(source, residue)?;
+        let context = Self::open_controls(source, backup, residue, backup_name, expected, active_bytes)?;
+        if unlock(&context.preserved.bytes, passphrase)?.public_key() != expected.public_key {
+            return Err(KeyFileError::UnexpectedPublicKey);
+        }
+        context.check()?;
+        Ok(context)
+    }
+    fn open_controls(
+        source: &'a mut KeyDirectory, backup: &'a mut KeyDirectory, residue: &str,
+        backup_name: &str, expected: &KeyCleanupExpected, active_bytes: &[u8],
+    ) -> Result<Self> {
         if !recovery_name(residue) {
             return Err(KeyFileError::UnsafePath);
         }
         name(backup_name)?;
         source.secure()?;
         backup.secure()?;
-        absent(source, residue)?;
         let source_identity = KeyDirectoryIdentity::from_metadata(&io(source.dir.metadata())?);
         if source_identity == expected.preserved_directory
             || KeyDirectoryIdentity::from_metadata(&io(backup.dir.metadata())?)
@@ -124,6 +143,7 @@ impl<'a> AbsentContext<'a> {
             preserved,
             marker,
             guard,
+            removed_target: None,
         };
         if context.validate(active_bytes)? != expected.state {
             return invalid();
@@ -157,10 +177,7 @@ impl<'a> AbsentContext<'a> {
         {
             return invalid();
         }
-        if unlock(&context.preserved.bytes, passphrase)?.public_key() != expected.public_key {
-            return Err(KeyFileError::UnexpectedPublicKey);
-        }
-        context.check()?;
+        context.check_controls()?;
         Ok(context)
     }
     fn validate(&self, snapshot: &[u8]) -> Result<KeyStateDiagnostic> {
@@ -183,6 +200,12 @@ impl<'a> AbsentContext<'a> {
         state_history::decode_history(snapshot, &source, initial.area_id, initial.snapshot_hash)
     }
     fn check(&self) -> Result<()> {
+        self.check_controls()?;
+        absent(self.source, &self.residue)?;
+        if let Some(target) = &self.removed_target { target.check()?; }
+        Ok(())
+    }
+    fn check_controls(&self) -> Result<()> {
         self.source.secure()?;
         self.backup.secure()?;
         if KeyDirectoryIdentity::from_metadata(&io(self.source.dir.metadata())?)
@@ -195,8 +218,7 @@ impl<'a> AbsentContext<'a> {
         self.preserved.check(self.backup, &self.backup_name, true)?;
         self.marker
             .check(self.source, recovery_hold::MARKER, true)?;
-        self.guard.check(self.source, recovery_hold::GUARD, true)?;
-        absent(self.source, &self.residue)
+        self.guard.check(self.source, recovery_hold::GUARD, true)
     }
     fn sync_controls(&self, hook: &mut impl FnMut(CompletionStage) -> Result<()>) -> Result<()> {
         self.check()?;
@@ -214,10 +236,10 @@ impl<'a> AbsentContext<'a> {
     }
 }
 
-/// 保全先/制御file・両directoryを保持する不在専用準備。Dropは追記/削除しない。
-/// 新規生成する完了はconfirmed_absent_on_recoveryだけで、鍵unlinkは行わない。
+/// 現在の不在と保全先/制御file・両directoryを保持する完了準備。Dropは追記/削除しない。
+/// 不在専用APIはconfirmed_absentのみ。正常unlink APIは保存確認後にremoved_presentを準備する。
 pub struct PreparedAbsentCleanup<'a> {
-    context: AbsentContext<'a>,
+    context: CompletionContext<'a>,
     state: HeldFile,
     new_bytes: Vec<u8>,
     intent: KeyCleanupCompletion,
@@ -335,6 +357,43 @@ impl PreparedAbsentCleanup<'_> {
     }
 }
 
+fn completion_identity() -> Result<([u8; 32], i64)> {
+    let mut operation_id = [0; 32];
+    super::super::super::random(&mut operation_id)?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| KeyFileError::RecoveryStateInvalid)?.as_secs();
+    let now = i64::try_from(now).map_err(|_| KeyFileError::RecoveryStateInvalid)?;
+    Ok((operation_id, now))
+}
+
+fn completion_value(
+    context: &CompletionContext<'_>, state: &HeldFile, operation_id: [u8; 32],
+    now: i64, disposition: KeyCleanupDisposition,
+) -> Result<(Vec<u8>, KeyCleanupCompletion)> {
+    let started_operation_id = active_id(&context.expected.state)?;
+        let mut value = decoded(&state.bytes)?;
+        events_mut(&mut value)?.push(map(vec![
+            ("sequence", Value::Int(context.expected.state.generation as i64 + 1)),
+            ("operation_id", bytes(operation_id)),
+            ("kind", text("residue_cleanup_completed")),
+            (
+                "actor_uid",
+                bytes(rustix::process::geteuid().as_raw().to_be_bytes()),
+            ),
+            ("recorded_unix_seconds", Value::Int(now)),
+            ("rules", text("lngnb-key-operations-1")),
+            ("started_operation_id", bytes(started_operation_id)),
+            (
+                "disposition",
+                text(disposition.text()),
+            ),
+        ]));
+        let new_bytes = encoded(&value)?;
+        let after = context.validate(&new_bytes)?;
+    Ok((new_bytes, KeyCleanupCompletion {
+        before: context.expected.state, after, started_operation_id, operation_id, disposition,
+    }))
+}
+
 impl KeyDirectory {
     /// 対象を削除せず、現在の不在と保全先を再資格化して新規不在完了を準備する。
     pub fn prepare_absent_residue_completion<'a>(
@@ -345,13 +404,7 @@ impl KeyDirectory {
         backup_name: &str,
         expected: &KeyCleanupExpected,
     ) -> Result<PreparedAbsentCleanup<'a>> {
-        let mut operation_id = [0; 32];
-        super::super::super::random(&mut operation_id)?;
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| KeyFileError::RecoveryStateInvalid)?
-            .as_secs();
-        let now = i64::try_from(now).map_err(|_| KeyFileError::RecoveryStateInvalid)?;
+        let (operation_id, now) = completion_identity()?;
         self.prepare_absent_residue_completion_with(
             residue,
             passphrase,
@@ -375,12 +428,12 @@ impl KeyDirectory {
         now: i64,
         hook: &mut impl FnMut(CompletionStage) -> Result<()>,
     ) -> Result<PreparedAbsentCleanup<'a>> {
-        let started_operation_id = active_id(&expected.state)?;
+        active_id(&expected.state)?;
         if self.reject_state_artifacts(true)? >= SCAN_LIMIT {
             return Err(KeyFileError::ScanLimit);
         }
         let state = HeldFile::open(self, initial_state::STATE, initial_state::STATE_LIMIT)?;
-        let context = AbsentContext::open(
+        let context = CompletionContext::open(
             self,
             backup,
             residue,
@@ -389,25 +442,7 @@ impl KeyDirectory {
             expected,
             &state.bytes,
         )?;
-        let mut value = decoded(&state.bytes)?;
-        events_mut(&mut value)?.push(map(vec![
-            ("sequence", Value::Int(expected.state.generation as i64 + 1)),
-            ("operation_id", bytes(operation_id)),
-            ("kind", text("residue_cleanup_completed")),
-            (
-                "actor_uid",
-                bytes(rustix::process::geteuid().as_raw().to_be_bytes()),
-            ),
-            ("recorded_unix_seconds", Value::Int(now)),
-            ("rules", text("lngnb-key-operations-1")),
-            ("started_operation_id", bytes(started_operation_id)),
-            (
-                "disposition",
-                text(KeyCleanupDisposition::ConfirmedAbsentOnRecovery.text()),
-            ),
-        ]));
-        let new_bytes = encoded(&value)?;
-        let after = context.validate(&new_bytes)?;
+        let (new_bytes, intent) = completion_value(&context, &state, operation_id, now, KeyCleanupDisposition::ConfirmedAbsentOnRecovery)?;
         context.sync_controls(hook)?;
         state.check(context.source, initial_state::STATE, true)?;
         state.sync()?;
@@ -423,13 +458,7 @@ impl KeyDirectory {
             context,
             state,
             new_bytes,
-            intent: KeyCleanupCompletion {
-                before: expected.state,
-                after,
-                started_operation_id,
-                operation_id,
-                disposition: KeyCleanupDisposition::ConfirmedAbsentOnRecovery,
-            },
+            intent,
         })
     }
 }
