@@ -2,7 +2,10 @@
 use super::*;
 use crate::cbor::{self, Value};
 use sha2::{Digest, Sha256};
-use std::{fs::Metadata, time::{SystemTime, UNIX_EPOCH}};
+use std::{
+    fs::Metadata,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 /// 期待するローカル現物の記録。構築/一致だけで保存・整理資格にはならない。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -21,9 +24,15 @@ pub struct KeyFileIdentity {
 impl KeyFileIdentity {
     pub fn from_metadata(m: &Metadata) -> Self {
         Self {
-            dev: m.dev(), ino: m.ino(), length: m.len(), nlink: m.nlink(),
-            uid: m.uid(), mode: m.mode(), mtime_seconds: m.mtime(),
-            mtime_nanoseconds: m.mtime_nsec(), ctime_seconds: m.ctime(),
+            dev: m.dev(),
+            ino: m.ino(),
+            length: m.len(),
+            nlink: m.nlink(),
+            uid: m.uid(),
+            mode: m.mode(),
+            mtime_seconds: m.mtime(),
+            mtime_nanoseconds: m.mtime_nsec(),
+            ctime_seconds: m.ctime(),
             ctime_nanoseconds: m.ctime_nsec(),
         }
     }
@@ -50,7 +59,11 @@ pub struct KeyDirectoryIdentity {
 }
 impl KeyDirectoryIdentity {
     pub fn from_metadata(m: &Metadata) -> Self {
-        Self { dev: m.dev(), ino: m.ino(), uid: m.uid() }
+        Self {
+            dev: m.dev(),
+            ino: m.ino(),
+            uid: m.uid(),
+        }
     }
     fn value(self) -> Value {
         map(vec![
@@ -117,18 +130,25 @@ impl HeldFile {
     fn open(dir: &KeyDirectory, name: &str, limit: usize) -> Result<Self> {
         let bytes = dir.state_bytes(name, limit)?;
         let file = File::from(os(fs::openat(
-            &dir.dir, name,
+            &dir.dir,
+            name,
             OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
         ))?);
         let metadata = io(file.metadata())?;
-        let held = Self { file, metadata, bytes };
+        let held = Self {
+            file,
+            metadata,
+            bytes,
+        };
         held.check(dir, name, true)?;
         Ok(held)
     }
     fn check(&self, dir: &KeyDirectory, name: &str, original_metadata: bool) -> Result<()> {
         dir.state_binding(name, &self.bytes, &self.file)?;
-        if original_metadata && fingerprint(&io(self.file.metadata())?) != fingerprint(&self.metadata) {
+        if original_metadata
+            && fingerprint(&io(self.file.metadata())?) != fingerprint(&self.metadata)
+        {
             return Err(KeyFileError::RecoveryChanged);
         }
         Ok(())
@@ -162,14 +182,18 @@ impl PreparedKeyCleanup<'_> {
     fn recheck(&self) -> Result<()> {
         self.source.secure()?;
         self.backup.secure()?;
-        if KeyDirectoryIdentity::from_metadata(&io(self.source.dir.metadata())?) != self.source_identity
-            || KeyDirectoryIdentity::from_metadata(&io(self.backup.dir.metadata())?) != self.expected.preserved_directory
+        if KeyDirectoryIdentity::from_metadata(&io(self.source.dir.metadata())?)
+            != self.source_identity
+            || KeyDirectoryIdentity::from_metadata(&io(self.backup.dir.metadata())?)
+                != self.expected.preserved_directory
         {
             return Err(KeyFileError::RecoveryChanged);
         }
         self.target.check(self.source, &self.target_name, true)?;
-        self.preserved.check(self.backup, &self.preserved_name, true)?;
-        self.marker.check(self.source, recovery_hold::MARKER, true)?;
+        self.preserved
+            .check(self.backup, &self.preserved_name, true)?;
+        self.marker
+            .check(self.source, recovery_hold::MARKER, true)?;
         self.guard.check(self.source, recovery_hold::GUARD, true)?;
         Ok(())
     }
@@ -192,11 +216,15 @@ impl PreparedKeyCleanup<'_> {
         if self.source.reject_state_artifacts(true)? >= SCAN_LIMIT {
             return Err(KeyFileError::ScanLimit);
         }
-        let temp = format!(".lngnb-key-state-update-{}", data_encoding::HEXLOWER.encode(&self.receipt.operation_id));
+        let temp = format!(
+            ".lngnb-key-state-update-{}",
+            data_encoding::HEXLOWER.encode(&self.receipt.operation_id)
+        );
         let mut durable = false;
         let appended = (|| -> Result<KeyStateDiagnostic> {
             let mut file = File::from(os(fs::openat(
-                &self.source.dir, temp.as_str(),
+                &self.source.dir,
+                temp.as_str(),
                 OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 Mode::RUSR | Mode::WUSR,
             ))?);
@@ -215,37 +243,56 @@ impl PreparedKeyCleanup<'_> {
             self.source.state_binding(&temp, &self.new_bytes, &file)?;
             self.source.only_cleanup_update(&temp)?;
             os(fs::renameat_with(
-                &self.source.dir, temp.as_str(), &self.source.dir, initial_state::STATE,
+                &self.source.dir,
+                temp.as_str(),
+                &self.source.dir,
+                initial_state::STATE,
                 RenameFlags::EXCHANGE,
             ))?;
             hook(CleanupStartStage::Exchanged)?;
-            self.source.state_binding(initial_state::STATE, &self.new_bytes, &file)?;
+            self.source
+                .state_binding(initial_state::STATE, &self.new_bytes, &file)?;
             self.state.check(self.source, &temp, false)?;
             io(self.source.dir.sync_all())?;
             self.recheck()?;
-            self.source.state_binding(initial_state::STATE, &self.new_bytes, &file)?;
+            self.source
+                .state_binding(initial_state::STATE, &self.new_bytes, &file)?;
             self.state.check(self.source, &temp, false)?;
             durable = true;
             hook(CleanupStartStage::StateSynced)?;
             hook(CleanupStartStage::BeforeCleanup)?;
             self.recheck()?;
-            self.source.state_binding(initial_state::STATE, &self.new_bytes, &file)?;
+            self.source
+                .state_binding(initial_state::STATE, &self.new_bytes, &file)?;
             self.state.check(self.source, &temp, false)?;
             self.source.only_cleanup_update(&temp)?;
-            os(fs::unlinkat(&self.source.dir, temp.as_str(), AtFlags::empty()))?;
+            os(fs::unlinkat(
+                &self.source.dir,
+                temp.as_str(),
+                AtFlags::empty(),
+            ))?;
             hook(CleanupStartStage::OldSnapshotRemoved)?;
             io(self.source.dir.sync_all())?;
             hook(CleanupStartStage::CleanupSynced)?;
             self.recheck()?;
-            self.source.state_binding(initial_state::STATE, &self.new_bytes, &file)?;
-            if self.source.key_state_history(&self.receipt.after.initial.area_id)? != self.receipt.after {
+            self.source
+                .state_binding(initial_state::STATE, &self.new_bytes, &file)?;
+            if self
+                .source
+                .key_state_history(&self.receipt.after.initial.area_id)?
+                != self.receipt.after
+            {
                 return invalid();
             }
             Ok(self.receipt.after)
         })();
-        appended.map_err(|_| if durable {
-            KeyFileError::RecoveryStateCleanupUncertain
-        } else { KeyFileError::RecoveryStateUncertain })
+        appended.map_err(|_| {
+            if durable {
+                KeyFileError::RecoveryStateCleanupUncertain
+            } else {
+                KeyFileError::RecoveryStateUncertain
+            }
+        })
     }
 }
 
@@ -254,12 +301,20 @@ impl KeyDirectory {
     fn only_cleanup_update(&self, temp: &str) -> Result<()> {
         self.secure()?;
         let before = fingerprint(&io(self.dir.metadata())?);
-        let entries = io(std::fs::read_dir(format!("/proc/self/fd/{}", self.dir.as_raw_fd())))?;
+        let entries = io(std::fs::read_dir(format!(
+            "/proc/self/fd/{}",
+            self.dir.as_raw_fd()
+        )))?;
         for (i, entry) in entries.enumerate() {
-            if i >= SCAN_LIMIT { return Err(KeyFileError::ScanLimit); }
+            if i >= SCAN_LIMIT {
+                return Err(KeyFileError::ScanLimit);
+            }
             let n = io(entry)?.file_name();
             let n = n.as_encoded_bytes();
-            if n.starts_with(b".lngnb-key-state") && n != initial_state::STATE.as_bytes() && n != temp.as_bytes() {
+            if n.starts_with(b".lngnb-key-state")
+                && n != initial_state::STATE.as_bytes()
+                && n != temp.as_bytes()
+            {
                 return invalid();
             }
         }
@@ -272,42 +327,74 @@ impl KeyDirectory {
     /// 明示した一対象を認証・現物照合し、今回のfsyncを行って両領域を保持する。
     /// 返却後intentを控えてからstartを呼べる。準備だけでは履歴/鍵を変更しない。
     pub fn prepare_residue_cleanup<'a>(
-        &'a mut self, residue: &str, passphrase: &str,
-        backup: &'a mut KeyDirectory, backup_name: &str, expected: &KeyCleanupExpected,
+        &'a mut self,
+        residue: &str,
+        passphrase: &str,
+        backup: &'a mut KeyDirectory,
+        backup_name: &str,
+        expected: &KeyCleanupExpected,
     ) -> Result<PreparedKeyCleanup<'a>> {
         let mut operation_id = [0; 32];
         super::super::random(&mut operation_id)?;
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| KeyFileError::RecoveryStateInvalid)?.as_secs();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| KeyFileError::RecoveryStateInvalid)?
+            .as_secs();
         let now = i64::try_from(now).map_err(|_| KeyFileError::RecoveryStateInvalid)?;
-        self.prepare_residue_cleanup_with(residue, passphrase, backup, backup_name, expected, operation_id, now, &mut |_| Ok(()))
+        self.prepare_residue_cleanup_with(
+            residue,
+            passphrase,
+            backup,
+            backup_name,
+            expected,
+            operation_id,
+            now,
+            &mut |_| Ok(()),
+        )
     }
     #[allow(clippy::too_many_arguments)]
     pub(super) fn prepare_residue_cleanup_with<'a>(
-        &'a mut self, residue: &str, passphrase: &str,
-        backup: &'a mut KeyDirectory, backup_name: &str, expected: &KeyCleanupExpected,
-        operation_id: [u8; 32], now: i64,
+        &'a mut self,
+        residue: &str,
+        passphrase: &str,
+        backup: &'a mut KeyDirectory,
+        backup_name: &str,
+        expected: &KeyCleanupExpected,
+        operation_id: [u8; 32],
+        now: i64,
         hook: &mut impl FnMut(CleanupStartStage) -> Result<()>,
     ) -> Result<PreparedKeyCleanup<'a>> {
-        if !recovery_name(residue) { return Err(KeyFileError::UnsafePath); }
+        if !recovery_name(residue) {
+            return Err(KeyFileError::UnsafePath);
+        }
         name(backup_name)?;
         self.secure()?;
         backup.secure()?;
         let source_identity = KeyDirectoryIdentity::from_metadata(&io(self.dir.metadata())?);
         let backup_identity = KeyDirectoryIdentity::from_metadata(&io(backup.dir.metadata())?);
-        if backup_identity != expected.preserved_directory || source_identity == backup_identity
+        if backup_identity != expected.preserved_directory
+            || source_identity == backup_identity
             || expected.state.state != KeyHistoryState::Held
             || self.key_state_history(&expected.state.initial.area_id)? != expected.state
-        { return invalid(); }
-        if self.reject_state_artifacts(true)? >= SCAN_LIMIT { return Err(KeyFileError::ScanLimit); }
+        {
+            return invalid();
+        }
+        if self.reject_state_artifacts(true)? >= SCAN_LIMIT {
+            return Err(KeyFileError::ScanLimit);
+        }
         let target = HeldFile::open(self, residue, MAX_KEYFILE_BYTES)?;
         let preserved = HeldFile::open(backup, backup_name, MAX_KEYFILE_BYTES)?;
         if KeyFileIdentity::from_metadata(&target.metadata) != expected.target
             || KeyFileIdentity::from_metadata(&preserved.metadata) != expected.preserved
-        { return Err(KeyFileError::RecoveryChanged); }
+        {
+            return Err(KeyFileError::RecoveryChanged);
+        }
         if unlock(&target.bytes, passphrase)?.public_key() != expected.public_key {
             return Err(KeyFileError::UnexpectedPublicKey);
         }
-        if target.bytes != preserved.bytes { return Err(KeyFileError::PreservationMismatch); }
+        if target.bytes != preserved.bytes {
+            return Err(KeyFileError::PreservationMismatch);
+        }
         let marker = HeldFile::open(self, recovery_hold::MARKER, MAX_KEYFILE_BYTES)?;
         let guard = HeldFile::open(self, recovery_hold::GUARD, MAX_KEYFILE_BYTES)?;
         let state = HeldFile::open(self, initial_state::STATE, initial_state::STATE_LIMIT)?;
@@ -321,37 +408,84 @@ impl KeyDirectory {
         if self.marker_area_id(&source_marker)? != expected.state.initial.area_id
             || marker.bytes[73..] != expected.state.initial.snapshot_hash
             || guard.bytes != expected_guard
-            || state_history::decode_history(&state.bytes, &source_marker, expected.state.initial.area_id, expected.state.initial.snapshot_hash)? != expected.state
-        { return invalid(); }
-        let mut value = cbor::decode(&state.bytes).map_err(|_| KeyFileError::RecoveryStateInvalid)?;
-        let Value::Map(ref mut items) = value else { return invalid(); };
-        let Some((_, Value::Array(events))) = items.iter_mut().find(|(k, _)| k == "events") else { return invalid(); };
+            || state_history::decode_history(
+                &state.bytes,
+                &source_marker,
+                expected.state.initial.area_id,
+                expected.state.initial.snapshot_hash,
+            )? != expected.state
+        {
+            return invalid();
+        }
+        let mut value =
+            cbor::decode(&state.bytes).map_err(|_| KeyFileError::RecoveryStateInvalid)?;
+        let Value::Map(ref mut items) = value else {
+            return invalid();
+        };
+        let Some((_, Value::Array(events))) = items.iter_mut().find(|(k, _)| k == "events") else {
+            return invalid();
+        };
         events.push(map(vec![
             ("sequence", Value::Int(expected.state.generation as i64 + 1)),
             ("operation_id", bytes(operation_id)),
             ("kind", text("residue_cleanup_started")),
-            ("actor_uid", bytes(rustix::process::geteuid().as_raw().to_be_bytes())),
+            (
+                "actor_uid",
+                bytes(rustix::process::geteuid().as_raw().to_be_bytes()),
+            ),
             ("recorded_unix_seconds", Value::Int(now)),
             ("rules", text("lngnb-key-operations-1")),
-            ("target", map(vec![
-                ("name", text(residue)), ("identity", expected.target.value()),
-                ("ciphertext_sha256", bytes(<[u8; 32]>::from(Sha256::digest(&target.bytes)))),
-                ("public_key", bytes(expected.public_key)),
-            ])),
-            ("preserved", map(vec![
-                ("directory", expected.preserved_directory.value()),
-                ("name", text(backup_name)), ("identity", expected.preserved.value()),
-            ])),
+            (
+                "target",
+                map(vec![
+                    ("name", text(residue)),
+                    ("identity", expected.target.value()),
+                    (
+                        "ciphertext_sha256",
+                        bytes(<[u8; 32]>::from(Sha256::digest(&target.bytes))),
+                    ),
+                    ("public_key", bytes(expected.public_key)),
+                ]),
+            ),
+            (
+                "preserved",
+                map(vec![
+                    ("directory", expected.preserved_directory.value()),
+                    ("name", text(backup_name)),
+                    ("identity", expected.preserved.value()),
+                ]),
+            ),
         ]));
         let new_bytes = cbor::encode(&value).map_err(|_| KeyFileError::RecoveryStateInvalid)?;
-        let after = state_history::decode_history(&new_bytes, &source_marker, expected.state.initial.area_id, expected.state.initial.snapshot_hash)?;
+        let after = state_history::decode_history(
+            &new_bytes,
+            &source_marker,
+            expected.state.initial.area_id,
+            expected.state.initial.snapshot_hash,
+        )?;
         let prepared = PreparedKeyCleanup {
-            source: self, backup, target_name: residue.into(), preserved_name: backup_name.into(),
-            expected: *expected, source_identity, target, preserved, marker, guard, state, new_bytes,
-            receipt: KeyCleanupStart { before: expected.state, after, operation_id },
+            source: self,
+            backup,
+            target_name: residue.into(),
+            preserved_name: backup_name.into(),
+            expected: *expected,
+            source_identity,
+            target,
+            preserved,
+            marker,
+            guard,
+            state,
+            new_bytes,
+            receipt: KeyCleanupStart {
+                before: expected.state,
+                after,
+                operation_id,
+            },
         };
         prepared.recheck()?;
-        prepared.state.check(prepared.source, initial_state::STATE, true)?;
+        prepared
+            .state
+            .check(prepared.source, initial_state::STATE, true)?;
         prepared.target.sync()?;
         hook(CleanupStartStage::TargetFileSynced)?;
         prepared.recheck()?;
@@ -367,11 +501,15 @@ impl KeyDirectory {
         prepared.state.sync()?;
         hook(CleanupStartStage::StateFilesSynced)?;
         prepared.recheck()?;
-        prepared.state.check(prepared.source, initial_state::STATE, true)?;
+        prepared
+            .state
+            .check(prepared.source, initial_state::STATE, true)?;
         io(prepared.source.dir.sync_all())?;
         hook(CleanupStartStage::StateDirectorySynced)?;
         prepared.recheck()?;
-        prepared.state.check(prepared.source, initial_state::STATE, true)?;
+        prepared
+            .state
+            .check(prepared.source, initial_state::STATE, true)?;
         prepared.source.reject_state_artifacts(true)?;
         Ok(prepared)
     }
