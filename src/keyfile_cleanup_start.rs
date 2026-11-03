@@ -1,4 +1,6 @@
-//! §5.100: 一対象の保持fd/認証/今回fsyncと開始追記。鍵unlink/復旧/解除なし。
+//! §5.100: 一対象の保持fd/認証/今回fsyncと開始追記。鍵unlink/解除なし。
+#[path = "keyfile_cleanup_recovery.rs"]
+pub(super) mod recovery;
 use super::*;
 use crate::cbor::{self, Value};
 use sha2::{Digest, Sha256};
