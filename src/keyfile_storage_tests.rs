@@ -2666,3 +2666,28 @@ fn initial_state_process_kill_preserves_keys_and_never_adopts_prepared_snapshots
         }
     }
 }
+
+#[test]
+fn initial_state_namespace_capacity_is_reserved_before_any_preparation() {
+    use recovery_hold::MARKER;
+    let a = Area::new();
+    let id = [0x42; 32];
+    let mut d = KeyDirectory::open(&a.0).unwrap();
+    d.initialize_recovery_hold_with(id, &mut |_, _| Ok(())).unwrap();
+    a.put("public-filler", b"public namespace count fixture");
+    for i in 0..SCAN_LIMIT - 4 {
+        stdfs::hard_link(a.0.join("public-filler"), a.0.join(format!("public-filler-{i}"))).unwrap();
+    }
+    assert_eq!(stdfs::read_dir(&a.0).unwrap().count(), SCAN_LIMIT - 1);
+    let marker = stdfs::read(a.0.join(MARKER)).unwrap();
+    let before = fingerprint(&stdfs::metadata(a.0.join(MARKER)).unwrap());
+    e(d.initialize_key_state(&id), KeyFileError::ScanLimit);
+    assert_eq!(stdfs::read_dir(&a.0).unwrap().count(), SCAN_LIMIT - 1);
+    assert_eq!(stdfs::read(a.0.join(MARKER)).unwrap(), marker);
+    assert_eq!(fingerprint(&stdfs::metadata(a.0.join(MARKER)).unwrap()), before);
+    stdfs::remove_file(a.0.join("public-filler-0")).unwrap();
+    let result = d.initialize_key_state(&id).unwrap();
+    assert_eq!(d.initial_key_state(&id).unwrap(), result);
+    assert_eq!(stdfs::read_dir(&a.0).unwrap().count(), SCAN_LIMIT - 1);
+    assert_eq!(stdfs::read(a.0.join("public-filler")).unwrap(), b"public namespace count fixture");
+}

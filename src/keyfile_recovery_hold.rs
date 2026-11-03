@@ -84,7 +84,7 @@ impl KeyDirectory {
         expected_area_id: &[u8; 32],
         hook: &mut impl FnMut(InitialRecoveryStage) -> Result<()>,
     ) -> Result<KeyRecoveryHold> {
-        self.reject_state_artifacts(false)?;
+        let entries = self.reject_state_artifacts(false)?;
         let marker = self.read(MARKER)?;
         let area_id = self.marker_area_id(&marker)?;
         if &area_id != expected_area_id {
@@ -98,6 +98,9 @@ impl KeyDirectory {
             Err(KeyFileError::Missing) => None,
             Err(e) => return Err(e),
         };
+        if existing.is_none() && entries == SCAN_LIMIT {
+            return Err(KeyFileError::ScanLimit);
+        }
         let (marker_file, marker_meta) = self.checked_hold_handle(MARKER, &marker)?;
         // ここから現在の保存確認を開始。失敗時も全fileを保持する。
         let recovered = (|| -> Result<KeyRecoveryHold> {
@@ -200,7 +203,9 @@ impl KeyDirectory {
         hook: &mut impl FnMut(usize, HoldStage) -> Result<()>,
     ) -> Result<KeyRecoveryHold> {
         self.secure()?;
-        self.reject_state_artifacts(false)?;
+        if self.reject_state_artifacts(false)? > SCAN_LIMIT - 2 {
+            return Err(KeyFileError::ScanLimit);
+        }
         // 不在は生成前の条件だけ。競合作成はO_EXCLでも拒否する。
         for n in [MARKER, GUARD] {
             match fs::statat(&self.dir, n, AtFlags::SYMLINK_NOFOLLOW) {

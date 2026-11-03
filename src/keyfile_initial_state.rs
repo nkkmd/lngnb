@@ -108,17 +108,19 @@ pub(super) fn decode_initial(
 
 impl KeyDirectory {
     /// 初期専用の導入/復旧に履歴やその一時名を混ぜない。部分一覧を成功にしない。
-    pub(super) fn reject_state_artifacts(&self, allow_state: bool) -> Result<()> {
+    pub(super) fn reject_state_artifacts(&self, allow_state: bool) -> Result<usize> {
         self.secure()?;
         let before = fingerprint(&io(self.dir.metadata())?);
         let entries = io(std::fs::read_dir(format!(
             "/proc/self/fd/{}",
             self.dir.as_raw_fd()
         )))?;
+        let mut count = 0;
         for (i, entry) in entries.enumerate() {
             if i >= SCAN_LIMIT {
                 return Err(KeyFileError::ScanLimit);
             }
+            count = i + 1;
             let name = io(entry)?.file_name();
             let bytes = name.as_encoded_bytes();
             if bytes.starts_with(STATE_PREFIX) && !(allow_state && bytes == STATE.as_bytes()) {
@@ -129,7 +131,7 @@ impl KeyDirectory {
         if before != fingerprint(&io(self.dir.metadata())?) {
             return Err(KeyFileError::RecoveryChanged);
         }
-        Ok(())
+        Ok(count)
     }
 
     // 鍵の4096 byte上限は変えず、この管理snapshot専用の上限付き読取りに分ける。
@@ -254,7 +256,10 @@ impl KeyDirectory {
         operation_id: [u8; 32],
         hook: &mut impl FnMut(StateStage) -> Result<()>,
     ) -> Result<KeyInitialState> {
-        self.reject_state_artifacts(false)?;
+        // 準備中は二名増える。上限不足をmarker交換後へ持ち越さない。
+        if self.reject_state_artifacts(false)? > SCAN_LIMIT - 2 {
+            return Err(KeyFileError::ScanLimit);
+        }
         let source = self.read(recovery_hold::MARKER)?;
         let area_id = self.marker_area_id(&source)?;
         if &area_id != expected_area_id {
