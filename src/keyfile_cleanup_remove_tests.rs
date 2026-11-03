@@ -636,8 +636,8 @@ fn residue_removal_capacity_and_held_directory_renames_leave_replacements_untouc
     let moved_a = f.a.0.with_extension("moved");
     let moved_b = f.b.0.with_extension("moved");
     let p = f.prepare().unwrap();
-    stdfs::rename(&source_path(&moved_a), &moved_a).unwrap();
-    stdfs::rename(&source_path(&moved_b), &moved_b).unwrap();
+    stdfs::rename(source_path(&moved_a), &moved_a).unwrap();
+    stdfs::rename(source_path(&moved_b), &moved_b).unwrap();
     let source_original = source_path(&moved_a);
     let backup_original = source_path(&moved_b);
     stdfs::DirBuilder::new()
