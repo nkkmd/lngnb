@@ -8,6 +8,18 @@ const STATE_PREFIX: &[u8] = b".lngnb-key-state";
 pub(super) const STATE_LIMIT: usize = 1_048_576;
 const V2_MAGIC: &[u8] = b"lngnb:key-recovery:2\0";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum StateRecoveryStage {
+    FilesSynced,
+    MarkerSynced,
+    BeforeInstall,
+    StateInstalled,
+    StateSynced,
+    BeforeCleanup,
+    OldMarkerRemoved,
+    CleanupSynced,
+}
+
 /// 現在検査した初回Heldの情報。公開/変更再開・過去の保存確定の資格ではない。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KeyInitialState {
@@ -107,6 +119,190 @@ pub(super) fn decode_initial(
 }
 
 impl KeyDirectory {
+    /// 完全v2/guardと明示した初回履歴だけを再保存し、導入中断を明示復旧する。
+    /// 期待値は選択条件であり資格ではない。履歴生成・guard解除・鍵変更はしない。
+    pub fn recover_initial_key_state(
+        &mut self,
+        expected: &KeyInitialState,
+    ) -> Result<KeyInitialState> {
+        self.recover_initial_key_state_with(expected, &mut |_| Ok(()))
+    }
+
+    // 追加候補/不明prefixを採用せず、明示した操作の二準備名だけを許す。
+    fn recovery_state_names(&self, snapshot: &str, marker: &str) -> Result<()> {
+        self.secure()?;
+        let before = fingerprint(&io(self.dir.metadata())?);
+        let entries = io(std::fs::read_dir(format!(
+            "/proc/self/fd/{}",
+            self.dir.as_raw_fd()
+        )))?;
+        for (i, entry) in entries.enumerate() {
+            if i >= SCAN_LIMIT {
+                return Err(KeyFileError::ScanLimit);
+            }
+            let name = io(entry)?.file_name();
+            let bytes = name.as_encoded_bytes();
+            if bytes.starts_with(STATE_PREFIX)
+                && bytes != STATE.as_bytes()
+                && bytes != snapshot.as_bytes()
+                && bytes != marker.as_bytes()
+            {
+                return invalid();
+            }
+        }
+        self.secure()?;
+        if before != fingerprint(&io(self.dir.metadata())?) {
+            return Err(KeyFileError::RecoveryChanged);
+        }
+        Ok(())
+    }
+
+    pub(super) fn recover_initial_key_state_with(
+        &mut self,
+        expected: &KeyInitialState,
+        hook: &mut impl FnMut(StateRecoveryStage) -> Result<()>,
+    ) -> Result<KeyInitialState> {
+        if expected.generation != 1 {
+            return invalid();
+        }
+        let id = data_encoding::HEXLOWER.encode(&expected.operation_id);
+        let snapshot_temp = format!(".lngnb-key-state-snapshot-{id}");
+        let marker_temp = format!(".lngnb-key-state-marker-{id}");
+        self.recovery_state_names(&snapshot_temp, &marker_temp)?;
+        let marker = self.read(recovery_hold::MARKER)?;
+        if marker.len() != 105 || !marker.starts_with(V2_MAGIC) {
+            return invalid();
+        }
+        let mut source = marker[..73].to_vec();
+        source[19] = b'1';
+        let area_id = self.marker_area_id(&source)?;
+        if area_id != expected.area_id || marker[73..] != expected.snapshot_hash {
+            return invalid();
+        }
+        let mut guard = b"lngnb:key-hold:1\0".to_vec();
+        guard.extend_from_slice(&area_id);
+        if self.read(recovery_hold::GUARD)? != guard {
+            return invalid();
+        }
+        let optional = |n: &str, limit| match self.state_bytes(n, limit) {
+            Ok(b) => Ok(Some(b)),
+            Err(KeyFileError::Missing) => Ok(None),
+            Err(e) => Err(e),
+        };
+        let fixed = optional(STATE, STATE_LIMIT)?;
+        let prepared = optional(&snapshot_temp, STATE_LIMIT)?;
+        let old = optional(&marker_temp, MAX_KEYFILE_BYTES)?;
+        // 配置前は元v1の物理コピーも必須。配置後はcleanup中断で不在でもよい。
+        let (state_name, bytes, needs_install) = match (fixed, prepared) {
+            (None, Some(bytes)) if old.as_deref() == Some(source.as_slice()) => {
+                (snapshot_temp.as_str(), bytes, true)
+            }
+            (Some(bytes), None) => (STATE, bytes, false),
+            _ => return invalid(),
+        };
+        if old.as_deref().is_some_and(|b| b != source) {
+            return invalid();
+        }
+        let result = decode_initial(&bytes, &source, area_id)?;
+        if &result != expected {
+            return invalid();
+        }
+        let (marker_file, marker_meta) =
+            self.checked_hold_handle(recovery_hold::MARKER, &marker)?;
+        let (guard_file, guard_meta) = self.checked_hold_handle(recovery_hold::GUARD, &guard)?;
+        // checked_hold_handleの鍵上限ではなくsnapshot専用上限で保持fdを照合する。
+        let state_file = File::from(os(fs::openat(
+            &self.dir,
+            state_name,
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ))?);
+        self.state_binding(state_name, &bytes, &state_file)?;
+        let state_meta = io(state_file.metadata())?;
+        let old_file = if old.is_some() {
+            Some(self.checked_hold_handle(&marker_temp, &source)?)
+        } else {
+            None
+        };
+        let mut durable = false;
+        let recovered = (|| -> Result<KeyInitialState> {
+            io(marker_file.sync_all())?;
+            io(guard_file.sync_all())?;
+            io(state_file.sync_all())?;
+            if let Some((file, _)) = &old_file {
+                io(file.sync_all())?;
+            }
+            hook(StateRecoveryStage::FilesSynced)?;
+            self.recheck_hold_handle(recovery_hold::MARKER, &marker, &marker_file, &marker_meta)?;
+            self.recheck_hold_handle(recovery_hold::GUARD, &guard, &guard_file, &guard_meta)?;
+            self.state_binding(state_name, &bytes, &state_file)?;
+            if fingerprint(&io(state_file.metadata())?) != fingerprint(&state_meta) {
+                return Err(KeyFileError::RecoveryChanged);
+            }
+            if let Some((file, meta)) = &old_file {
+                self.recheck_hold_handle(&marker_temp, &source, file, meta)?;
+            }
+            io(self.dir.sync_all())?;
+            hook(StateRecoveryStage::MarkerSynced)?;
+            hook(StateRecoveryStage::BeforeInstall)?;
+            self.recovery_state_names(&snapshot_temp, &marker_temp)?;
+            self.recheck_hold_handle(recovery_hold::MARKER, &marker, &marker_file, &marker_meta)?;
+            self.recheck_hold_handle(recovery_hold::GUARD, &guard, &guard_file, &guard_meta)?;
+            self.state_binding(state_name, &bytes, &state_file)?;
+            if fingerprint(&io(state_file.metadata())?) != fingerprint(&state_meta) {
+                return Err(KeyFileError::RecoveryChanged);
+            }
+            if let Some((file, meta)) = &old_file {
+                self.recheck_hold_handle(&marker_temp, &source, file, meta)?;
+            }
+            if needs_install {
+                os(fs::renameat_with(
+                    &self.dir,
+                    &snapshot_temp,
+                    &self.dir,
+                    STATE,
+                    RenameFlags::NOREPLACE,
+                ))?;
+            }
+            hook(StateRecoveryStage::StateInstalled)?;
+            io(self.dir.sync_all())?;
+            self.state_binding(STATE, &bytes, &state_file)?;
+            self.recheck_hold_handle(recovery_hold::MARKER, &marker, &marker_file, &marker_meta)?;
+            self.recheck_hold_handle(recovery_hold::GUARD, &guard, &guard_file, &guard_meta)?;
+            durable = true;
+            hook(StateRecoveryStage::StateSynced)?;
+            hook(StateRecoveryStage::BeforeCleanup)?;
+            self.state_binding(STATE, &bytes, &state_file)?;
+            self.recheck_hold_handle(recovery_hold::MARKER, &marker, &marker_file, &marker_meta)?;
+            self.recheck_hold_handle(recovery_hold::GUARD, &guard, &guard_file, &guard_meta)?;
+            self.recovery_state_names(&snapshot_temp, &marker_temp)?;
+            // 配置済みと準備履歴が併存したら、同bytesでも候補を選ばない。
+            match fs::statat(&self.dir, &snapshot_temp, AtFlags::SYMLINK_NOFOLLOW) {
+                Err(rustix::io::Errno::NOENT) => (),
+                _ => return invalid(),
+            }
+            if let Some((file, meta)) = &old_file {
+                self.recheck_hold_handle(&marker_temp, &source, file, meta)?;
+                os(fs::unlinkat(&self.dir, &marker_temp, AtFlags::empty()))?;
+            }
+            hook(StateRecoveryStage::OldMarkerRemoved)?;
+            io(self.dir.sync_all())?;
+            hook(StateRecoveryStage::CleanupSynced)?;
+            self.state_binding(STATE, &bytes, &state_file)?;
+            self.recheck_hold_handle(recovery_hold::MARKER, &marker, &marker_file, &marker_meta)?;
+            self.recheck_hold_handle(recovery_hold::GUARD, &guard, &guard_file, &guard_meta)?;
+            self.reject_state_artifacts(true)?;
+            Ok(result)
+        })();
+        recovered.map_err(|_| {
+            if durable {
+                KeyFileError::RecoveryStateCleanupUncertain
+            } else {
+                KeyFileError::RecoveryStateUncertain
+            }
+        })
+    }
+
     /// 初期専用の導入/復旧に履歴やその一時名を混ぜない。部分一覧を成功にしない。
     pub(super) fn reject_state_artifacts(&self, allow_state: bool) -> Result<usize> {
         self.secure()?;
