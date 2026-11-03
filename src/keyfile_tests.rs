@@ -34,7 +34,7 @@ fn fixture(section: &str) -> serde_json::Value {
 pub(super) fn a14() -> serde_json::Value {
     fixture("## 付録A14 暗号化鍵ファイルの固定計算例")
 }
-fn a13() -> serde_json::Value {
+pub(super) fn a13() -> serde_json::Value {
     fixture("## 付録A13 Record・IDの固定計算例")
 }
 fn original() -> Vec<u8> {

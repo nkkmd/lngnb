@@ -31,7 +31,7 @@ fn setup() -> (
         preserved_directory: KeyDirectoryIdentity::from_metadata(&stdfs::metadata(&b.0).unwrap()),
         preserved: KeyFileIdentity::from_metadata(&stdfs::metadata(b.0.join("saved")).unwrap()),
         public_key: super::super::super::tests::unhex(
-            super::super::super::tests::a14()["public_key_hex"]
+            super::super::super::tests::a13()["public_key_hex"]
                 .as_str()
                 .unwrap(),
         )
@@ -445,7 +445,7 @@ fn independent_start(a: &Area, b: &Area, old: &[u8], new: &[u8], intent: &KeyCle
 }
 fn intent_public_key() -> [u8; 32] {
     super::super::super::tests::unhex(
-        super::super::super::tests::a14()["public_key_hex"]
+        super::super::super::tests::a13()["public_key_hex"]
             .as_str()
             .unwrap(),
     )
