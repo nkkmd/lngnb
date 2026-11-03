@@ -19,6 +19,9 @@ pub use recovery_hold::KeyRecoveryHold;
 #[path = "keyfile_initial_state.rs"]
 mod initial_state;
 pub use initial_state::KeyInitialState;
+#[path = "keyfile_state_history.rs"]
+mod state_history;
+pub use state_history::{KeyHistoryState, KeyStateDiagnostic};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyFileError {
     UnsafePath,

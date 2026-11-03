@@ -55,7 +55,7 @@ fn invalid<T>() -> Result<T> {
 fn map(entries: Vec<(&str, Value)>) -> Value {
     Value::Map(entries.into_iter().map(|(k, v)| (k.into(), v)).collect())
 }
-fn initial_value(source: &[u8], area_id: [u8; 32], operation_id: [u8; 32]) -> Value {
+pub(super) fn initial_value(source: &[u8], area_id: [u8; 32], operation_id: [u8; 32]) -> Value {
     map(vec![
         ("format", Value::Text("lngnb-key-state-1".into())),
         ("area_id", Value::Bytes(area_id.to_vec())),
@@ -331,7 +331,7 @@ impl KeyDirectory {
     }
 
     // 鍵の4096 byte上限は変えず、この管理snapshot専用の上限付き読取りに分ける。
-    fn state_bytes(&self, n: &str, limit: usize) -> Result<Vec<u8>> {
+    pub(super) fn state_bytes(&self, n: &str, limit: usize) -> Result<Vec<u8>> {
         self.secure()?;
         let fd = fs::openat(
             &self.dir,
