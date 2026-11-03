@@ -39,14 +39,18 @@ impl RemovedTarget {
         current.nlink = original.nlink;
         current.ctime_seconds = original.ctime_seconds;
         current.ctime_nanoseconds = original.ctime_nanoseconds;
-        if current != original { return Err(KeyFileError::RecoveryChanged); }
+        if current != original {
+            return Err(KeyFileError::RecoveryChanged);
+        }
         let mut bytes = vec![0; self.held.bytes.len()];
         io(self.held.file.read_exact_at(&mut bytes, 0))?;
         let mut extra = [0];
         if bytes != self.held.bytes
             || io(self.held.file.read_at(&mut extra, bytes.len() as u64))? != 0
             || fingerprint(&io(self.held.file.metadata())?) != fingerprint(&before)
-        { return Err(KeyFileError::RecoveryChanged); }
+        {
+            return Err(KeyFileError::RecoveryChanged);
+        }
         Ok(())
     }
 }
@@ -61,8 +65,10 @@ pub struct PreparedResidueRemoval<'a> {
 impl PreparedResidueRemoval<'_> {
     fn check(&self) -> Result<()> {
         self.context.check_controls()?;
-        self.target.check(self.context.source, &self.context.residue, true)?;
-        self.state.check(self.context.source, initial_state::STATE, true)?;
+        self.target
+            .check(self.context.source, &self.context.residue, true)?;
+        self.state
+            .check(self.context.source, initial_state::STATE, true)?;
         if self.context.source.reject_state_artifacts(true)? >= SCAN_LIMIT {
             return Err(KeyFileError::ScanLimit);
         }
@@ -86,10 +92,18 @@ impl<'a> PreparedResidueRemoval<'a> {
         self.check()?;
         hook(S::BeforeUnlink)?;
         self.check()?;
-        let Self { mut context, state, target } = self;
+        let Self {
+            mut context,
+            state,
+            target,
+        } = self;
         let mut saved = false;
         let result = (|| -> Result<PreparedAbsentCleanup<'a>> {
-            os(fs::unlinkat(&context.source.dir, context.residue.as_str(), AtFlags::empty()))?;
+            os(fs::unlinkat(
+                &context.source.dir,
+                context.residue.as_str(),
+                AtFlags::empty(),
+            ))?;
             hook(S::Unlinked)?;
             context.removed_target = Some(RemovedTarget::capture(target)?);
             context.check()?;
@@ -105,47 +119,98 @@ impl<'a> PreparedResidueRemoval<'a> {
             hook(S::CompletionIdentified)?;
             context.check()?;
             state.check(context.source, initial_state::STATE, true)?;
-            let (new_bytes, intent) = completion_value(&context, &state, operation_id, now, KeyCleanupDisposition::RemovedPresent)?;
+            let (new_bytes, intent) = completion_value(
+                &context,
+                &state,
+                operation_id,
+                now,
+                KeyCleanupDisposition::RemovedPresent,
+            )?;
             hook(S::CompletionPrepared)?;
             context.check()?;
             state.check(context.source, initial_state::STATE, true)?;
-            if context.source.reject_state_artifacts(true)? >= SCAN_LIMIT { return Err(KeyFileError::ScanLimit); }
-            Ok(PreparedAbsentCleanup { context, state, new_bytes, intent })
+            if context.source.reject_state_artifacts(true)? >= SCAN_LIMIT {
+                return Err(KeyFileError::ScanLimit);
+            }
+            Ok(PreparedAbsentCleanup {
+                context,
+                state,
+                new_bytes,
+                intent,
+            })
         })();
-        result.map_err(|_| if saved { KeyFileError::ResidueCompletionRequired } else { KeyFileError::ResidueRemovalUncertain })
+        result.map_err(|_| {
+            if saved {
+                KeyFileError::ResidueCompletionRequired
+            } else {
+                KeyFileError::ResidueRemovalUncertain
+            }
+        })
     }
 }
 
 impl KeyDirectory {
     /// 保存済み未完了開始と現在の両暗号文を認証/照合し、今回fsyncして保持する。
     pub fn prepare_residue_removal<'a>(
-        &'a mut self, residue: &str, passphrase: &str, backup: &'a mut KeyDirectory,
-        backup_name: &str, expected: &KeyCleanupExpected,
+        &'a mut self,
+        residue: &str,
+        passphrase: &str,
+        backup: &'a mut KeyDirectory,
+        backup_name: &str,
+        expected: &KeyCleanupExpected,
     ) -> Result<PreparedResidueRemoval<'a>> {
-        self.prepare_residue_removal_with(residue, passphrase, backup, backup_name, expected, &mut |_| Ok(()))
+        self.prepare_residue_removal_with(
+            residue,
+            passphrase,
+            backup,
+            backup_name,
+            expected,
+            &mut |_| Ok(()),
+        )
     }
     #[allow(clippy::too_many_arguments)]
     pub(in super::super::super) fn prepare_residue_removal_with<'a>(
-        &'a mut self, residue: &str, passphrase: &str, backup: &'a mut KeyDirectory,
-        backup_name: &str, expected: &KeyCleanupExpected,
+        &'a mut self,
+        residue: &str,
+        passphrase: &str,
+        backup: &'a mut KeyDirectory,
+        backup_name: &str,
+        expected: &KeyCleanupExpected,
         hook: &mut impl FnMut(RemovalStage) -> Result<()>,
     ) -> Result<PreparedResidueRemoval<'a>> {
         use RemovalStage as S;
         active_id(&expected.state)?;
-        if !recovery_name(residue) { return Err(KeyFileError::UnsafePath); }
+        if !recovery_name(residue) {
+            return Err(KeyFileError::UnsafePath);
+        }
         name(backup_name)?;
-        if self.reject_state_artifacts(true)? >= SCAN_LIMIT { return Err(KeyFileError::ScanLimit); }
+        if self.reject_state_artifacts(true)? >= SCAN_LIMIT {
+            return Err(KeyFileError::ScanLimit);
+        }
         let state = HeldFile::open(self, initial_state::STATE, initial_state::STATE_LIMIT)?;
         let target = HeldFile::open(self, residue, MAX_KEYFILE_BYTES)?;
         if KeyFileIdentity::from_metadata(&target.metadata) != expected.target {
             return Err(KeyFileError::RecoveryChanged);
         }
-        let context = CompletionContext::open_controls(self, backup, residue, backup_name, expected, &state.bytes)?;
-        if target.bytes != context.preserved.bytes { return Err(KeyFileError::PreservationMismatch); }
+        let context = CompletionContext::open_controls(
+            self,
+            backup,
+            residue,
+            backup_name,
+            expected,
+            &state.bytes,
+        )?;
+        if target.bytes != context.preserved.bytes {
+            return Err(KeyFileError::PreservationMismatch);
+        }
         if unlock(&target.bytes, passphrase)?.public_key() != expected.public_key {
             return Err(KeyFileError::UnexpectedPublicKey);
         }
-        let prepared = PreparedResidueRemoval { context, state, target };
+        let prepared = PreparedResidueRemoval {
+            context,
+            state,
+            target,
+        };
         prepared.check()?;
         prepared.target.sync()?;
         hook(S::TargetSynced)?;

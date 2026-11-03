@@ -5,7 +5,9 @@ pub(super) mod completion;
 pub(super) mod recovery;
 use super::*;
 use crate::cbor::{self, Value};
-pub use completion::{KeyCleanupCompletion, KeyCleanupDisposition, PreparedAbsentCleanup, PreparedResidueRemoval};
+pub use completion::{
+    KeyCleanupCompletion, KeyCleanupDisposition, PreparedAbsentCleanup, PreparedResidueRemoval,
+};
 use sha2::{Digest, Sha256};
 use std::{
     fs::Metadata,
