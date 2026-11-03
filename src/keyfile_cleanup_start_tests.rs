@@ -375,12 +375,20 @@ fn cleanup_start_write_exchange_and_cleanup_failures_preserve_both_snapshots_and
 
 #[test]
 fn cleanup_start_directory_fd_binding_and_reserved_entry_capacity_are_checked_before_create() {
+    use std::os::unix::fs::OpenOptionsExt;
+
     let (a, b, mut source, mut backup, expected, key, pass) = setup();
     let old = snapshot(&a);
     // 既存一覧ちょうど上限では追加一枠がない。
     let count = stdfs::read_dir(&a.0).unwrap().count();
+    // 一覧件数だけの空entry。鍵・履歴の保存確認fixtureとは区別する。
     for i in count..SCAN_LIMIT {
-        a.put(&format!("entry-{i}"), b"");
+        stdfs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(a.0.join(format!("entry-{i}")))
+            .unwrap();
     }
     e(
         prepare(&mut source, &mut backup, &pass, &expected),
