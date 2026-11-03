@@ -16,6 +16,9 @@ const SCAN_LIMIT: usize = 10_000;
 #[path = "keyfile_recovery_hold.rs"]
 mod recovery_hold;
 pub use recovery_hold::KeyRecoveryHold;
+#[path = "keyfile_initial_state.rs"]
+mod initial_state;
+pub use initial_state::KeyInitialState;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyFileError {
     UnsafePath,
@@ -39,6 +42,10 @@ pub enum KeyFileError {
     RecoveryStateInvalid,
     /// 明示停止の作成開始後。保存確定/未保存を断定せず全fileを保持する。
     RecoveryHoldUncertain,
+    /// 履歴導入開始後。保存確定/未保存を断定せず全fileを保持する。
+    RecoveryStateUncertain,
+    /// 履歴導入の保存確認後、一時名整理・最終照合等が未完了/不確実。
+    RecoveryStateCleanupUncertain,
     /// 交換/配置済みだがdirectory fsync成功を確認できない。成功/rollbackを断定しない。
     CommitUncertain,
     /// 新鍵の永続化確認済み。旧暗号文の整理だけが未完了/不確実。
@@ -67,6 +74,8 @@ impl std::fmt::Display for KeyFileError {
             Self::PreservationMismatch => "key_preservation_mismatch",
             Self::RecoveryStateInvalid => "key_recovery_state_invalid",
             Self::RecoveryHoldUncertain => "key_recovery_hold_uncertain",
+            Self::RecoveryStateUncertain => "key_recovery_state_uncertain",
+            Self::RecoveryStateCleanupUncertain => "key_recovery_state_cleanup_uncertain",
             Self::CommitUncertain => "key_commit_uncertain",
             Self::CleanupUncertain => "key_committed_cleanup_uncertain",
             Self::Key(e) => return e.fmt(f),
