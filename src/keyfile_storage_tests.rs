@@ -2125,3 +2125,260 @@ fn initial_hold_recovery_process_kill_keeps_stop_and_requires_explicit_recovery(
         e(d.create("later", &p), KeyFileError::PendingRecovery);
     }
 }
+
+fn initial_state_fixed() -> (Vec<u8>, Vec<u8>) {
+    let source = "6c6e676e623a6b65792d7265636f766572793a310042424242424242424242424242424242424242424242424242424242424242420000000000000001000000000000000200000003";
+    let snapshot = "a4666576656e747381a3646b696e6476696e697469616c5f686f6c645f636f6e6669726d65646873657175656e6365016c6f7065726174696f6e5f69645820242424242424242424242424242424242424242424242424242424242424242466666f726d6174716c6e676e622d6b65792d73746174652d3167617265615f6964582042424242424242424242424242424242424242424242424242424242424242426d736f757263655f6d61726b657258496c6e676e623a6b65792d7265636f766572793a310042424242424242424242424242424242424242424242424242424242424242420000000000000001000000000000000200000003";
+    (super::super::tests::unhex(source), super::super::tests::unhex(snapshot))
+}
+fn initial_state_reference(source: &[u8], snapshot: &[u8], marker: &[u8], receipt: KeyInitialState) {
+    let hex = |b: &[u8]| data_encoding::HEXLOWER.encode(b);
+    let input = serde_json::json!([{"source":hex(source),"snapshot":hex(snapshot),"marker":hex(marker),"area":hex(&receipt.area_id),"operation":hex(&receipt.operation_id)}]);
+    let python = std::env::var_os("LNGNB_REFERENCE_PYTHON").expect("independent checker required");
+    let mut child = Command::new(python).arg("tests/key_state_reference.py")
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    child.stdin.take().unwrap().write_all(input.to_string().as_bytes()).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "independent state checker failed (details suppressed)");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["checked"], 1);
+}
+fn initial_state_temp(id: [u8; 32], role: &str) -> String {
+    format!(".lngnb-key-state-{role}-{}", data_encoding::HEXLOWER.encode(&id))
+}
+
+#[test]
+fn initial_state_fixed_cbor_and_marker_match_independent_python() {
+    let (source, snapshot) = initial_state_fixed();
+    let receipt = initial_state::decode_initial(&snapshot, &source, [0x42; 32]).unwrap();
+    assert_eq!(receipt.operation_id, [0x24; 32]);
+    assert_eq!(receipt.generation, 1);
+    let mut marker = source.clone(); marker[19] = b'2'; marker.extend(receipt.snapshot_hash);
+    assert_eq!(marker.len(), 105);
+    initial_state_reference(&source, &snapshot, &marker, receipt);
+}
+
+#[test]
+fn initial_state_explicit_bootstrap_preserves_keys_and_remains_held_after_reopen() {
+    use recovery_hold::{GUARD, MARKER};
+    let a = Area::new(); let id = [0x42; 32];
+    let (bytes, p) = fixture();
+    a.put("publisher", &bytes); a.put(&residue_name(1), &bytes);
+    a.put(".lngnb-key-unknown", b"public unrelated marker");
+    let original = fingerprint(&stdfs::metadata(a.0.join("publisher")).unwrap());
+    let mut d = KeyDirectory::open(&a.0).unwrap();
+    d.initialize_recovery_hold_with(id, &mut |_, _| Ok(())).unwrap();
+    let source = stdfs::read(a.0.join(MARKER)).unwrap();
+    let guard = stdfs::read(a.0.join(GUARD)).unwrap();
+    let receipt = d.initialize_key_state(&id).unwrap();
+    assert_eq!(receipt.generation, 1);
+    e(KeyDirectory::open(&a.0), KeyFileError::Busy);
+    drop(d);
+    let mut d = KeyDirectory::open(&a.0).unwrap();
+    assert_eq!(d.initial_key_state(&id).unwrap(), receipt);
+    e(d.initialize_key_state(&id), KeyFileError::RecoveryStateInvalid);
+    e(d.initialize_recovery_hold(), KeyFileError::RecoveryStateInvalid);
+    e(d.recover_initial_hold(&id), KeyFileError::RecoveryStateInvalid);
+    e(d.recovery_hold_status(), KeyFileError::RecoveryStateInvalid);
+    e(d.create("later", &p), KeyFileError::PendingRecovery);
+    e(d.change_passphrase("publisher", &p, "new public pass"), KeyFileError::PendingRecovery);
+    assert!(d.load("publisher", &p).is_ok());
+    assert_eq!(stdfs::read(a.0.join("publisher")).unwrap(), bytes);
+    assert_eq!(fingerprint(&stdfs::metadata(a.0.join("publisher")).unwrap()), original);
+    assert_eq!(stdfs::read(a.0.join(residue_name(1))).unwrap(), bytes);
+    assert_eq!(stdfs::read(a.0.join(".lngnb-key-unknown")).unwrap(), b"public unrelated marker");
+    assert_eq!(stdfs::read(a.0.join(GUARD)).unwrap(), guard);
+    let marker = stdfs::read(a.0.join(MARKER)).unwrap();
+    assert_eq!(&marker[21..73], &source[21..]);
+    let state = stdfs::read(a.0.join(initial_state::STATE)).unwrap();
+    initial_state_reference(&source, &state, &marker, receipt);
+    for name in [MARKER, GUARD, initial_state::STATE] {
+        let meta = stdfs::metadata(a.0.join(name)).unwrap();
+        assert_eq!(meta.mode() & 0o7777, 0o600); assert_eq!(meta.nlink(), 1);
+    }
+}
+
+#[test]
+fn initial_state_decoder_rejects_unknown_fields_kinds_sequences_and_bounds() {
+    use crate::cbor::{self, Value};
+    let (source, snapshot) = initial_state_fixed();
+    let value = cbor::decode(&snapshot).unwrap();
+    for phase in 0..9 {
+        let mut changed = value.clone();
+        let Value::Map(ref mut fields) = changed else { panic!("fixture map") };
+        match phase {
+            0 => fields.push(("extra".into(), Value::Null)),
+            1 => fields.iter_mut().find(|(k,_)| k == "format").unwrap().1 = Value::Text("lngnb-key-state-9".into()),
+            2 => fields.iter_mut().find(|(k,_)| k == "area_id").unwrap().1 = Value::Bytes(vec![0;32]),
+            3 => fields.iter_mut().find(|(k,_)| k == "source_marker").unwrap().1 = Value::Bytes(vec![0;73]),
+            _ => {
+                let Value::Array(events) = &mut fields.iter_mut().find(|(k,_)| k == "events").unwrap().1 else { panic!("fixture events") };
+                match phase {
+                    4 => events.clear(),
+                    5 => events.push(events[0].clone()),
+                    6 => { let item=events[0].clone(); events.resize(1025,item); }
+                    _ => {
+                        let Value::Map(event) = &mut events[0] else { panic!("fixture event") };
+                        if phase == 7 { event.iter_mut().find(|(k,_)| k == "sequence").unwrap().1 = Value::Int(2); }
+                        else { event.iter_mut().find(|(k,_)| k == "kind").unwrap().1 = Value::Text("ready".into()); }
+                    }
+                }
+            }
+        }
+        let bytes = cbor::encode(&changed).unwrap();
+        e(initial_state::decode_initial(&bytes, &source, [0x42;32]), KeyFileError::RecoveryStateInvalid);
+    }
+    e(initial_state::decode_initial(&vec![0;initial_state::STATE_LIMIT+1], &source, [0x42;32]), KeyFileError::RecoveryStateInvalid);
+    let mut trailing = snapshot.clone(); trailing.push(0);
+    e(initial_state::decode_initial(&trailing, &source, [0x42;32]), KeyFileError::RecoveryStateInvalid);
+    let mut duplicate = snapshot; duplicate[0] = 0xa5; duplicate.extend_from_slice(&[0x66,b'f',b'o',b'r',b'm',b'a',b't',0x60]);
+    e(initial_state::decode_initial(&duplicate, &source, [0x42;32]), KeyFileError::RecoveryStateInvalid);
+}
+
+#[test]
+fn initial_state_all_failure_boundaries_keep_stop_and_never_restart_initialization() {
+    use initial_state::StateStage as S;
+    for stage in [S::StateCreated,S::StateWritten,S::StateFileSynced,S::StatePrepared,S::MarkerCreated,S::MarkerWritten,S::MarkerFileSynced,S::MarkerPrepared,S::BeforeExchange,S::MarkerExchanged,S::MarkerSynced,S::StateInstalled,S::StateSynced,S::BeforeCleanup,S::OldMarkerRemoved,S::CleanupSynced] {
+        let a=Area::new(); let id=[0x42;32]; let mut d=KeyDirectory::open(&a.0).unwrap();
+        a.put("publisher",b"public preserved stand-in");
+        d.initialize_recovery_hold_with(id,&mut |_,_|Ok(())).unwrap();
+        let wanted=if matches!(stage,S::StateSynced|S::BeforeCleanup|S::OldMarkerRemoved|S::CleanupSynced) { KeyFileError::RecoveryStateCleanupUncertain } else { KeyFileError::RecoveryStateUncertain };
+        e(d.initialize_key_state_with(&id,[0x24;32],&mut |s|if s==stage { Err(KeyFileError::Io) } else { Ok(()) }),wanted);
+        drop(d); let mut d=KeyDirectory::open(&a.0).unwrap();
+        e(d.create("later","public pass"),KeyFileError::PendingRecovery);
+        e(d.recover_initial_hold(&id),KeyFileError::RecoveryStateInvalid);
+        e(d.initialize_key_state(&id),KeyFileError::RecoveryStateInvalid);
+        assert_eq!(stdfs::read(a.0.join("publisher")).unwrap(),b"public preserved stand-in");
+    }
+}
+
+#[test]
+fn initial_state_rejects_replacement_races_before_exchange_install_and_cleanup() {
+    use initial_state::StateStage as S;
+    use recovery_hold::MARKER;
+    let id=[0x42;32]; let operation=[0x24;32];
+    for phase in 0..4 {
+        let a=Area::new(); let mut d=KeyDirectory::open(&a.0).unwrap();
+        d.initialize_recovery_hold_with(id,&mut |_,_|Ok(())).unwrap();
+        let wanted=if phase<2 {KeyFileError::RecoveryStateUncertain} else {KeyFileError::RecoveryStateCleanupUncertain};
+        e(d.initialize_key_state_with(&id,operation,&mut |s| {
+            if s==S::BeforeExchange && phase==0 {
+                let bytes=stdfs::read(a.0.join(MARKER)).unwrap();
+                stdfs::rename(a.0.join(MARKER),a.0.join("public-original")).unwrap(); a.put(MARKER,&bytes);
+            }
+            if s==S::BeforeExchange && phase==1 { a.put(initial_state::STATE,b"public racing state"); }
+            if s==S::BeforeCleanup && phase==2 {
+                let name=initial_state_temp(operation,"marker"); let bytes=stdfs::read(a.0.join(&name)).unwrap();
+                stdfs::rename(a.0.join(&name),a.0.join("public-original")).unwrap(); a.put(&name,&bytes);
+            }
+            if s==S::BeforeCleanup && phase==3 { stdfs::write(a.0.join(initial_state::STATE),b"public changed state").unwrap(); }
+            Ok(())
+        }),wanted);
+        if phase==1 {assert_eq!(stdfs::read(a.0.join(initial_state::STATE)).unwrap(),b"public racing state");}
+        if phase==2 {assert!(a.0.join(initial_state_temp(operation,"marker")).exists());}
+        e(d.create("later","public pass"),KeyFileError::PendingRecovery);
+    }
+}
+
+#[test]
+fn initial_state_namespace_and_invalid_prerequisites_cannot_bypass_initial_apis() {
+    use recovery_hold::{GUARD,MARKER};
+    let id=[0x42;32];
+    for name in [initial_state::STATE,".lngnb-key-state-snapshot-public",".lngnb-key-state-unknown"] {
+        let a=Area::new(); let mut d=KeyDirectory::open(&a.0).unwrap();
+        d.initialize_recovery_hold_with(id,&mut |_,_|Ok(())).unwrap();
+        stdfs::remove_file(a.0.join(GUARD)).unwrap(); a.put(name,b"public unresolved state");
+        e(d.recover_initial_hold(&id),KeyFileError::RecoveryStateInvalid);
+        e(d.initialize_recovery_hold(),KeyFileError::RecoveryStateInvalid);
+        e(d.initialize_key_state(&id),KeyFileError::RecoveryStateInvalid);
+        assert!(!a.0.join(GUARD).exists()); assert_eq!(stdfs::read(a.0.join(name)).unwrap(),b"public unresolved state");
+    }
+    let a=Area::new(); let mut d=KeyDirectory::open(&a.0).unwrap();
+    e(d.initialize_key_state(&id),KeyFileError::Missing);
+    assert_eq!(stdfs::read_dir(&a.0).unwrap().count(),0);
+    d.initialize_recovery_hold_with(id,&mut |_,_|Ok(())).unwrap();
+    let before=stdfs::read(a.0.join(MARKER)).unwrap();
+    e(d.initialize_key_state(&[0;32]),KeyFileError::RecoveryStateInvalid);
+    stdfs::write(a.0.join(GUARD),b"public incomplete guard").unwrap();
+    e(d.initialize_key_state(&id),KeyFileError::RecoveryStateInvalid);
+    assert_eq!(stdfs::read(a.0.join(MARKER)).unwrap(),before);
+    assert_eq!(stdfs::read_dir(&a.0).unwrap().count(),2);
+}
+
+#[test]
+fn initial_state_directory_fd_binding_and_copy_refusal_preserve_replacements() {
+    use recovery_hold::{GUARD,MARKER};
+    let a=Area::new(); let path=a.0.join("source"); let id=[0x42;32];
+    stdfs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+    let mut d=KeyDirectory::open(&path).unwrap();
+    d.initialize_recovery_hold_with(id,&mut |_,_|Ok(())).unwrap();
+    stdfs::rename(&path,a.0.join("moved")).unwrap();
+    stdfs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+    a.put("source/public-marker",b"public replacement directory");
+    let receipt=d.initialize_key_state(&id).unwrap(); assert_eq!(d.initial_key_state(&id).unwrap(),receipt);
+    assert_eq!(stdfs::read_dir(path).unwrap().count(),1);
+    let b=Area::new();
+    for name in [MARKER,GUARD,initial_state::STATE] {b.put(name,&stdfs::read(a.0.join("moved").join(name)).unwrap());}
+    let mut copied=KeyDirectory::open(&b.0).unwrap();
+    e(copied.initial_key_state(&id),KeyFileError::RecoveryStateInvalid);
+    e(copied.create("later","public pass"),KeyFileError::PendingRecovery);
+}
+
+#[test]
+fn initial_state_diagnosis_rejects_missing_corrupt_unsafe_or_oversized_state_without_reset() {
+    use recovery_hold::MARKER;
+    let id=[0x42;32];
+    for phase in 0..7 {
+        let a=Area::new(); let mut d=KeyDirectory::open(&a.0).unwrap();
+        d.initialize_recovery_hold_with(id,&mut |_,_|Ok(())).unwrap(); d.initialize_key_state(&id).unwrap();
+        match phase {
+            0=>stdfs::remove_file(a.0.join(initial_state::STATE)).unwrap(),
+            1=>stdfs::write(a.0.join(initial_state::STATE),b"public invalid state").unwrap(),
+            2=>{stdfs::remove_file(a.0.join(initial_state::STATE)).unwrap();symlink(MARKER,a.0.join(initial_state::STATE)).unwrap();}
+            3=>{stdfs::remove_file(a.0.join(initial_state::STATE)).unwrap();stdfs::hard_link(a.0.join(MARKER),a.0.join(initial_state::STATE)).unwrap();}
+            4=>stdfs::set_permissions(a.0.join(initial_state::STATE),stdfs::Permissions::from_mode(0o644)).unwrap(),
+            5=>stdfs::write(a.0.join(initial_state::STATE),vec![0;initial_state::STATE_LIMIT+1]).unwrap(),
+            _=>a.put(".lngnb-key-state-snapshot-unresolved",b"public unresolved preparation"),
+        }
+        assert!(d.initial_key_state(&id).is_err());
+        e(d.initialize_key_state(&id),KeyFileError::RecoveryStateInvalid);
+        e(d.recover_initial_hold(&id),KeyFileError::RecoveryStateInvalid);
+        e(d.create("later","public pass"),KeyFileError::PendingRecovery);
+        assert_eq!(stdfs::read(a.0.join(MARKER)).unwrap().len(),105);
+    }
+}
+
+#[test]
+fn initial_state_process_kill_preserves_keys_and_never_adopts_prepared_snapshots() {
+    use initial_state::StateStage as S;
+    if let Some(path)=std::env::var_os("LNGNB_PUBLIC_STATE_KILL_AREA") {
+        let path=PathBuf::from(path);
+        assert!(path.file_name().unwrap().to_string_lossy().starts_with("lngnb-keytest-"));
+        assert_eq!(stdfs::read(path.join("fixture-marker")).unwrap(),b"public initial state fixture");
+        let point=std::env::var("LNGNB_PUBLIC_STATE_KILL_POINT").unwrap(); let mut d=KeyDirectory::open(&path).unwrap();
+        let _=d.initialize_key_state_with(&[0x42;32],[0x24;32],&mut |s| {
+            if format!("{s:?}")==point {println!("READY");std::io::stdout().flush().unwrap();loop{std::thread::park();}}
+            Ok(())
+        });
+        panic!("kill point not reached");
+    }
+    let (bytes,p)=fixture();
+    for stage in [S::StatePrepared,S::MarkerSynced,S::StateSynced,S::OldMarkerRemoved] {
+        let a=Area::new(); a.put("publisher",&bytes); a.put("fixture-marker",b"public initial state fixture");
+        {let mut d=KeyDirectory::open(&a.0).unwrap();d.initialize_recovery_hold_with([0x42;32],&mut |_,_|Ok(())).unwrap();}
+        let mut child=Command::new(std::env::current_exe().unwrap())
+            .args(["--exact","keyfile::files::tests::initial_state_process_kill_preserves_keys_and_never_adopts_prepared_snapshots","--nocapture"])
+            .env("LNGNB_PUBLIC_STATE_KILL_AREA",&a.0).env("LNGNB_PUBLIC_STATE_KILL_POINT",format!("{stage:?}"))
+            .stdout(Stdio::piped()).spawn().unwrap();
+        let mut stdout=std::io::BufReader::new(child.stdout.take().unwrap()); let mut line=String::new();
+        loop{line.clear();assert!(stdout.read_line(&mut line).unwrap()>0);if line.trim()=="READY"{break;}}
+        child.kill().unwrap();assert!(!child.wait().unwrap().success());
+        let mut d=KeyDirectory::open(&a.0).unwrap();
+        e(d.create("later",&p),KeyFileError::PendingRecovery);assert!(d.load("publisher",&p).is_ok());
+        assert_eq!(stdfs::read(a.0.join("publisher")).unwrap(),bytes);
+        e(d.initialize_key_state(&[0x42;32]),KeyFileError::RecoveryStateInvalid);
+        e(d.recover_initial_hold(&[0x42;32]),KeyFileError::RecoveryStateInvalid);
+        if stage==S::OldMarkerRemoved {assert_eq!(d.initial_key_state(&[0x42;32]).unwrap().generation,1);}
+        else{assert!(d.initial_key_state(&[0x42;32]).is_err());}
+    }
+}

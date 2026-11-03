@@ -34,7 +34,7 @@ pub(super) enum InitialRecoveryStage {
 }
 
 impl KeyDirectory {
-    fn checked_hold_handle(&self, n: &str, bytes: &[u8]) -> Result<(File, std::fs::Metadata)> {
+    pub(super) fn checked_hold_handle(&self, n: &str, bytes: &[u8]) -> Result<(File, std::fs::Metadata)> {
         let fd = os(fs::openat(
             &self.dir,
             n,
@@ -47,7 +47,7 @@ impl KeyDirectory {
         Ok((file, m))
     }
 
-    fn recheck_hold_handle(
+    pub(super) fn recheck_hold_handle(
         &self,
         n: &str,
         bytes: &[u8],
@@ -80,6 +80,7 @@ impl KeyDirectory {
         expected_area_id: &[u8; 32],
         hook: &mut impl FnMut(InitialRecoveryStage) -> Result<()>,
     ) -> Result<KeyRecoveryHold> {
+        self.reject_state_artifacts(false)?;
         let marker = self.read(MARKER)?;
         let area_id = self.marker_area_id(&marker)?;
         if &area_id != expected_area_id {
@@ -137,7 +138,7 @@ impl KeyDirectory {
         recovered.map_err(|_| KeyFileError::RecoveryHoldUncertain)
     }
 
-    fn marker_area_id(&self, marker: &[u8]) -> Result<[u8; 32]> {
+    pub(super) fn marker_area_id(&self, marker: &[u8]) -> Result<[u8; 32]> {
         let m = io(self.dir.metadata())?;
         let mut suffix = Vec::new();
         suffix.extend_from_slice(&m.dev().to_be_bytes());
@@ -195,6 +196,7 @@ impl KeyDirectory {
         hook: &mut impl FnMut(usize, HoldStage) -> Result<()>,
     ) -> Result<KeyRecoveryHold> {
         self.secure()?;
+        self.reject_state_artifacts(false)?;
         // 不在は生成前の条件だけ。競合作成はO_EXCLでも拒否する。
         for n in [MARKER, GUARD] {
             match fs::statat(&self.dir, n, AtFlags::SYMLINK_NOFOLLOW) {
