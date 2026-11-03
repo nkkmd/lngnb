@@ -4,7 +4,7 @@ use super::*;
 #[path = "keyfile_completion_recovery.rs"]
 mod completion_recovery;
 #[path = "keyfile_cleanup_remove.rs"]
-pub(super) mod removal;
+pub(in super::super) mod removal;
 pub use removal::PreparedResidueRemoval;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
