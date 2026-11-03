@@ -485,7 +485,9 @@ fn cleanup_recovery_rejects_different_prefix_even_with_a_valid_root_and_explicit
     let mut selected = intent;
     selected.after.snapshot_hash = sha2::Sha256::digest(&altered).into();
     assert_eq!(
-        source.key_state_history(&expected.state.initial.area_id).unwrap(),
+        source
+            .key_state_history(&expected.state.initial.area_id)
+            .unwrap(),
         selected.after
     );
     let stable = files(&a);
