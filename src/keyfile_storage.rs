@@ -44,7 +44,7 @@ pub enum KeyFileError {
     RecoveryHoldUncertain,
     /// 履歴導入開始後。保存確定/未保存を断定せず全fileを保持する。
     RecoveryStateUncertain,
-    /// 履歴導入の保存確認済み。一時名の整理だけが未完了/不確実。
+    /// 履歴導入の保存確認後、一時名整理・最終照合等が未完了/不確実。
     RecoveryStateCleanupUncertain,
     /// 交換/配置済みだがdirectory fsync成功を確認できない。成功/rollbackを断定しない。
     CommitUncertain,

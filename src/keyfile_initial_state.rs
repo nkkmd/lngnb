@@ -48,11 +48,14 @@ fn initial_value(source: &[u8], area_id: [u8; 32], operation_id: [u8; 32]) -> Va
         ("format", Value::Text("lngnb-key-state-1".into())),
         ("area_id", Value::Bytes(area_id.to_vec())),
         ("source_marker", Value::Bytes(source.to_vec())),
-        ("events", Value::Array(vec![map(vec![
-            ("sequence", Value::Int(1)),
-            ("operation_id", Value::Bytes(operation_id.to_vec())),
-            ("kind", Value::Text("initial_hold_confirmed".into())),
-        ])])),
+        (
+            "events",
+            Value::Array(vec![map(vec![
+                ("sequence", Value::Int(1)),
+                ("operation_id", Value::Bytes(operation_id.to_vec())),
+                ("kind", Value::Text("initial_hold_confirmed".into())),
+            ])]),
+        ),
     ])
 }
 fn field<'a>(v: &'a Value, name: &str) -> Result<&'a Value> {
@@ -63,19 +66,33 @@ fn field<'a>(v: &'a Value, name: &str) -> Result<&'a Value> {
     }
     invalid()
 }
-pub(super) fn decode_initial(bytes: &[u8], source: &[u8], area_id: [u8; 32]) -> Result<KeyInitialState> {
-    if bytes.len() > STATE_LIMIT || source.len() != 73
-        || !source.starts_with(b"lngnb:key-recovery:1\0") || source[21..53] != area_id {
+pub(super) fn decode_initial(
+    bytes: &[u8],
+    source: &[u8],
+    area_id: [u8; 32],
+) -> Result<KeyInitialState> {
+    if bytes.len() > STATE_LIMIT
+        || source.len() != 73
+        || !source.starts_with(b"lngnb:key-recovery:1\0")
+        || source[21..53] != area_id
+    {
         return invalid();
     }
     let value = cbor::decode(bytes).map_err(|_| KeyFileError::RecoveryStateInvalid)?;
-    let Value::Array(events) = field(&value, "events")? else { return invalid() };
+    let Value::Array(events) = field(&value, "events")? else {
+        return invalid();
+    };
     // profile上限1024より狭く、実装済みの初回kind一件だけを受理する。
     if events.len() != 1 {
         return invalid();
     }
-    let Value::Bytes(id) = field(&events[0], "operation_id")? else { return invalid() };
-    let operation_id: [u8; 32] = id.as_slice().try_into().map_err(|_| KeyFileError::RecoveryStateInvalid)?;
+    let Value::Bytes(id) = field(&events[0], "operation_id")? else {
+        return invalid();
+    };
+    let operation_id: [u8; 32] = id
+        .as_slice()
+        .try_into()
+        .map_err(|_| KeyFileError::RecoveryStateInvalid)?;
     let expected = cbor::encode(&initial_value(source, area_id, operation_id))
         .map_err(|_| KeyFileError::RecoveryStateInvalid)?;
     if bytes != expected {
@@ -94,9 +111,14 @@ impl KeyDirectory {
     pub(super) fn reject_state_artifacts(&self, allow_state: bool) -> Result<()> {
         self.secure()?;
         let before = fingerprint(&io(self.dir.metadata())?);
-        let entries = io(std::fs::read_dir(format!("/proc/self/fd/{}", self.dir.as_raw_fd())))?;
+        let entries = io(std::fs::read_dir(format!(
+            "/proc/self/fd/{}",
+            self.dir.as_raw_fd()
+        )))?;
         for (i, entry) in entries.enumerate() {
-            if i >= SCAN_LIMIT { return Err(KeyFileError::ScanLimit); }
+            if i >= SCAN_LIMIT {
+                return Err(KeyFileError::ScanLimit);
+            }
             let name = io(entry)?.file_name();
             let bytes = name.as_encoded_bytes();
             if bytes.starts_with(STATE_PREFIX) && !(allow_state && bytes == STATE.as_bytes()) {
@@ -113,17 +135,32 @@ impl KeyDirectory {
     // 鍵の4096 byte上限は変えず、この管理snapshot専用の上限付き読取りに分ける。
     fn state_bytes(&self, n: &str, limit: usize) -> Result<Vec<u8>> {
         self.secure()?;
-        let fd = fs::openat(&self.dir, n, OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::empty())
-            .map_err(|e| if e == rustix::io::Errno::NOENT { KeyFileError::Missing } else { KeyFileError::UnsafePath })?;
+        let fd = fs::openat(
+            &self.dir,
+            n,
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|e| {
+            if e == rustix::io::Errno::NOENT {
+                KeyFileError::Missing
+            } else {
+                KeyFileError::UnsafePath
+            }
+        })?;
         let mut file = File::from(fd);
         let before = io(file.metadata())?;
         private_file(&before, rustix::process::geteuid().as_raw())?;
-        if before.len() > limit as u64 { return invalid(); }
+        if before.len() > limit as u64 {
+            return invalid();
+        }
         let mut bytes = Vec::new();
         io((&mut file).take(limit as u64 + 1).read_to_end(&mut bytes))?;
         let after = io(file.metadata())?;
-        if bytes.len() > limit || before.len() != bytes.len() as u64
-            || fingerprint(&before) != fingerprint(&after) {
+        if bytes.len() > limit
+            || before.len() != bytes.len() as u64
+            || fingerprint(&before) != fingerprint(&after)
+        {
             return invalid();
         }
         Ok(bytes)
@@ -133,9 +170,11 @@ impl KeyDirectory {
         let before = io(file.metadata())?;
         private_file(&before, rustix::process::geteuid().as_raw())?;
         let path = os(fs::statat(&self.dir, n, AtFlags::SYMLINK_NOFOLLOW))?;
-        if path.st_dev != before.dev() || path.st_ino != before.ino()
+        if path.st_dev != before.dev()
+            || path.st_ino != before.ino()
             || self.state_bytes(n, bytes.len())? != bytes
-            || fingerprint(&io(file.metadata())?) != fingerprint(&before) {
+            || fingerprint(&io(file.metadata())?) != fingerprint(&before)
+        {
             return Err(KeyFileError::RecoveryChanged);
         }
         Ok(())
@@ -145,20 +184,30 @@ impl KeyDirectory {
     pub fn initial_key_state(&mut self, expected_area_id: &[u8; 32]) -> Result<KeyInitialState> {
         self.reject_state_artifacts(true)?;
         let marker = self.read(recovery_hold::MARKER)?;
-        if marker.len() != 105 || !marker.starts_with(V2_MAGIC) { return invalid(); }
+        if marker.len() != 105 || !marker.starts_with(V2_MAGIC) {
+            return invalid();
+        }
         let mut source = marker[..73].to_vec();
         source[19] = b'1';
         let area_id = self.marker_area_id(&source)?;
-        if &area_id != expected_area_id { return invalid(); }
+        if &area_id != expected_area_id {
+            return invalid();
+        }
         let guard = self.read(recovery_hold::GUARD)?;
         let mut expected_guard = b"lngnb:key-hold:1\0".to_vec();
         expected_guard.extend_from_slice(&area_id);
-        if guard != expected_guard { return invalid(); }
+        if guard != expected_guard {
+            return invalid();
+        }
         let bytes = self.state_bytes(STATE, STATE_LIMIT)?;
         let result = decode_initial(&bytes, &source, area_id)?;
-        if marker[73..] != result.snapshot_hash { return invalid(); }
-        if self.read(recovery_hold::MARKER)? != marker || self.read(recovery_hold::GUARD)? != guard
-            || self.state_bytes(STATE, STATE_LIMIT)? != bytes {
+        if marker[73..] != result.snapshot_hash {
+            return invalid();
+        }
+        if self.read(recovery_hold::MARKER)? != marker
+            || self.read(recovery_hold::GUARD)? != guard
+            || self.state_bytes(STATE, STATE_LIMIT)? != bytes
+        {
             return Err(KeyFileError::RecoveryChanged);
         }
         self.reject_state_artifacts(true)?;
@@ -173,10 +222,18 @@ impl KeyDirectory {
     }
 
     fn prepare_state_file(
-        &self, n: &str, bytes: &[u8], stages: [StateStage; 4],
+        &self,
+        n: &str,
+        bytes: &[u8],
+        stages: [StateStage; 4],
         hook: &mut impl FnMut(StateStage) -> Result<()>,
     ) -> Result<File> {
-        let fd = os(fs::openat(&self.dir, n, OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::RUSR | Mode::WUSR))?;
+        let fd = os(fs::openat(
+            &self.dir,
+            n,
+            OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        ))?;
         let mut file = File::from(fd);
         os(fs::fchmod(&file, Mode::RUSR | Mode::WUSR))?;
         hook(stages[0])?;
@@ -192,23 +249,30 @@ impl KeyDirectory {
     }
 
     pub(super) fn initialize_key_state_with(
-        &mut self, expected_area_id: &[u8; 32], operation_id: [u8; 32],
+        &mut self,
+        expected_area_id: &[u8; 32],
+        operation_id: [u8; 32],
         hook: &mut impl FnMut(StateStage) -> Result<()>,
     ) -> Result<KeyInitialState> {
         self.reject_state_artifacts(false)?;
         let source = self.read(recovery_hold::MARKER)?;
         let area_id = self.marker_area_id(&source)?;
-        if &area_id != expected_area_id { return invalid(); }
+        if &area_id != expected_area_id {
+            return invalid();
+        }
         let mut guard = b"lngnb:key-hold:1\0".to_vec();
         guard.extend_from_slice(&area_id);
-        if self.read(recovery_hold::GUARD)? != guard { return invalid(); }
+        if self.read(recovery_hold::GUARD)? != guard {
+            return invalid();
+        }
         let (old_marker, old_meta) = self.checked_hold_handle(recovery_hold::MARKER, &source)?;
         let (guard_file, guard_meta) = self.checked_hold_handle(recovery_hold::GUARD, &guard)?;
         // 準備名生成前に既存の初期停止を今回fsyncする。失敗しても作り直さない。
         io(old_marker.sync_all()).map_err(|_| KeyFileError::RecoveryStateUncertain)?;
         io(guard_file.sync_all()).map_err(|_| KeyFileError::RecoveryStateUncertain)?;
         io(self.dir.sync_all()).map_err(|_| KeyFileError::RecoveryStateUncertain)?;
-        let bytes = cbor::encode(&initial_value(&source, area_id, operation_id)).map_err(|_| KeyFileError::RecoveryStateInvalid)?;
+        let bytes = cbor::encode(&initial_value(&source, area_id, operation_id))
+            .map_err(|_| KeyFileError::RecoveryStateInvalid)?;
         let result = decode_initial(&bytes, &source, area_id)?;
         let mut marker = V2_MAGIC.to_vec();
         marker.extend_from_slice(&source[21..]);
@@ -218,14 +282,40 @@ impl KeyDirectory {
         let marker_temp = format!(".lngnb-key-state-marker-{id}");
         let mut durable = false;
         let installed = (|| -> Result<KeyInitialState> {
-            let state_file = self.prepare_state_file(&state_temp, &bytes, [StateStage::StateCreated, StateStage::StateWritten, StateStage::StateFileSynced, StateStage::StatePrepared], hook)?;
-            let new_marker = self.prepare_state_file(&marker_temp, &marker, [StateStage::MarkerCreated, StateStage::MarkerWritten, StateStage::MarkerFileSynced, StateStage::MarkerPrepared], hook)?;
+            let state_file = self.prepare_state_file(
+                &state_temp,
+                &bytes,
+                [
+                    StateStage::StateCreated,
+                    StateStage::StateWritten,
+                    StateStage::StateFileSynced,
+                    StateStage::StatePrepared,
+                ],
+                hook,
+            )?;
+            let new_marker = self.prepare_state_file(
+                &marker_temp,
+                &marker,
+                [
+                    StateStage::MarkerCreated,
+                    StateStage::MarkerWritten,
+                    StateStage::MarkerFileSynced,
+                    StateStage::MarkerPrepared,
+                ],
+                hook,
+            )?;
             hook(StateStage::BeforeExchange)?;
             self.recheck_hold_handle(recovery_hold::MARKER, &source, &old_marker, &old_meta)?;
             self.recheck_hold_handle(recovery_hold::GUARD, &guard, &guard_file, &guard_meta)?;
             self.state_binding(&state_temp, &bytes, &state_file)?;
             self.state_binding(&marker_temp, &marker, &new_marker)?;
-            os(fs::renameat_with(&self.dir, &marker_temp, &self.dir, recovery_hold::MARKER, RenameFlags::EXCHANGE))?;
+            os(fs::renameat_with(
+                &self.dir,
+                &marker_temp,
+                &self.dir,
+                recovery_hold::MARKER,
+                RenameFlags::EXCHANGE,
+            ))?;
             hook(StateStage::MarkerExchanged)?;
             self.state_binding(recovery_hold::MARKER, &marker, &new_marker)?;
             self.state_binding(&marker_temp, &source, &old_marker)?;
@@ -233,7 +323,13 @@ impl KeyDirectory {
             hook(StateStage::MarkerSynced)?;
             self.state_binding(recovery_hold::MARKER, &marker, &new_marker)?;
             self.state_binding(&state_temp, &bytes, &state_file)?;
-            os(fs::renameat_with(&self.dir, &state_temp, &self.dir, STATE, RenameFlags::NOREPLACE))?;
+            os(fs::renameat_with(
+                &self.dir,
+                &state_temp,
+                &self.dir,
+                STATE,
+                RenameFlags::NOREPLACE,
+            ))?;
             hook(StateStage::StateInstalled)?;
             self.state_binding(STATE, &bytes, &state_file)?;
             io(self.dir.sync_all())?;
@@ -257,6 +353,12 @@ impl KeyDirectory {
             self.reject_state_artifacts(true)?;
             Ok(result)
         })();
-        installed.map_err(|_| if durable { KeyFileError::RecoveryStateCleanupUncertain } else { KeyFileError::RecoveryStateUncertain })
+        installed.map_err(|_| {
+            if durable {
+                KeyFileError::RecoveryStateCleanupUncertain
+            } else {
+                KeyFileError::RecoveryStateUncertain
+            }
+        })
     }
 }

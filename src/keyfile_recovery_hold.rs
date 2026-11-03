@@ -34,7 +34,11 @@ pub(super) enum InitialRecoveryStage {
 }
 
 impl KeyDirectory {
-    pub(super) fn checked_hold_handle(&self, n: &str, bytes: &[u8]) -> Result<(File, std::fs::Metadata)> {
+    pub(super) fn checked_hold_handle(
+        &self,
+        n: &str,
+        bytes: &[u8],
+    ) -> Result<(File, std::fs::Metadata)> {
         let fd = os(fs::openat(
             &self.dir,
             n,
