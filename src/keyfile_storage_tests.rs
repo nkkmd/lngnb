@@ -2702,3 +2702,385 @@ fn initial_state_namespace_capacity_is_reserved_before_any_preparation() {
         b"public namespace count fixture"
     );
 }
+
+fn interrupted_initial_state(a: &Area, stage: initial_state::StateStage) -> KeyInitialState {
+    let id = [0x42; 32];
+    let operation = [0x24; 32];
+    let mut d = KeyDirectory::open(&a.0).unwrap();
+    d.initialize_recovery_hold_with(id, &mut |_, _| Ok(()))
+        .unwrap();
+    assert!(
+        d.initialize_key_state_with(&id, operation, &mut |s| {
+            if s == stage {
+                Err(KeyFileError::Io)
+            } else {
+                Ok(())
+            }
+        })
+        .is_err()
+    );
+    let marker = stdfs::read(a.0.join(recovery_hold::MARKER)).unwrap();
+    KeyInitialState {
+        area_id: id,
+        operation_id: operation,
+        snapshot_hash: marker[73..].try_into().unwrap(),
+        generation: 1,
+    }
+}
+
+#[test]
+fn state_recovery_post_exchange_boundaries_reopen_preserve_keys_and_remain_held() {
+    use initial_state::StateStage as S;
+    for stage in [
+        S::MarkerExchanged,
+        S::MarkerSynced,
+        S::StateInstalled,
+        S::StateSynced,
+        S::BeforeCleanup,
+        S::OldMarkerRemoved,
+        S::CleanupSynced,
+    ] {
+        let a = Area::new();
+        let (key, pass) = fixture();
+        a.put("publisher", &key);
+        a.put(".lngnb-key-unknown", b"public unrelated residue");
+        let expected = interrupted_initial_state(&a, stage);
+        let guard = stdfs::read(a.0.join(recovery_hold::GUARD)).unwrap();
+        let marker = stdfs::read(a.0.join(recovery_hold::MARKER)).unwrap();
+        let mut d = KeyDirectory::open(&a.0).unwrap();
+        assert_eq!(d.recover_initial_key_state(&expected).unwrap(), expected);
+        assert_eq!(d.initial_key_state(&expected.area_id).unwrap(), expected);
+        // 同じ明示指示を再実行しても新しい履歴を作らない。
+        assert_eq!(d.recover_initial_key_state(&expected).unwrap(), expected);
+        let bytes = stdfs::read(a.0.join(initial_state::STATE)).unwrap();
+        let mut source = marker[..73].to_vec();
+        source[19] = b'1';
+        initial_state_reference(&source, &bytes, &marker, expected);
+        assert!(d.load("publisher", &pass).is_ok());
+        e(
+            d.create("later", "public pass"),
+            KeyFileError::PendingRecovery,
+        );
+        e(
+            d.recover_initial_hold(&expected.area_id),
+            KeyFileError::RecoveryStateInvalid,
+        );
+        assert_eq!(stdfs::read(a.0.join("publisher")).unwrap(), key);
+        assert_eq!(stdfs::read(a.0.join(recovery_hold::GUARD)).unwrap(), guard);
+        assert_eq!(
+            stdfs::read(a.0.join(recovery_hold::MARKER)).unwrap(),
+            marker
+        );
+        assert_eq!(
+            stdfs::read(a.0.join(".lngnb-key-unknown")).unwrap(),
+            b"public unrelated residue"
+        );
+        drop(d);
+        let mut d = KeyDirectory::open(&a.0).unwrap();
+        assert_eq!(d.initial_key_state(&expected.area_id).unwrap(), expected);
+        e(
+            d.create("later", "public pass"),
+            KeyFileError::PendingRecovery,
+        );
+    }
+}
+
+#[test]
+fn state_recovery_failures_can_be_explicitly_retried_after_reopen() {
+    use initial_state::{StateRecoveryStage as R, StateStage as S};
+    for start in [S::MarkerExchanged, S::StateInstalled, S::OldMarkerRemoved] {
+        for stage in [
+            R::FilesSynced,
+            R::MarkerSynced,
+            R::BeforeInstall,
+            R::StateInstalled,
+            R::StateSynced,
+            R::BeforeCleanup,
+            R::OldMarkerRemoved,
+            R::CleanupSynced,
+        ] {
+            let a = Area::new();
+            a.put("publisher", b"public preserved key stand-in");
+            let expected = interrupted_initial_state(&a, start);
+            let mut d = KeyDirectory::open(&a.0).unwrap();
+            let error = if matches!(
+                stage,
+                R::StateSynced | R::BeforeCleanup | R::OldMarkerRemoved | R::CleanupSynced
+            ) {
+                KeyFileError::RecoveryStateCleanupUncertain
+            } else {
+                KeyFileError::RecoveryStateUncertain
+            };
+            e(
+                d.recover_initial_key_state_with(&expected, &mut |s| {
+                    if s == stage {
+                        Err(KeyFileError::Io)
+                    } else {
+                        Ok(())
+                    }
+                }),
+                error,
+            );
+            drop(d);
+            let mut d = KeyDirectory::open(&a.0).unwrap();
+            e(
+                d.create("later", "public pass"),
+                KeyFileError::PendingRecovery,
+            );
+            assert_eq!(d.recover_initial_key_state(&expected).unwrap(), expected);
+            assert_eq!(
+                stdfs::read(a.0.join("publisher")).unwrap(),
+                b"public preserved key stand-in"
+            );
+        }
+    }
+}
+
+#[test]
+fn state_recovery_rejects_missing_incomplete_mismatched_and_ambiguous_inputs_unchanged() {
+    use initial_state::StateStage as S;
+    for phase in 0..18 {
+        let a = Area::new();
+        let mut expected = interrupted_initial_state(&a, S::MarkerExchanged);
+        let state = initial_state_temp(expected.operation_id, "snapshot");
+        let old = initial_state_temp(expected.operation_id, "marker");
+        match phase {
+            0 => expected.area_id[0] ^= 1,
+            1 => expected.operation_id[0] ^= 1,
+            2 => expected.snapshot_hash[0] ^= 1,
+            3 => expected.generation = 2,
+            4 => stdfs::remove_file(a.0.join(&state)).unwrap(),
+            5 => stdfs::write(a.0.join(&state), b"public incomplete snapshot").unwrap(),
+            6 => stdfs::remove_file(a.0.join(&old)).unwrap(),
+            7 => stdfs::write(a.0.join(&old), b"public wrong source").unwrap(),
+            8 => a.put(initial_state::STATE, b"public competing state"),
+            9 => a.put(
+                ".lngnb-key-state-snapshot-unresolved",
+                b"public extra candidate",
+            ),
+            10 => stdfs::remove_file(a.0.join(recovery_hold::GUARD)).unwrap(),
+            11 => stdfs::write(a.0.join(recovery_hold::GUARD), b"public wrong guard").unwrap(),
+            12 => stdfs::write(a.0.join(recovery_hold::MARKER), b"public unknown marker").unwrap(),
+            13 => {
+                stdfs::remove_file(a.0.join(&state)).unwrap();
+                symlink(&old, a.0.join(&state)).unwrap();
+            }
+            14 => {
+                stdfs::remove_file(a.0.join(&state)).unwrap();
+                stdfs::hard_link(a.0.join(&old), a.0.join(&state)).unwrap();
+            }
+            15 => stdfs::set_permissions(a.0.join(&state), stdfs::Permissions::from_mode(0o644))
+                .unwrap(),
+            16 => stdfs::write(a.0.join(&state), vec![0; initial_state::STATE_LIMIT + 1]).unwrap(),
+            _ => {
+                let old_bytes = stdfs::read(a.0.join(&old)).unwrap();
+                stdfs::write(a.0.join(recovery_hold::MARKER), old_bytes).unwrap();
+            }
+        }
+        let snapshot = || {
+            let mut entries: Vec<_> = stdfs::read_dir(&a.0)
+                .unwrap()
+                .map(|e| {
+                    let path = e.unwrap().path();
+                    (
+                        path.file_name().unwrap().to_owned(),
+                        stdfs::symlink_metadata(&path).unwrap().ino(),
+                        stdfs::read(&path).unwrap_or_default(),
+                    )
+                })
+                .collect();
+            entries.sort();
+            entries
+        };
+        let before = snapshot();
+        let mut d = KeyDirectory::open(&a.0).unwrap();
+        assert!(d.recover_initial_key_state(&expected).is_err());
+        assert_eq!(snapshot(), before);
+        e(
+            d.recover_initial_hold(&expected.area_id),
+            KeyFileError::RecoveryStateInvalid,
+        );
+        e(
+            d.create("later", "public pass"),
+            KeyFileError::PendingRecovery,
+        );
+    }
+}
+
+#[test]
+fn state_recovery_races_preserve_foreign_files_and_stop() {
+    use initial_state::{StateRecoveryStage as R, StateStage as S};
+    for phase in 0..6 {
+        let a = Area::new();
+        let expected = interrupted_initial_state(&a, S::MarkerExchanged);
+        let state = initial_state_temp(expected.operation_id, "snapshot");
+        let old = initial_state_temp(expected.operation_id, "marker");
+        let mut d = KeyDirectory::open(&a.0).unwrap();
+        assert!(
+            d.recover_initial_key_state_with(&expected, &mut |s| {
+                if s == if phase < 4 {
+                    R::BeforeInstall
+                } else {
+                    R::BeforeCleanup
+                } {
+                    let target = match phase {
+                        0 => recovery_hold::MARKER,
+                        1 => state.as_str(),
+                        2 => recovery_hold::GUARD,
+                        3 => {
+                            a.put(initial_state::STATE, b"public competing state");
+                            return Ok(());
+                        }
+                        4 => old.as_str(),
+                        _ => initial_state::STATE,
+                    };
+                    let bytes = stdfs::read(a.0.join(target)).unwrap();
+                    stdfs::rename(a.0.join(target), a.0.join("saved-original")).unwrap();
+                    a.put(target, &bytes);
+                }
+                Ok(())
+            })
+            .is_err()
+        );
+        assert!(a.0.join(&old).exists());
+        e(
+            d.create("later", "public pass"),
+            KeyFileError::PendingRecovery,
+        );
+        if phase == 3 {
+            assert_eq!(
+                stdfs::read(a.0.join(initial_state::STATE)).unwrap(),
+                b"public competing state"
+            );
+        }
+    }
+}
+
+#[test]
+fn state_recovery_directory_fd_binding_copy_rejection_and_scan_limit() {
+    use initial_state::StateStage as S;
+    let a = Area::new();
+    let expected = interrupted_initial_state(&a, S::MarkerExchanged);
+    let b = Area::new();
+    for entry in stdfs::read_dir(&a.0).unwrap() {
+        let path = entry.unwrap().path();
+        b.put(
+            path.file_name().unwrap().to_str().unwrap(),
+            &stdfs::read(&path).unwrap(),
+        );
+    }
+    let mut copied = KeyDirectory::open(&b.0).unwrap();
+    e(
+        copied.recover_initial_key_state(&expected),
+        KeyFileError::RecoveryStateInvalid,
+    );
+    drop(copied);
+    let mut d = KeyDirectory::open(&a.0).unwrap();
+    e(KeyDirectory::open(&a.0), KeyFileError::Busy);
+    let moved = a.0.with_extension("moved");
+    stdfs::rename(&a.0, &moved).unwrap();
+    stdfs::DirBuilder::new().mode(0o700).create(&a.0).unwrap();
+    a.put("untouched", b"public replacement directory");
+    assert_eq!(d.recover_initial_key_state(&expected).unwrap(), expected);
+    assert_eq!(stdfs::read_dir(&a.0).unwrap().count(), 1);
+    drop(d);
+    stdfs::remove_dir_all(&moved).unwrap();
+
+    let a = Area::new();
+    let expected = interrupted_initial_state(&a, S::MarkerExchanged);
+    let count = stdfs::read_dir(&a.0).unwrap().count();
+    for i in count..=SCAN_LIMIT {
+        use std::os::unix::fs::OpenOptionsExt;
+        stdfs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(a.0.join(format!("public-filler-{i}")))
+            .unwrap();
+    }
+    let mut d = KeyDirectory::open(&a.0).unwrap();
+    e(
+        d.recover_initial_key_state(&expected),
+        KeyFileError::ScanLimit,
+    );
+    assert!(!a.0.join(initial_state::STATE).exists());
+    stdfs::remove_file(a.0.join(format!("public-filler-{SCAN_LIMIT}"))).unwrap();
+    assert_eq!(d.recover_initial_key_state(&expected).unwrap(), expected);
+}
+
+#[test]
+fn state_recovery_process_kill_then_explicit_retry_maintains_stop() {
+    use initial_state::{StateRecoveryStage as R, StateStage as S};
+    if let Some(path) = std::env::var_os("LNGNB_PUBLIC_STATE_RECOVERY_KILL_AREA") {
+        let path = PathBuf::from(path);
+        assert!(
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("lngnb-keytest-")
+        );
+        assert_eq!(
+            stdfs::read(path.join("fixture-marker")).unwrap(),
+            b"public recovery fixture"
+        );
+        let marker = stdfs::read(path.join(recovery_hold::MARKER)).unwrap();
+        let expected = KeyInitialState {
+            area_id: [0x42; 32],
+            operation_id: [0x24; 32],
+            snapshot_hash: marker[73..].try_into().unwrap(),
+            generation: 1,
+        };
+        let point = std::env::var("LNGNB_PUBLIC_STATE_RECOVERY_KILL_POINT").unwrap();
+        let mut d = KeyDirectory::open(&path).unwrap();
+        let _ = d.recover_initial_key_state_with(&expected, &mut |s| {
+            if format!("{s:?}") == point {
+                println!("READY");
+                std::io::stdout().flush().unwrap();
+                loop {
+                    std::thread::park();
+                }
+            }
+            Ok(())
+        });
+        panic!("kill point not reached");
+    }
+    for stage in [
+        R::FilesSynced,
+        R::MarkerSynced,
+        R::StateInstalled,
+        R::StateSynced,
+        R::OldMarkerRemoved,
+    ] {
+        let a = Area::new();
+        let (key, pass) = fixture();
+        a.put("publisher", &key);
+        a.put("fixture-marker", b"public recovery fixture");
+        let expected = interrupted_initial_state(&a, S::MarkerExchanged);
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "keyfile::files::tests::state_recovery_process_kill_then_explicit_retry_maintains_stop", "--nocapture"])
+            .env("LNGNB_PUBLIC_STATE_RECOVERY_KILL_AREA", &a.0)
+            .env("LNGNB_PUBLIC_STATE_RECOVERY_KILL_POINT", format!("{stage:?}"))
+            .stdout(Stdio::piped()).spawn().unwrap();
+        let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        loop {
+            line.clear();
+            assert!(stdout.read_line(&mut line).unwrap() > 0);
+            if line.trim() == "READY" {
+                break;
+            }
+        }
+        child.kill().unwrap();
+        assert!(!child.wait().unwrap().success());
+        let mut d = KeyDirectory::open(&a.0).unwrap();
+        e(d.create("later", &pass), KeyFileError::PendingRecovery);
+        e(
+            d.recover_initial_hold(&expected.area_id),
+            KeyFileError::RecoveryStateInvalid,
+        );
+        assert_eq!(d.recover_initial_key_state(&expected).unwrap(), expected);
+        assert!(d.load("publisher", &pass).is_ok());
+        assert_eq!(stdfs::read(a.0.join("publisher")).unwrap(), key);
+        e(d.create("later", &pass), KeyFileError::PendingRecovery);
+    }
+}
