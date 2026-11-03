@@ -2,6 +2,8 @@
 import hashlib
 import json
 import sys
+import os
+from pathlib import Path
 
 import cbor2
 
@@ -86,5 +88,47 @@ def main():
     print(json.dumps({"checked": len(cases)}))
 
 
+def started():
+    case = json.load(sys.stdin)
+    source, backup = Path(case["source"]), Path(case["backup"])
+    old_raw, new_raw = bytes.fromhex(case["old"]), bytes.fromhex(case["new"])
+    old, new = cbor2.loads(old_raw), cbor2.loads(new_raw)
+    assert encode(old) == old_raw and encode(new) == new_raw
+    assert set(old) == set(new) == {"format", "area_id", "source_marker", "events"}
+    for key in ("format", "area_id", "source_marker"):
+        assert old[key] == new[key]
+    assert new["events"][:-1] == old["events"]
+    assert hashlib.sha256(new_raw).hexdigest() == case["hash"]
+    def directory(m):
+        return {"dev": m.st_dev.to_bytes(8, "big"), "ino": m.st_ino.to_bytes(8, "big"),
+                "uid": m.st_uid.to_bytes(4, "big")}
+    def file(m):
+        return dict(directory(m), length=m.st_size.to_bytes(8, "big"),
+                    nlink=m.st_nlink.to_bytes(8, "big"), mode=m.st_mode.to_bytes(4, "big"),
+                    mtime_seconds=m.st_mtime_ns//10**9, mtime_nanoseconds=m.st_mtime_ns % 10**9,
+                    ctime_seconds=m.st_ctime_ns//10**9, ctime_nanoseconds=m.st_ctime_ns % 10**9)
+    original = (source / case["target"]).read_bytes()
+    assert original == (backup / case["preserved"]).read_bytes()
+    expected = {
+        "sequence": len(old["events"])+1, "operation_id": bytes.fromhex(case["operation"]),
+        "kind": "residue_cleanup_started", "actor_uid": os.geteuid().to_bytes(4, "big"),
+        "recorded_unix_seconds": 42, "rules": "lngnb-key-operations-1",
+        "target": {"name": case["target"], "identity": file((source / case["target"]).stat()),
+                   "ciphertext_sha256": hashlib.sha256(original).digest(),
+                   "public_key": bytes.fromhex(case["public_key"])},
+        "preserved": {"directory": directory(backup.stat()), "name": case["preserved"],
+                      "identity": file((backup / case["preserved"]).stat())},
+    }
+    assert new["events"][-1] == expected
+    initial = dict(new, events=new["events"][:1])
+    marker = (source / ".lngnb-key-control").read_bytes()
+    assert marker == b"lngnb:key-recovery:2\0" + new["source_marker"][21:] + hashlib.sha256(encode(initial)).digest()
+    assert (source / ".lngnb-key-hold").read_bytes() == b"lngnb:key-hold:1\0" + new["area_id"]
+    print(json.dumps({"checked": 1}))
+
+
 if __name__ == "__main__":
-    main()
+    if sys.argv[1:] == ["--started"]:
+        started()
+    else:
+        main()

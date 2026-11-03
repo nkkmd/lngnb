@@ -364,7 +364,7 @@ impl KeyDirectory {
         Ok(bytes)
     }
 
-    fn state_binding(&self, n: &str, bytes: &[u8], file: &File) -> Result<()> {
+    pub(super) fn state_binding(&self, n: &str, bytes: &[u8], file: &File) -> Result<()> {
         let before = io(file.metadata())?;
         private_file(&before, rustix::process::geteuid().as_raw())?;
         let path = os(fs::statat(&self.dir, n, AtFlags::SYMLINK_NOFOLLOW))?;

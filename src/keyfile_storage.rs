@@ -22,6 +22,11 @@ pub use initial_state::KeyInitialState;
 #[path = "keyfile_state_history.rs"]
 mod state_history;
 pub use state_history::{KeyHistoryState, KeyStateDiagnostic};
+#[path = "keyfile_cleanup_start.rs"]
+mod cleanup_start;
+pub use cleanup_start::{
+    KeyCleanupExpected, KeyCleanupStart, KeyDirectoryIdentity, KeyFileIdentity, PreparedKeyCleanup,
+};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyFileError {
     UnsafePath,
@@ -45,9 +50,9 @@ pub enum KeyFileError {
     RecoveryStateInvalid,
     /// 明示停止の作成開始後。保存確定/未保存を断定せず全fileを保持する。
     RecoveryHoldUncertain,
-    /// 履歴導入開始後。保存確定/未保存を断定せず全fileを保持する。
+    /// 履歴導入/追記開始後。保存確定/未保存を断定せず全fileを保持する。
     RecoveryStateUncertain,
-    /// 履歴導入の保存確認後、一時名整理・最終照合等が未完了/不確実。
+    /// 履歴導入/追記の保存確認後、一時名整理・最終照合等が未完了/不確実。
     RecoveryStateCleanupUncertain,
     /// 交換/配置済みだがdirectory fsync成功を確認できない。成功/rollbackを断定しない。
     CommitUncertain,
