@@ -384,11 +384,23 @@ fn history_rejects_noncanonical_duplicate_trailing_and_unknown_version_bytes() {
 #[test]
 fn history_fixed_examples_match_independent_python_cbor_hash_and_reservation() {
     for (count, expected) in [
-        (1, "161597de563dacd25992b52daf83e55b9c9d5f4a1ce79a4442ca8a01ed7c9e03"),
-        (2, "c7fc7582330291d79397ebb8d56d4bc1f0ae69ba2dfd0d9858ade0439f865a30"),
-        (3, "c4a6ad0555d9fc630e1588d1ce5b45a5b00425ab0be27d3614aef021e808b5f2"),
+        (
+            1,
+            "161597de563dacd25992b52daf83e55b9c9d5f4a1ce79a4442ca8a01ed7c9e03",
+        ),
+        (
+            2,
+            "c7fc7582330291d79397ebb8d56d4bc1f0ae69ba2dfd0d9858ade0439f865a30",
+        ),
+        (
+            3,
+            "c4a6ad0555d9fc630e1588d1ce5b45a5b00425ab0be27d3614aef021e808b5f2",
+        ),
     ] {
-        assert_eq!(data_encoding::HEXLOWER.encode(&decode(&history(count)).unwrap().snapshot_hash), expected);
+        assert_eq!(
+            data_encoding::HEXLOWER.encode(&decode(&history(count)).unwrap().snapshot_hash),
+            expected
+        );
     }
     let cases: Vec<_> = [1, 2, 3, 24, 256, 1023]
         .into_iter()
@@ -490,7 +502,12 @@ fn history_directory_diagnostic_preserves_stop_and_rejects_initial_api_bypass() 
     assert!(dir.initialize_key_state(&area_id).is_err());
     assert!(dir.initialize_recovery_hold().is_err());
     assert!(dir.recover_initial_hold(&area_id).is_err());
-    assert_eq!(dir.load("publisher", "public test password").unwrap().public_key(), public);
+    assert_eq!(
+        dir.load("publisher", "public test password")
+            .unwrap()
+            .public_key(),
+        public
+    );
     assert_eq!(stdfs::read(path.join("publisher")).unwrap(), key_before);
     assert_eq!(
         dir.create("later", "public test password").err(),
