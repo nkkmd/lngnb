@@ -9,6 +9,8 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 static NEXT: AtomicU64 = AtomicU64::new(0);
+#[path = "keyfile_cleanup_start_tests.rs"]
+mod cleanup_start_tests;
 struct Area(PathBuf);
 impl Area {
     fn new() -> Self {
