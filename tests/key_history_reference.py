@@ -69,6 +69,8 @@ def main():
                    started_operation_id=bytes(32),
                    disposition="confirmed_absent_on_recovery")
     max_length = len(encode(maximum))
+    assert max_length == 264
+    assert root == "161597de563dacd25992b52daf83e55b9c9d5f4a1ce79a4442ca8a01ed7c9e03"
     for case in cases:
         expected = snapshot(case["count"])
         raw = bytes.fromhex(case["snapshot"])

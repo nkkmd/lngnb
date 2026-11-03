@@ -209,6 +209,6 @@ mod tests;
 mod files;
 #[cfg(target_os = "linux")]
 pub use files::{
-    KeyDirectory, KeyFileError, KeyHistoryState, KeyInitialState, KeyRecoveryEntry, KeyRecoveryHold,
-    KeyRecoveryInventory, KeyStateDiagnostic,
+    KeyDirectory, KeyFileError, KeyHistoryState, KeyInitialState, KeyRecoveryEntry,
+    KeyRecoveryHold, KeyRecoveryInventory, KeyStateDiagnostic,
 };

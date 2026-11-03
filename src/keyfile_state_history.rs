@@ -49,7 +49,9 @@ fn keys(value: &Value, expected: &[&str]) -> Result<()> {
         return invalid();
     };
     if m.len() != expected.len()
-        || expected.iter().any(|key| m.iter().filter(|(k, _)| k == key).count() != 1)
+        || expected
+            .iter()
+            .any(|key| m.iter().filter(|(k, _)| k.as_str() == *key).count() != 1)
     {
         return invalid();
     }
@@ -59,7 +61,9 @@ fn bytes<const N: usize>(v: &Value) -> Result<[u8; N]> {
     let Value::Bytes(b) = v else {
         return invalid();
     };
-    b.as_slice().try_into().map_err(|_| KeyFileError::RecoveryStateInvalid)
+    b.as_slice()
+        .try_into()
+        .map_err(|_| KeyFileError::RecoveryStateInvalid)
 }
 fn text(v: &Value) -> Result<&str> {
     match v {
@@ -83,14 +87,26 @@ fn encoded(v: &Value) -> Result<Vec<u8>> {
     cbor::encode(v).map_err(|_| KeyFileError::RecoveryStateInvalid)
 }
 fn identity(v: &Value, owner: [u8; 4]) -> Result<()> {
-    keys(v, &[
-        "dev", "ino", "length", "nlink", "uid", "mode", "mtime_seconds",
-        "ctime_seconds", "mtime_nanoseconds", "ctime_nanoseconds",
-    ])?;
+    keys(
+        v,
+        &[
+            "dev",
+            "ino",
+            "length",
+            "nlink",
+            "uid",
+            "mode",
+            "mtime_seconds",
+            "ctime_seconds",
+            "mtime_nanoseconds",
+            "ctime_nanoseconds",
+        ],
+    )?;
     bytes::<8>(field(v, "dev")?)?;
     bytes::<8>(field(v, "ino")?)?;
     let length = u64::from_be_bytes(bytes(field(v, "length")?)?);
-    if length == 0 || length > MAX_KEYFILE_BYTES as u64
+    if length == 0
+        || length > MAX_KEYFILE_BYTES as u64
         || u64::from_be_bytes(bytes(field(v, "nlink")?)?) != 1
         || bytes::<4>(field(v, "uid")?)? != owner
         || u32::from_be_bytes(bytes(field(v, "mode")?)?) != 0o100600
@@ -108,11 +124,16 @@ fn identity(v: &Value, owner: [u8; 4]) -> Result<()> {
 }
 fn started(event: &Value, source: &[u8]) -> Result<()> {
     let target = field(event, "target")?;
-    keys(target, &["name", "identity", "ciphertext_sha256", "public_key"])?;
+    keys(
+        target,
+        &["name", "identity", "ciphertext_sha256", "public_key"],
+    )?;
     if !recovery_name(text(field(target, "name")?)?) {
         return invalid();
     }
-    let owner = source[69..73].try_into().map_err(|_| KeyFileError::RecoveryStateInvalid)?;
+    let owner = source[69..73]
+        .try_into()
+        .map_err(|_| KeyFileError::RecoveryStateInvalid)?;
     identity(field(target, "identity")?, owner)?;
     bytes::<32>(field(target, "ciphertext_sha256")?)?;
     bytes::<32>(field(target, "public_key")?)?;
@@ -160,18 +181,29 @@ fn maximum_completion_bytes() -> Result<usize> {
     ]);
     Ok(encoded(&v)?.len())
 }
-fn completion_fits(count: usize, prefix_bytes: usize, completion_bytes: usize, limit: usize) -> bool {
+fn completion_fits(
+    count: usize,
+    prefix_bytes: usize,
+    completion_bytes: usize,
+    limit: usize,
+) -> bool {
     count < 1024
-        && prefix_bytes.checked_add(completion_bytes)
+        && prefix_bytes
+            .checked_add(completion_bytes)
             .and_then(|n| n.checked_add(array_head(count + 1) - array_head(count)))
             .is_some_and(|n| n <= limit)
 }
 
 pub(super) fn decode_history(
-    snapshot: &[u8], source: &[u8], area_id: [u8; 32], root: [u8; 32],
+    snapshot: &[u8],
+    source: &[u8],
+    area_id: [u8; 32],
+    root: [u8; 32],
 ) -> Result<KeyStateDiagnostic> {
-    if snapshot.len() > initial_state::STATE_LIMIT || source.len() != 73
-        || !source.starts_with(b"lngnb:key-recovery:1\0") || source[21..53] != area_id
+    if snapshot.len() > initial_state::STATE_LIMIT
+        || source.len() != 73
+        || !source.starts_with(b"lngnb:key-recovery:1\0")
+        || source[21..53] != area_id
     {
         return invalid();
     }
@@ -226,7 +258,14 @@ pub(super) fn decode_history(
         equal_text(field(event, "rules")?, RULES)?;
         prefix_bytes += encoded(event)?.len() + array_head(count) - array_head(i);
         if kind == STARTED {
-            if active.is_some() || !completion_fits(count, prefix_bytes, completion_bytes, initial_state::STATE_LIMIT) {
+            if active.is_some()
+                || !completion_fits(
+                    count,
+                    prefix_bytes,
+                    completion_bytes,
+                    initial_state::STATE_LIMIT,
+                )
+            {
                 return invalid();
             }
             started(event, source)?;
@@ -250,7 +289,9 @@ pub(super) fn decode_history(
         generation: events.len() as u64,
         snapshot_hash: Sha256::digest(snapshot).into(),
         state: match active {
-            Some(started_operation_id) => KeyHistoryState::Active { started_operation_id },
+            Some(started_operation_id) => KeyHistoryState::Active {
+                started_operation_id,
+            },
             None => KeyHistoryState::Held,
         },
     })
@@ -276,7 +317,9 @@ impl KeyDirectory {
             return invalid();
         }
         let snapshot = self.state_bytes(initial_state::STATE, initial_state::STATE_LIMIT)?;
-        let root = marker[73..].try_into().map_err(|_| KeyFileError::RecoveryStateInvalid)?;
+        let root = marker[73..]
+            .try_into()
+            .map_err(|_| KeyFileError::RecoveryStateInvalid)?;
         let result = decode_history(&snapshot, &source, area_id, root)?;
         if self.read(recovery_hold::MARKER)? != marker
             || self.read(recovery_hold::GUARD)? != guard
