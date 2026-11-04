@@ -4,8 +4,15 @@ use super::*;
 pub(in super::super) mod recovery;
 
 enum ResumeSnapshot {
-    New { operation: [u8; 32], now: i64 },
-    Existing { old_bytes: Vec<u8>, new_bytes: Vec<u8>, intent: KeyResumeIntent },
+    New {
+        operation: [u8; 32],
+        now: i64,
+    },
+    Existing {
+        old_bytes: Vec<u8>,
+        new_bytes: Vec<u8>,
+        intent: KeyResumeIntent,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -199,12 +206,16 @@ impl PreparedKeyResume<'_> {
         inventory(self.source, temporary)
     }
     fn qualify(
-        &self, temporary: Option<&str>, hook: &mut impl FnMut(ResumeStage) -> Result<()>,
+        &self,
+        temporary: Option<&str>,
+        hook: &mut impl FnMut(ResumeStage) -> Result<()>,
         extra: &mut impl FnMut() -> Result<()>,
     ) -> Result<()> {
         use ResumeStage as S;
         let mut check = || -> Result<()> {
-            if temporary.is_none() { self.check_held()?; } else {
+            if temporary.is_none() {
+                self.check_held()?;
+            } else {
                 self.check(temporary)?;
                 self.state.check(self.source, initial_state::STATE, true)?;
             }
@@ -230,15 +241,11 @@ impl PreparedKeyResume<'_> {
         self.state.sync()?;
         hook(S::ControlsSynced)?;
         check()?;
-        self
-            .state
-            .check(self.source, initial_state::STATE, true)?;
+        self.state.check(self.source, initial_state::STATE, true)?;
         io(self.source.dir.sync_all())?;
         hook(S::Qualified)?;
         check()?;
-        self
-            .state
-            .check(self.source, initial_state::STATE, true)?;
+        self.state.check(self.source, initial_state::STATE, true)?;
         Ok(())
     }
     /// 再開意思の一eventと全履歴だけを保存。guard/鍵/保全先を削除しない。
@@ -395,25 +402,53 @@ impl KeyDirectory {
     ) -> Result<PreparedKeyResume<'a>> {
         name(current_name)?;
         name(backup_name)?;
-        if backups.is_empty() || backups.len() > 512 || proofs.len() > 511 { return invalid(); }
+        if backups.is_empty() || backups.len() > 512 || proofs.len() > 511 {
+            return invalid();
+        }
         if expected.state.state != KeyHistoryState::Held
-            || self.key_state_history(&expected.state.initial.area_id)? != expected.state { return invalid(); }
-        if inventory(self, None)? >= SCAN_LIMIT { return Err(KeyFileError::ScanLimit); }
-        let prepared = self.prepare_resume_snapshot(current_name, passphrase, backups, current_backup,
-            backup_name, proofs, expected, ResumeSnapshot::New { operation, now })?;
+            || self.key_state_history(&expected.state.initial.area_id)? != expected.state
+        {
+            return invalid();
+        }
+        if inventory(self, None)? >= SCAN_LIMIT {
+            return Err(KeyFileError::ScanLimit);
+        }
+        let prepared = self.prepare_resume_snapshot(
+            current_name,
+            passphrase,
+            backups,
+            current_backup,
+            backup_name,
+            proofs,
+            expected,
+            ResumeSnapshot::New { operation, now },
+        )?;
         prepared.qualify(None, hook, &mut || Ok(()))?;
         Ok(prepared)
     }
     // Private qualification only. Existing bytes are never constructed or saved by recovery.
     #[allow(clippy::too_many_arguments)]
     fn prepare_resume_snapshot<'a>(
-        &'a mut self, current_name: &str, passphrase: &str, backups: &'a mut [KeyDirectory],
-        current_backup: usize, backup_name: &str, proofs: &[KeyResumePreservation<'_>],
-        expected: &KeyResumeExpected, snapshot: ResumeSnapshot,
+        &'a mut self,
+        current_name: &str,
+        passphrase: &str,
+        backups: &'a mut [KeyDirectory],
+        current_backup: usize,
+        backup_name: &str,
+        proofs: &[KeyResumePreservation<'_>],
+        expected: &KeyResumeExpected,
+        snapshot: ResumeSnapshot,
     ) -> Result<PreparedKeyResume<'a>> {
-        name(current_name)?; name(backup_name)?; self.secure()?;
-        if backups.is_empty() || backups.len() > 512 || proofs.len() > 511
-            || expected.state.state != KeyHistoryState::Held { return invalid(); }
+        name(current_name)?;
+        name(backup_name)?;
+        self.secure()?;
+        if backups.is_empty()
+            || backups.len() > 512
+            || proofs.len() > 511
+            || expected.state.state != KeyHistoryState::Held
+        {
+            return invalid();
+        }
         let source_identity = KeyDirectoryIdentity::from_metadata(&io(self.dir.metadata())?);
         let mut backup_identities = Vec::new();
         for dir in backups.iter() {
@@ -454,8 +489,7 @@ impl KeyDirectory {
         {
             return invalid();
         }
-        let mut value =
-            cbor::decode(&old_bytes).map_err(|_| KeyFileError::RecoveryStateInvalid)?;
+        let mut value = cbor::decode(&old_bytes).map_err(|_| KeyFileError::RecoveryStateInvalid)?;
         let events = array(field(&value, "events")?)?;
         let completed: Vec<_> = events
             .iter()
@@ -550,36 +584,99 @@ impl KeyDirectory {
         }
         let bindings = vec![
             ("reason", text("reviewed_current_key_and_preservations")),
-            ("current", map(vec![("name", text(current_name)), ("identity", expected.current.value()),
-                ("ciphertext_sha256", bytes(expected.ciphertext_sha256)), ("public_key", bytes(expected.public_key))])),
-            ("preserved", map(vec![("directory", expected.preserved_directory.value()), ("name", text(backup_name)),
-                ("identity", expected.preserved.value())])),
-            ("guard_identity", expected.guard.value()), ("cleanup_operations", Value::Array(references)),
+            (
+                "current",
+                map(vec![
+                    ("name", text(current_name)),
+                    ("identity", expected.current.value()),
+                    ("ciphertext_sha256", bytes(expected.ciphertext_sha256)),
+                    ("public_key", bytes(expected.public_key)),
+                ]),
+            ),
+            (
+                "preserved",
+                map(vec![
+                    ("directory", expected.preserved_directory.value()),
+                    ("name", text(backup_name)),
+                    ("identity", expected.preserved.value()),
+                ]),
+            ),
+            ("guard_identity", expected.guard.value()),
+            ("cleanup_operations", Value::Array(references)),
         ];
         let (new_bytes, intent) = match snapshot {
             ResumeSnapshot::New { operation, now } => {
-                let mut fields = vec![("sequence", Value::Int(expected.state.generation as i64 + 1)),
-                    ("operation_id", bytes(operation)), ("kind", text("key_changes_resumed")),
-                    ("actor_uid", bytes(rustix::process::geteuid().as_raw().to_be_bytes())),
-                    ("recorded_unix_seconds", Value::Int(now)), ("rules", text("lngnb-key-operations-1"))];
+                let mut fields = vec![
+                    ("sequence", Value::Int(expected.state.generation as i64 + 1)),
+                    ("operation_id", bytes(operation)),
+                    ("kind", text("key_changes_resumed")),
+                    (
+                        "actor_uid",
+                        bytes(rustix::process::geteuid().as_raw().to_be_bytes()),
+                    ),
+                    ("recorded_unix_seconds", Value::Int(now)),
+                    ("rules", text("lngnb-key-operations-1")),
+                ];
                 fields.extend(bindings);
-                let Value::Map(items) = &mut value else { return invalid(); };
-                let Some((_, Value::Array(events))) = items.iter_mut().find(|(k, _)| k == "events") else { return invalid(); };
+                let Value::Map(items) = &mut value else {
+                    return invalid();
+                };
+                let Some((_, Value::Array(events))) = items.iter_mut().find(|(k, _)| k == "events")
+                else {
+                    return invalid();
+                };
                 events.push(map(fields));
                 let new_bytes = encoded(&value)?;
-                let after = state_history::decode_history(&new_bytes, &source_marker, expected.state.initial.area_id, expected.state.initial.snapshot_hash)?;
-                (new_bytes, KeyResumeIntent { before: expected.state, after, operation_id: operation })
+                let after = state_history::decode_history(
+                    &new_bytes,
+                    &source_marker,
+                    expected.state.initial.area_id,
+                    expected.state.initial.snapshot_hash,
+                )?;
+                (
+                    new_bytes,
+                    KeyResumeIntent {
+                        before: expected.state,
+                        after,
+                        operation_id: operation,
+                    },
+                )
             }
-            ResumeSnapshot::Existing { new_bytes, intent, .. } => {
-                let after = state_history::decode_history(&new_bytes, &source_marker, expected.state.initial.area_id, expected.state.initial.snapshot_hash)?;
-                if intent.before != expected.state || intent.before.generation.checked_add(1) != Some(intent.after.generation)
-                    || after != intent.after || after.initial != intent.before.initial
-                    || after.state != (KeyHistoryState::Ready { resumed_operation_id: intent.operation_id }) { return invalid(); }
-                let value = cbor::decode(&new_bytes).map_err(|_| KeyFileError::RecoveryStateInvalid)?;
-                let event = array(field(&value, "events")?)?.last().ok_or(KeyFileError::RecoveryStateInvalid)?;
+            ResumeSnapshot::Existing {
+                new_bytes, intent, ..
+            } => {
+                let after = state_history::decode_history(
+                    &new_bytes,
+                    &source_marker,
+                    expected.state.initial.area_id,
+                    expected.state.initial.snapshot_hash,
+                )?;
+                if intent.before != expected.state
+                    || intent.before.generation.checked_add(1) != Some(intent.after.generation)
+                    || after != intent.after
+                    || after.initial != intent.before.initial
+                    || after.state
+                        != (KeyHistoryState::Ready {
+                            resumed_operation_id: intent.operation_id,
+                        })
+                {
+                    return invalid();
+                }
+                let value =
+                    cbor::decode(&new_bytes).map_err(|_| KeyFileError::RecoveryStateInvalid)?;
+                let event = array(field(&value, "events")?)?
+                    .last()
+                    .ok_or(KeyFileError::RecoveryStateInvalid)?;
                 if field(event, "kind")? != &text("key_changes_resumed")
-                    || field(event, "operation_id")? != &bytes(intent.operation_id) { return invalid(); }
-                for (key, expected_value) in bindings { if !equal(field(event, key)?, &expected_value)? { return invalid(); } }
+                    || field(event, "operation_id")? != &bytes(intent.operation_id)
+                {
+                    return invalid();
+                }
+                for (key, expected_value) in bindings {
+                    if !equal(field(event, key)?, &expected_value)? {
+                        return invalid();
+                    }
+                }
                 (new_bytes, intent)
             }
         };
