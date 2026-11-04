@@ -246,11 +246,19 @@ pub(super) fn decode_history(
     for (i, event) in events.iter().enumerate().skip(1) {
         let count = i + 1;
         let kind = text(field(event, "kind")?)?;
-        if ready.is_some() { return invalid(); }
+        if ready.is_some() {
+            return invalid();
+        }
         let additional: &[&str] = match kind {
             STARTED => &["target", "preserved"],
             COMPLETED => &["started_operation_id", "disposition"],
-            RESUMED => &["current", "preserved", "guard_identity", "cleanup_operations", "reason"],
+            RESUMED => &[
+                "current",
+                "preserved",
+                "guard_identity",
+                "cleanup_operations",
+                "reason",
+            ],
             _ => return invalid(),
         };
         let mut expected = COMMON.to_vec();
@@ -288,7 +296,9 @@ pub(super) fn decode_history(
             active = None;
             completions.push(bytes::<32>(field(event, "operation_id")?)?);
         } else {
-            if active.is_some() { return invalid(); }
+            if active.is_some() {
+                return invalid();
+            }
             resume::validate(event, source, &completions)?;
             ready = Some(bytes::<32>(field(event, "operation_id")?)?);
         }
@@ -302,7 +312,9 @@ pub(super) fn decode_history(
         generation: events.len() as u64,
         snapshot_hash: Sha256::digest(snapshot).into(),
         state: match (ready, active) {
-            (Some(resumed_operation_id), _) => KeyHistoryState::Ready { resumed_operation_id },
+            (Some(resumed_operation_id), _) => KeyHistoryState::Ready {
+                resumed_operation_id,
+            },
             (None, Some(started_operation_id)) => KeyHistoryState::Active {
                 started_operation_id,
             },
@@ -338,9 +350,14 @@ impl KeyDirectory {
         let result = decode_history(&snapshot, &source, area_id, root)?;
         if matches!(result.state, KeyHistoryState::Ready { .. }) {
             let value = cbor::decode(&snapshot).map_err(|_| KeyFileError::RecoveryStateInvalid)?;
-            let Value::Array(events) = field(&value, "events")? else { return invalid(); };
+            let Value::Array(events) = field(&value, "events")? else {
+                return invalid();
+            };
             if resume::guard_identity(events.last().ok_or(KeyFileError::RecoveryStateInvalid)?)?
-                != KeyFileIdentity::from_metadata(&guard_meta) { return invalid(); }
+                != KeyFileIdentity::from_metadata(&guard_meta)
+            {
+                return invalid();
+            }
         }
         self.recheck_hold_handle(recovery_hold::GUARD, &guard, &guard_file, &guard_meta)?;
         if self.read(recovery_hold::MARKER)? != marker

@@ -2,17 +2,29 @@
 use super::*;
 
 pub(super) fn validate(event: &Value, source: &[u8], completions: &[[u8; 32]]) -> Result<()> {
-    let owner: [u8; 4] = source[69..73].try_into().map_err(|_| KeyFileError::RecoveryStateInvalid)?;
-    if bytes::<4>(field(event, "actor_uid")?)? != owner { return invalid(); }
-    equal_text(field(event, "reason")?, "reviewed_current_key_and_preservations")?;
+    let owner: [u8; 4] = source[69..73]
+        .try_into()
+        .map_err(|_| KeyFileError::RecoveryStateInvalid)?;
+    if bytes::<4>(field(event, "actor_uid")?)? != owner {
+        return invalid();
+    }
+    equal_text(
+        field(event, "reason")?,
+        "reviewed_current_key_and_preservations",
+    )?;
     let current = field(event, "current")?;
-    keys(current, &["name", "identity", "ciphertext_sha256", "public_key"])?;
+    keys(
+        current,
+        &["name", "identity", "ciphertext_sha256", "public_key"],
+    )?;
     name(text(field(current, "name")?)?).map_err(|_| KeyFileError::RecoveryStateInvalid)?;
     bytes::<32>(field(current, "ciphertext_sha256")?)?;
     bytes::<32>(field(current, "public_key")?)?;
     let current_id = field(current, "identity")?;
     identity(current_id, owner)?;
-    if bytes::<8>(field(current_id, "dev")?)? != source[53..61] { return invalid(); }
+    if bytes::<8>(field(current_id, "dev")?)? != source[53..61] {
+        return invalid();
+    }
     let preserved = field(event, "preserved")?;
     keys(preserved, &["directory", "name", "identity"])?;
     name(text(field(preserved, "name")?)?).map_err(|_| KeyFileError::RecoveryStateInvalid)?;
@@ -21,22 +33,43 @@ pub(super) fn validate(event: &Value, source: &[u8], completions: &[[u8; 32]]) -
     let dev = bytes::<8>(field(directory, "dev")?)?;
     let ino = bytes::<8>(field(directory, "ino")?)?;
     if bytes::<4>(field(directory, "uid")?)? != owner
-        || (dev == source[53..61] && ino == source[61..69]) { return invalid(); }
+        || (dev == source[53..61] && ino == source[61..69])
+    {
+        return invalid();
+    }
     let preserved_id = field(preserved, "identity")?;
     identity(preserved_id, owner)?;
     if bytes::<8>(field(preserved_id, "dev")?)? != dev
-        || field(current_id, "length")? != field(preserved_id, "length")? { return invalid(); }
+        || field(current_id, "length")? != field(preserved_id, "length")?
+    {
+        return invalid();
+    }
     let guard = field(event, "guard_identity")?;
     identity(guard, owner)?;
     if bytes::<8>(field(guard, "dev")?)? != source[53..61]
-        || u64::from_be_bytes(bytes(field(guard, "length")?)?) != 49 { return invalid(); }
-    for (a, b) in [(current_id, preserved_id), (current_id, guard), (preserved_id, guard)] {
-        if field(a, "dev")? == field(b, "dev")? && field(a, "ino")? == field(b, "ino")? { return invalid(); }
+        || u64::from_be_bytes(bytes(field(guard, "length")?)?) != 49
+    {
+        return invalid();
     }
-    let Value::Array(references) = field(event, "cleanup_operations")? else { return invalid(); };
-    if references.len() != completions.len() { return invalid(); }
+    for (a, b) in [
+        (current_id, preserved_id),
+        (current_id, guard),
+        (preserved_id, guard),
+    ] {
+        if field(a, "dev")? == field(b, "dev")? && field(a, "ino")? == field(b, "ino")? {
+            return invalid();
+        }
+    }
+    let Value::Array(references) = field(event, "cleanup_operations")? else {
+        return invalid();
+    };
+    if references.len() != completions.len() {
+        return invalid();
+    }
     for (reference, expected) in references.iter().zip(completions) {
-        if &bytes::<32>(reference)? != expected { return invalid(); }
+        if &bytes::<32>(reference)? != expected {
+            return invalid();
+        }
     }
     Ok(())
 }
