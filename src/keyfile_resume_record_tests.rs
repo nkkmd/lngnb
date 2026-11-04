@@ -1004,3 +1004,6 @@ fn resume_record_fd_limit_refuses_without_writing() {
         f.old
     );
 }
+
+#[path = "keyfile_resume_recovery_tests.rs"]
+mod recovery_tests;
