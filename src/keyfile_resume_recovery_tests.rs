@@ -382,8 +382,12 @@ fn resume_recovery_other_layouts_interrupted_then_explicit_retry() {
             S::Prepared,
             S::StateSynced,
             S::BeforeCleanup,
+            S::OldSnapshotRemoved,
             S::CleanupSynced,
         ] {
+            if layout == S::OldSnapshotRemoved && point == S::OldSnapshotRemoved {
+                continue;
+            }
             let mut f = Fixture::new(false, 0);
             let intent = f.interrupt(layout);
             assert!(
