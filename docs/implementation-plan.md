@@ -2313,7 +2313,7 @@ lib7件を追加。状態と全prefix/root・旧actorUID非遡及、各map全キ
 - 必要なEXCHANGEと新snapshotのdirectory fsync後にだけ指定旧snapshotの物理コピーを整理し、directoryを再fsyncする。保持fd/path/bytesとrename前後の属性を照合し、同bytes別inodeを整理しない。正常鍵・保全先・marker・guard・全履歴を保持する。
 - 全検査は10,000 entry/1 MiB/1024件の既存上限を維持する。復旧で新規entry枠を消費せず、未知prefixを除外しない。成功しても論理Ready＋guardによる通常変更停止を維持する。
 
-対象試験は三配置・共有/別保全・整理なし/全整理履歴・受領値不一致・不完全/欠損/未知/複数候補・guard不在・全保全の認証/対応/同bytes別inode・各保存境界の中断と再open明示再試行・整理直前の候補差替えを含む。成功後は既存独立Pythonで固定schema・全履歴/root/hash・現物の完全bytes/identityとguard現存を照合する。ローカルRust未導入による未実行と、対象headのCI結果を区別してPRへ記録する。
+対象試験は三配置・共有/別保全・整理なし/全整理履歴・受領値不一致・不完全/欠損/未知/複数候補・guard不在・全保全の認証/対応/同bytes別inode・三配置での各保存境界の中断と再open明示再試行・復旧自身のSIGKILL三点・整理直前の同bytes別inode差替え・codec正当/新hash一致でも旧prefix不一致・実一覧10,000件と10,001件の境界を含む。成功後は既存独立Pythonで固定schema・全履歴/root/hash・現物の完全bytes/identityとguard現存を照合する。当初のローカルRust未導入による未実行、検証環境の追加導入、対象headの実行結果とCI結果を区別してPRへ記録する。
 
 次はguard解除とその中断復旧を別の最小単位で扱う。本節は停止解除・安全な鍵置換・通常更新・工程⑤全体の完了ではない。
 
