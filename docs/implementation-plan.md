@@ -2300,7 +2300,7 @@ lib7件を追加。状態と全prefix/root・旧actorUID非遡及、各map全キ
 
 過去整理の履歴はfixture内の合成であり、過去のunlink/fsync成功を証明しない。製品が今回生成した再開snapshotは独立Pythonの--recordedで全旧prefix・全完了対応・現在の全file/directory identity/hash/完全bytes・新event全field/root/hashへ照合する。Pythonの形式/hash検査をAEAD認証の代替にせず、製品の両認証/過去保全認証は誤passphrase等で検証する。hook/SIGKILLを実EIO/電源断相当の合格へ読み替えない。
 
-通常687件予定（679＋lib8＝lib526/main59/CLI3/data11/document1/key1/record69/core13/terminal1/scale3）。専用ext4必須2件/既存79件再実行・条件数を二重加算しない。ローカルRust/cargo/rustfmt不在でAST/diff/静的整合確認とCI実行を区別し、対象local/PR head/仮マージ/main commit/tree、自己/対象head独立レビュー、初回失敗/skipped/未実行と最終CI実測をPRへ残す。次は同じ控え・現在の全保全/認証を要求する三形の明示追記復旧、その後にguard解除/解除復旧を分割する。必要な復旧が揃う前にguard削除へ接続しない。通常更新schema/復旧disposition、安全置換/CLI、v1/不完全marker/guard/候補の一般処置、socket§5.91保留、残る共通管理接続/総合監査は継続中で、工程⑤全体/初期版完成とは扱わない。
+通常687件予定（679＋lib8＝lib526/main59/CLI3/data11/document1/key1/record69/core13/terminal1/scale3）。 中間headのCI41785020391/job126425080826は通常687件成功後、専用ext4検証中に約30分でcancelledとなった。ログの取消メッセージと30分設定/実測からjob上限到達の可能性が高いと判断し、CI job実行上限だけを45分へ広げる。取消原因の詳細annotationを得たとは扱わず、この推定を区別する。試験選択/条件・件数・製品の時間/SQL予算・権限/正式合格条件は変更せず、ext4/ビルド等の未完了工程は新headで再実行する。専用ext4必須2件/既存79件再実行・条件数を二重加算しない。ローカルRust/cargo/rustfmt不在でAST/diff/静的整合確認とCI実行を区別し、対象local/PR head/仮マージ/main commit/tree、自己/対象head独立レビュー、初回失敗/skipped/未実行と最終CI実測をPRへ残す。次は同じ控え・現在の全保全/認証を要求する三形の明示追記復旧、その後にguard解除/解除復旧を分割する。必要な復旧が揃う前にguard削除へ接続しない。通常更新schema/復旧disposition、安全置換/CLI、v1/不完全marker/guard/候補の一般処置、socket§5.91保留、残る共通管理接続/総合監査は継続中で、工程⑤全体/初期版完成とは扱わない。
 
 ## 6. 実装ゲートと試験方針
 
