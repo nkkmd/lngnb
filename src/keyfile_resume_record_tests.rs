@@ -798,7 +798,20 @@ fn child_context() -> Option<ChildContext> {
     let area = marker[21..53].try_into().unwrap();
     let key = stdfs::read(Path::new(&source).join("publisher")).unwrap();
     let expected = KeyResumeExpected {
-        state: dir.key_state_history(&area).unwrap(),
+        state: match std::env::var("LNGNB_PUBLIC_RESUME_OLD") {
+            Ok(hex) => {
+                let mut original = marker[..73].to_vec();
+                original[19] = b'1';
+                state_history::decode_history(
+                    &data_encoding::HEXLOWER.decode(hex.as_bytes()).unwrap(),
+                    &original,
+                    area,
+                    marker[73..].try_into().unwrap(),
+                )
+                .unwrap()
+            }
+            Err(_) => dir.key_state_history(&area).unwrap(),
+        },
         current: identity(&Path::new(&source).join("publisher")),
         ciphertext_sha256: Sha256::digest(&key).into(),
         public_key: public(),
@@ -1004,3 +1017,6 @@ fn resume_record_fd_limit_refuses_without_writing() {
         f.old
     );
 }
+
+#[path = "keyfile_resume_recovery_tests.rs"]
+mod recovery_tests;
