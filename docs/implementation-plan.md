@@ -2216,14 +2216,14 @@ snapshotの4キー・初回event・source_markerの73 bytes・恒久marker v2の
 
 | 要素 | 必須内容とcodecの照合 |
 |---|---|
-| 共通6項目 | §5.100の`sequence`/`operation_id`/`kind`/`actor_uid`/`recorded_unix_seconds`/`rules`をそのまま使用。配列順の連続sequence、新規CSPRNG32 bytesのoperation_id、source_markerの所有者と一致する4 bytes big-endian UID、0〜2^63-1のUnix秒、正確に`lngnb-key-operations-1`。時計逆行だけで履歴を破棄しない |
+| 共通6項目 | §5.100の`sequence`/`operation_id`/`kind`/`actor_uid`/`recorded_unix_seconds`/`rules`をそのまま使用。配列順の連続sequence、新規CSPRNG32 bytesのoperation_id、4 bytes big-endian UID、0〜2^63-1のUnix秒、正確に`lngnb-key-operations-1`。この新kindだけはactor_uidとsource_markerの所有者の一致も必須とし、既存kindの過去UIDにこの追加条件を遡及適用しない。時計逆行だけで履歴を破棄しない |
 | 追加5項目 | `current`、`preserved`、`guard_identity`、`cleanup_operations`、`reason`だけ。reasonは正確に`reviewed_current_key_and_preservations`。自由文や確認フラグの受領だけを本人認証/再開資格にしない |
 | current | 必須キー`name`/`identity`/`ciphertext_sha256`/`public_key`。nameは既存通常名規則（ASCII英数字と`._-`、1〜128 bytes、`.`/`..`と予約prefixを禁止）。hashは完全暗号文の通常SHA-256 32 bytes、公開鍵は期待Ed25519公開鍵32 bytes。identityは§5.100の全10項目と同じ符号化で、devはsource_markerのdev、uidはその所有者、modeは0o100600、nlinkは1、lengthは1〜4096。この値の型検査だけではA11の認証/完全bytes一致を証明しない |
 | preserved | 必須キー`directory`/`name`/`identity`。directoryは§5.100のdev/ino各8 bytes・uid4 bytes big-endianで、元と異なるdev/inoかつ同じ所有者。nameは通常名。identityは同じ全10項目でdev/uidは保全先directory、mode0o100600・nlink1、lengthはcurrentと同じ。currentのhash/公開鍵へ対応する保全先であり、別のhash/public_keyを重複保存しない |
 | guard_identity | §5.100の全10項目。dev/uidはsource_marker、mode0o100600・nlink1・lengthは正確に49。currentと同じdev/inoは拒否。file bytesは既存のASCII `lngnb:key-hold:1`＋NUL＋area_idで、I/O時に完全照合する。guardは元のHeldで保持していた同じinodeへ束縛し、同じarea_idの別inodeへの置換を認めない |
 | cleanup_operations | 32 bytesの**完了eventのoperation_id**の配列。このeventより前の全`residue_cleanup_completed`を配列順に一件ずつ、漏れ/追加/重複/並べ替えなく列挙する。各完了のstarted_operation_idから、同じ履歴に保持された対象・hash/期待公開鍵・保全先identityを一意に導く。整理完了がなければ空配列。未完了開始があれば再開自体を拒否する |
 
-identityのdev/ino/length/nlinkは各8 bytes、uid/modeは各4 bytes big-endian、mtime/ctime秒はi64整数、各nanosecondsは0〜999,999,999整数とし、u64をi63へ切り詰めない。必要な相互照合は全履歴/記録されたfieldに対して行い、過去eventのidentityを現在値へ書き換えない。currentとpreservedの安全な認証/完全bytes一致や今回fsyncは、codecとは別の保持fd資格で検証する。
+identityのdev/ino/length/nlinkは各8 bytes、uid/modeは各4 bytes big-endian、mtime/ctime秒はi64整数、各nanosecondsは0〜999,999,999整数とし、u64をi63へ切り詰めない。current・preserved・guard_identityの三fileはdev/inoの組を相互に別とする。別directoryであっても同じfile identityは拒否し、単一link条件との矛盾を受理しない。必要な相互照合は全履歴/記録されたfieldに対して行い、過去eventのidentityを現在値へ書き換えない。currentとpreservedの安全な認証/完全bytes一致や今回fsyncは、codecとは別の保持fd資格で検証する。
 
 全eventのoperation_idは初回を含めて一意。新eventは未完了操作のないHeldでだけ許し、履歴上Held→Readyを一件で導く。別の開始eventは作らず、既存Heldのguardを保持したまま再開の意思と現物を一eventへ記録する。Readyは`residue_cleanup_completed`から導かない。このschema群でReadyは末尾にだけ現れ、Readyからの再開再記録・整理開始/完了・初回event再挿入を拒否する。通常更新の未知kindを読み飛ばしてReadyを返さない。将来の通常更新schemaを追加するまでは、Ready後のeventは受理しない。
 
@@ -2245,7 +2245,7 @@ identityのdev/ino/length/nlinkは各8 bytes、uid/modeは各4 bytes big-endian�
 
 #### 中断の受領値と明示復旧
 
-再開の準備値には旧Heldの完全診断（area_id/初回root/世代/hash）と、操作ID・新Readyの世代/hashを含む控えを、追記前に取得できるようにする。控えは非秘密の照合値で、認証・今回保存・解除資格の証明ではない。新規追記と明示復旧を別の入口にし、復旧へも同じ現在鍵/全保全先と認証入力・明示した控えを要求する。任意Valueや任意guardを消す汎用APIは作らない。
+再開の準備値には旧Heldの完全診断（area_id/初回root/世代/hash）と、操作ID・新Readyの世代/hashを含む控えを、追記前に取得できるようにする。控えは非秘密の照合値で、認証・今回保存・解除資格の証明ではない。新規追記と明示復旧を別の入口にし、復旧へも同じ現在鍵/全保全先と認証入力・明示した控えを要求する。任意Valueや任意guardを消す汎用APIは作らない。復旧表の「全資格」は現在鍵/全保全先・全整理対象の不在・directory安全性・marker/root/完全履歴と、その行に定めた固定state/guard条件を指す。旧Heldが固定名に残ることやguard現存を全行で一律には要求せず、旧Heldは必要に応じて新履歴のprefixから再構成する。
 
 | 中断形 | 復旧の範囲と拒否 |
 |---|---|
