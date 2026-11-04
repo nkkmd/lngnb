@@ -270,60 +270,130 @@ fn resume_recovery_same_bytes_candidate_replacement_is_not_deleted() {
 #[test]
 fn resume_recovery_process_kill_then_explicit_retry_retains_guard() {
     if let Some(mut context) = child_context() {
-        let new = data_encoding::HEXLOWER.decode(std::env::var("LNGNB_PUBLIC_RESUME_NEW").unwrap().as_bytes()).unwrap();
-        let marker = stdfs::read(Path::new(&std::env::var_os("LNGNB_PUBLIC_RESUME_SOURCE").unwrap()).join(recovery_hold::MARKER)).unwrap();
-        let mut original = marker[..73].to_vec(); original[19] = b'1';
+        let new = data_encoding::HEXLOWER
+            .decode(std::env::var("LNGNB_PUBLIC_RESUME_NEW").unwrap().as_bytes())
+            .unwrap();
+        let marker = stdfs::read(
+            Path::new(&std::env::var_os("LNGNB_PUBLIC_RESUME_SOURCE").unwrap())
+                .join(recovery_hold::MARKER),
+        )
+        .unwrap();
+        let mut original = marker[..73].to_vec();
+        original[19] = b'1';
         let initial = context.expected.state.initial;
-        let after = state_history::decode_history(&new, &original, initial.area_id, initial.snapshot_hash).unwrap();
-        let intent = KeyResumeIntent { before: context.expected.state, after, operation_id: context.operation };
-        let proofs: Vec<_> = context.manifest.iter().map(|(id, index, name)| KeyResumePreservation {
-            completed_operation_id: *id, directory_index: *index, name, passphrase: &context.pass,
-        }).collect();
+        let after =
+            state_history::decode_history(&new, &original, initial.area_id, initial.snapshot_hash)
+                .unwrap();
+        let intent = KeyResumeIntent {
+            before: context.expected.state,
+            after,
+            operation_id: context.operation,
+        };
+        let proofs: Vec<_> = context
+            .manifest
+            .iter()
+            .map(|(id, index, name)| KeyResumePreservation {
+                completed_operation_id: *id,
+                directory_index: *index,
+                name,
+                passphrase: &context.pass,
+            })
+            .collect();
         let point = std::env::var("LNGNB_PUBLIC_RESUME_POINT").unwrap();
-        let _ = context.source.recover_key_resume_record_with("publisher", &context.pass, &mut context.backups,
-            0, "saved", &proofs, &context.expected, &intent, &mut |stage| {
+        let _ = context.source.recover_key_resume_record_with(
+            "publisher",
+            &context.pass,
+            &mut context.backups,
+            0,
+            "saved",
+            &proofs,
+            &context.expected,
+            &intent,
+            &mut |stage| {
                 if format!("{stage:?}") == point {
-                    println!("READY"); std::io::stdout().flush().unwrap();
-                    loop { std::thread::park(); }
+                    println!("READY");
+                    std::io::stdout().flush().unwrap();
+                    loop {
+                        std::thread::park();
+                    }
                 }
                 Ok(())
-            });
+            },
+        );
         panic!("kill point not reached");
     }
     for point in ["Prepared", "Exchanged", "OldSnapshotRemoved"] {
         let mut f = Fixture::new(true, 2);
         let intent = f.interrupt(S::Prepared);
         let new = stdfs::read(f.temp()).unwrap();
-        f.source.take(); f.backups.clear();
-        let mut command = child_command(&f, "keyfile::files::tests::resume_record_tests::recovery_tests::resume_recovery_process_kill_then_explicit_retry_retains_guard");
-        let mut child = command.env("LNGNB_PUBLIC_RESUME_OLD", data_encoding::HEXLOWER.encode(&f.old))
-            .env("LNGNB_PUBLIC_RESUME_NEW", data_encoding::HEXLOWER.encode(&new))
-            .env("LNGNB_PUBLIC_RESUME_POINT", point).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        f.source.take();
+        f.backups.clear();
+        let mut command = child_command(
+            &f,
+            "keyfile::files::tests::resume_record_tests::recovery_tests::resume_recovery_process_kill_then_explicit_retry_retains_guard",
+        );
+        let mut child = command
+            .env(
+                "LNGNB_PUBLIC_RESUME_OLD",
+                data_encoding::HEXLOWER.encode(&f.old),
+            )
+            .env(
+                "LNGNB_PUBLIC_RESUME_NEW",
+                data_encoding::HEXLOWER.encode(&new),
+            )
+            .env("LNGNB_PUBLIC_RESUME_POINT", point)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
         let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
         let mut ready = false;
         for _ in 0..10 {
             let mut line = String::new();
-            if output.read_line(&mut line).unwrap() == 0 { break; }
-            if line.trim() == "READY" { ready = true; break; }
+            if output.read_line(&mut line).unwrap() == 0 {
+                break;
+            }
+            if line.trim() == "READY" {
+                ready = true;
+                break;
+            }
         }
         assert!(ready, "recovery kill boundary not reached");
-        child.kill().unwrap(); assert!(!child.wait().unwrap().success());
+        child.kill().unwrap();
+        assert!(!child.wait().unwrap().success());
         f.reopen();
         f.retained();
         assert_eq!(f.recover(&intent, &mut |_| Ok(())).unwrap(), intent.after);
-        f.retained(); f.independent(intent);
+        f.retained();
+        f.independent(intent);
     }
 }
 
 #[test]
 fn resume_recovery_other_layouts_interrupted_then_explicit_retry() {
     for layout in [S::Exchanged, S::OldSnapshotRemoved] {
-        for point in [S::CurrentSynced, S::PreservationSynced(0), S::DirectoriesSynced,
-            S::ControlsSynced, S::Qualified, S::SnapshotsSynced, S::Prepared, S::StateSynced,
-            S::BeforeCleanup, S::CleanupSynced] {
+        for point in [
+            S::CurrentSynced,
+            S::PreservationSynced(0),
+            S::DirectoriesSynced,
+            S::ControlsSynced,
+            S::Qualified,
+            S::SnapshotsSynced,
+            S::Prepared,
+            S::StateSynced,
+            S::BeforeCleanup,
+            S::CleanupSynced,
+        ] {
             let mut f = Fixture::new(false, 0);
             let intent = f.interrupt(layout);
-            assert!(f.recover(&intent, &mut |stage| if stage == point { Err(KeyFileError::Io) } else { Ok(()) }).is_err());
+            assert!(
+                f.recover(&intent, &mut |stage| if stage == point {
+                    Err(KeyFileError::Io)
+                } else {
+                    Ok(())
+                })
+                .is_err()
+            );
             f.reopen();
             assert_eq!(f.recover(&intent, &mut |_| Ok(())).unwrap(), intent.after);
             f.retained();
@@ -344,7 +414,14 @@ fn resume_recovery_valid_new_hash_cannot_replace_the_expected_old_prefix() {
     intent.after.snapshot_hash = Sha256::digest(&encoded).into();
     stdfs::write(&path, &encoded).unwrap();
     // new snapshot is codec-valid and matches the supplied new hash; old prefix differs.
-    assert_eq!(f.source.as_mut().unwrap().key_state_history(&intent.before.initial.area_id).unwrap(), intent.after);
+    assert_eq!(
+        f.source
+            .as_mut()
+            .unwrap()
+            .key_state_history(&intent.before.initial.area_id)
+            .unwrap(),
+        intent.after
+    );
     assert!(f.recover(&intent, &mut |_| Ok(())).is_err());
     assert_eq!(stdfs::read(&path).unwrap(), encoded);
     f.retained();
@@ -359,7 +436,10 @@ fn resume_recovery_full_inventory_needs_no_new_entry_but_over_limit_is_refused()
     }
     stdfs::write(f.a.0.join("over-limit"), []).unwrap();
     assert!(f.recover(&intent, &mut |_| Ok(())).is_err());
-    assert_eq!(stdfs::read(f.a.0.join(initial_state::STATE)).unwrap(), f.old);
+    assert_eq!(
+        stdfs::read(f.a.0.join(initial_state::STATE)).unwrap(),
+        f.old
+    );
     stdfs::remove_file(f.a.0.join("over-limit")).unwrap();
     assert_eq!(f.recover(&intent, &mut |_| Ok(())).unwrap(), intent.after);
     assert_eq!(stdfs::read_dir(&f.a.0).unwrap().count(), 9_999);

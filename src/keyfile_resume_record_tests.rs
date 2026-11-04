@@ -800,9 +800,15 @@ fn child_context() -> Option<ChildContext> {
     let expected = KeyResumeExpected {
         state: match std::env::var("LNGNB_PUBLIC_RESUME_OLD") {
             Ok(hex) => {
-                let mut original = marker[..73].to_vec(); original[19] = b'1';
-                state_history::decode_history(&data_encoding::HEXLOWER.decode(hex.as_bytes()).unwrap(),
-                    &original, area, marker[73..].try_into().unwrap()).unwrap()
+                let mut original = marker[..73].to_vec();
+                original[19] = b'1';
+                state_history::decode_history(
+                    &data_encoding::HEXLOWER.decode(hex.as_bytes()).unwrap(),
+                    &original,
+                    area,
+                    marker[73..].try_into().unwrap(),
+                )
+                .unwrap()
             }
             Err(_) => dir.key_state_history(&area).unwrap(),
         },

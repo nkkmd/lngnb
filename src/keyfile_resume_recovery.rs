@@ -27,6 +27,7 @@ fn bound(
     }
     Ok(())
 }
+#[allow(clippy::too_many_arguments)]
 fn check_layout(
     context: &PreparedKeyResume<'_>,
     temporary: Option<&HeldFile>,
