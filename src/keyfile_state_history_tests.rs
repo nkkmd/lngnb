@@ -1,6 +1,8 @@
 //! §5.100/R27/R34: 公開固定値だけ。製品の追記/物理整理試験ではない。
 use super::*;
 use std::process::{Command, Stdio};
+#[path = "keyfile_resume_codec_tests.rs"]
+mod resume_tests;
 
 fn m(items: Vec<(&str, Value)>) -> Value {
     Value::Map(items.into_iter().map(|(k, v)| (k.into(), v)).collect())

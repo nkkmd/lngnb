@@ -8,6 +8,9 @@ const RULES: &str = "lngnb-key-operations-1";
 const STARTED: &str = "residue_cleanup_started";
 const COMPLETED: &str = "residue_cleanup_completed";
 const ABSENT: &str = "confirmed_absent_on_recovery";
+const RESUMED: &str = "key_changes_resumed";
+#[path = "keyfile_resume_codec.rs"]
+mod resume;
 const COMMON: [&str; 6] = [
     "sequence",
     "operation_id",
@@ -17,11 +20,12 @@ const COMMON: [&str; 6] = [
     "rules",
 ];
 
-/// 履歴から導いた状態。Ready・通常変更許可・削除資格を表す値は持たない。
+/// 履歴だけから導いた状態。Readyも認証・保存確定・通常変更許可ではない。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyHistoryState {
     Held,
     Active { started_operation_id: [u8; 32] },
+    Ready { resumed_operation_id: [u8; 32] },
 }
 
 /// 現在の有界読取りの整合だけ。認証・過去のfsync・保全確定の証明ではない。
@@ -235,18 +239,30 @@ pub(super) fn decode_history(
     }
     let mut ids = BTreeSet::from([operation_id]);
     let mut active = None;
+    let mut ready = None;
+    let mut completions = Vec::new();
     let mut prefix_bytes = initial_bytes.len();
     let completion_bytes = maximum_completion_bytes()?;
     for (i, event) in events.iter().enumerate().skip(1) {
         let count = i + 1;
         let kind = text(field(event, "kind")?)?;
-        let additional = match kind {
-            STARTED => ["target", "preserved"],
-            COMPLETED => ["started_operation_id", "disposition"],
+        if ready.is_some() {
+            return invalid();
+        }
+        let additional: &[&str] = match kind {
+            STARTED => &["target", "preserved"],
+            COMPLETED => &["started_operation_id", "disposition"],
+            RESUMED => &[
+                "current",
+                "preserved",
+                "guard_identity",
+                "cleanup_operations",
+                "reason",
+            ],
             _ => return invalid(),
         };
         let mut expected = COMMON.to_vec();
-        expected.extend(additional);
+        expected.extend_from_slice(additional);
         keys(event, &expected)?;
         if integer(field(event, "sequence")?)? != count as i64
             || !ids.insert(bytes::<32>(field(event, "operation_id")?)?)
@@ -270,7 +286,7 @@ pub(super) fn decode_history(
             }
             started(event, source)?;
             active = Some(bytes(field(event, "operation_id")?)?);
-        } else {
+        } else if kind == COMPLETED {
             let reference = bytes::<32>(field(event, "started_operation_id")?)?;
             if active != Some(reference)
                 || !["removed_present", ABSENT].contains(&text(field(event, "disposition")?)?)
@@ -278,6 +294,13 @@ pub(super) fn decode_history(
                 return invalid();
             }
             active = None;
+            completions.push(bytes::<32>(field(event, "operation_id")?)?);
+        } else {
+            if active.is_some() {
+                return invalid();
+            }
+            resume::validate(event, source, &completions)?;
+            ready = Some(bytes::<32>(field(event, "operation_id")?)?);
         }
     }
     // 全件を保持したまま検査。初回一件への切詰め/履歴再生成はしない。
@@ -288,11 +311,14 @@ pub(super) fn decode_history(
         initial,
         generation: events.len() as u64,
         snapshot_hash: Sha256::digest(snapshot).into(),
-        state: match active {
-            Some(started_operation_id) => KeyHistoryState::Active {
+        state: match (ready, active) {
+            (Some(resumed_operation_id), _) => KeyHistoryState::Ready {
+                resumed_operation_id,
+            },
+            (None, Some(started_operation_id)) => KeyHistoryState::Active {
                 started_operation_id,
             },
-            None => KeyHistoryState::Held,
+            (None, None) => KeyHistoryState::Held,
         },
     })
 }
@@ -316,11 +342,24 @@ impl KeyDirectory {
         if self.read(recovery_hold::GUARD)? != guard {
             return invalid();
         }
+        let (guard_file, guard_meta) = self.checked_hold_handle(recovery_hold::GUARD, &guard)?;
         let snapshot = self.state_bytes(initial_state::STATE, initial_state::STATE_LIMIT)?;
         let root = marker[73..]
             .try_into()
             .map_err(|_| KeyFileError::RecoveryStateInvalid)?;
         let result = decode_history(&snapshot, &source, area_id, root)?;
+        if matches!(result.state, KeyHistoryState::Ready { .. }) {
+            let value = cbor::decode(&snapshot).map_err(|_| KeyFileError::RecoveryStateInvalid)?;
+            let Value::Array(events) = field(&value, "events")? else {
+                return invalid();
+            };
+            if resume::guard_identity(events.last().ok_or(KeyFileError::RecoveryStateInvalid)?)?
+                != KeyFileIdentity::from_metadata(&guard_meta)
+            {
+                return invalid();
+            }
+        }
+        self.recheck_hold_handle(recovery_hold::GUARD, &guard, &guard_file, &guard_meta)?;
         if self.read(recovery_hold::MARKER)? != marker
             || self.read(recovery_hold::GUARD)? != guard
             || self.state_bytes(initial_state::STATE, initial_state::STATE_LIMIT)? != snapshot
