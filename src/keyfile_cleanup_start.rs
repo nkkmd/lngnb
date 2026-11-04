@@ -5,11 +5,13 @@ pub(super) mod completion;
 pub(super) mod recovery;
 #[path = "keyfile_resume_record.rs"]
 pub(super) mod resume_record;
-pub use resume_record::{KeyResumeExpected, KeyResumeIntent, KeyResumePreservation, PreparedKeyResume};
 use super::*;
 use crate::cbor::{self, Value};
 pub use completion::{
     KeyCleanupCompletion, KeyCleanupDisposition, PreparedAbsentCleanup, PreparedResidueRemoval,
+};
+pub use resume_record::{
+    KeyResumeExpected, KeyResumeIntent, KeyResumePreservation, PreparedKeyResume,
 };
 use sha2::{Digest, Sha256};
 use std::{

@@ -26,8 +26,9 @@ pub use state_history::{KeyHistoryState, KeyStateDiagnostic};
 mod cleanup_start;
 pub use cleanup_start::{
     KeyCleanupCompletion, KeyCleanupDisposition, KeyCleanupExpected, KeyCleanupStart,
-    KeyDirectoryIdentity, KeyFileIdentity, PreparedAbsentCleanup, PreparedKeyCleanup,
-    PreparedResidueRemoval, KeyResumeExpected, KeyResumeIntent, KeyResumePreservation, PreparedKeyResume,
+    KeyDirectoryIdentity, KeyFileIdentity, KeyResumeExpected, KeyResumeIntent,
+    KeyResumePreservation, PreparedAbsentCleanup, PreparedKeyCleanup, PreparedKeyResume,
+    PreparedResidueRemoval,
 };
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyFileError {
