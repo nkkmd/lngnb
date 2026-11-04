@@ -208,7 +208,7 @@ impl KeyDirectory {
             ResumeSnapshot::Existing {
                 old_bytes,
                 new_bytes,
-                intent: *intent,
+                intent,
             },
         )?;
         if context.state.bytes != fixed.bytes

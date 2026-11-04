@@ -3,7 +3,7 @@ use super::*;
 #[path = "keyfile_resume_recovery.rs"]
 pub(in super::super) mod recovery;
 
-enum ResumeSnapshot {
+enum ResumeSnapshot<'a> {
     New {
         operation: [u8; 32],
         now: i64,
@@ -11,7 +11,7 @@ enum ResumeSnapshot {
     Existing {
         old_bytes: Vec<u8>,
         new_bytes: Vec<u8>,
-        intent: KeyResumeIntent,
+        intent: &'a KeyResumeIntent,
     },
 }
 
@@ -437,7 +437,7 @@ impl KeyDirectory {
         backup_name: &str,
         proofs: &[KeyResumePreservation<'_>],
         expected: &KeyResumeExpected,
-        snapshot: ResumeSnapshot,
+        snapshot: ResumeSnapshot<'_>,
     ) -> Result<PreparedKeyResume<'a>> {
         name(current_name)?;
         name(backup_name)?;
@@ -677,7 +677,7 @@ impl KeyDirectory {
                         return invalid();
                     }
                 }
-                (new_bytes, intent)
+                (new_bytes, *intent)
             }
         };
         let prepared = PreparedKeyResume {
