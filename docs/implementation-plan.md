@@ -2181,7 +2181,7 @@ Readyは履歴上の論理状態だけでは許可にならない。履歴・恒
 | 2. 開始履歴 | 旧通常名のidentity/hash/期待公開鍵、検査済み新暗号文のhash/長さ/同じ期待公開鍵、元のReady、今回guard、操作IDと予定した一つの新鍵一時名を束縛する開始を、全prefix保持の原子的追記と今回file/directory fsyncで確定し、旧snapshot物理コピーの整理も完了する。開始を記録できなければguardを保持して停止。新暗号文fileの作成/通常名交換へ進まない |
 | 3. 新暗号文file | 保存済み開始を再検査し、それに束縛した予約一時名だけをO_EXCLで新規作成。書込み→file fsync→認証/期待公開鍵/完全bytes・fd/path identity検査→directory fsync。既存候補を採用・切詰め・再生成しない。途中失敗では通常名と全残存物/guard/履歴を保持する |
 | 4. 通常名交換 | 同じ旧file fd/通常名/旧完全bytes・新file・開始/marker/guardを直前照合してEXCHANGE。保持した新fdが通常名、旧fdが指定一時名へ移ったことを再検査しdirectory fsyncする。自身のEXCHANGEで変わるctimeは、dev/ino・完全bytes・その他の全属性を照合した上で直後の値を保持し、以後その値を再検査する。無関係な属性変化は許容しない。同bytes別inodeも拒否対象とし、交換失敗/未確定をrollback成功とは扱わない |
-| 5. 今回の旧暗号文整理 | 新鍵の認証・完全bytes/identityと今回の保存確認後だけ、交換先にある保持旧fd/path・旧完全bytesを再照合し、その一名をunlink→directory fsync。unlink後も元fdのnlink/自身ctime差と完全bytes、対象名の正確不在・新鍵を検査する。再出現した別fileを再unlinkしない。これは今回の継続呼出しが保持する旧暗号文だけを扱い、一般の残存物整理や鍵の完全消去/失効とは呼ばない |
+| 5. 今回の旧暗号文整理 | 新鍵の認証・完全bytes/identityと今回の保存確認後だけ、交換先にある保持旧fd/path・旧完全bytesを再照合し、その一名をunlink→directory fsync。unlink後も元fdのnlink==0を必須とし、EXCHANGE直後に保持した旧fd属性から自身unlinkによるctime差だけを許して、dev/ino/uid/mode/length/mtimeと完全bytesを維持する。unlink直後の属性も保持して以後再照合し、対象名の正確不在・新鍵を検査する。再出現した別fileを再unlinkしない。これは今回の継続呼出しが保持する旧暗号文だけを扱い、一般の残存物整理や鍵の完全消去/失効とは呼ばない |
 | 6. 完了履歴 | 新通常名と旧暗号文整理の保存確認・全制御file照合の後だけ、今回の完了を新IDで開始参照とともに原子的追記する。完了は認証した同じ公開鍵と新暗号文への対応を保持し、旧event全件を残す。旧snapshot物理コピー整理のdirectory fsyncも必要。成功した鍵交換だけから履歴の完了を推定しない |
 | 7. 今回guardの解除 | 完了履歴の保存・追記一時名整理と新通常名を再照合した後、今回の開始に束縛した同じguardだけを最後にunlink→directory fsyncし、正確不在/marker/全履歴/新鍵を再検査する。恒久markerは残す。guardに別inode/属性/bytesの差があれば削除せず拒否する。保存確認済みの出力失敗は未確定や再実行要求と分ける |
 
