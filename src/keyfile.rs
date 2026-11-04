@@ -213,4 +213,5 @@ pub use files::{
     KeyDirectoryIdentity, KeyFileError, KeyFileIdentity, KeyHistoryState, KeyInitialState,
     KeyRecoveryEntry, KeyRecoveryHold, KeyRecoveryInventory, KeyStateDiagnostic,
     PreparedAbsentCleanup, PreparedKeyCleanup, PreparedResidueRemoval,
+    KeyResumeExpected, KeyResumeIntent, KeyResumePreservation, PreparedKeyResume,
 };

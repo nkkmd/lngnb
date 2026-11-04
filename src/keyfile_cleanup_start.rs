@@ -3,6 +3,9 @@
 pub(super) mod completion;
 #[path = "keyfile_cleanup_recovery.rs"]
 pub(super) mod recovery;
+#[path = "keyfile_resume_record.rs"]
+pub(super) mod resume_record;
+pub use resume_record::{KeyResumeExpected, KeyResumeIntent, KeyResumePreservation, PreparedKeyResume};
 use super::*;
 use crate::cbor::{self, Value};
 pub use completion::{

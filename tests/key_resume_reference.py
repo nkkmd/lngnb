@@ -2,6 +2,10 @@
 import hashlib
 import json
 import sys
+import os
+import stat
+from pathlib import Path
+import cbor2
 from key_history_reference import snapshot, identity, common, encode
 
 
@@ -48,5 +52,61 @@ def main():
     print(json.dumps({"checked": len(cases)}))
 
 
+def recorded():
+    """Current filesystem bytes/identities and full prefix; product performs AEAD authentication."""
+    case = json.load(sys.stdin)
+    source = Path(case["source"])
+    backups = [Path(p) for p in case["backups"]]
+    old_raw, new_raw = bytes.fromhex(case["old"]), bytes.fromhex(case["new"])
+    old, new = cbor2.loads(old_raw), cbor2.loads(new_raw)
+    assert encode(old) == old_raw and encode(new) == new_raw
+    assert new["events"][:-1] == old["events"]
+    for key in ("format", "area_id", "source_marker"):
+        assert new[key] == old[key]
+    def directory(path):
+        m = path.stat()
+        return {"dev": m.st_dev.to_bytes(8, "big"), "ino": m.st_ino.to_bytes(8, "big"), "uid": m.st_uid.to_bytes(4, "big")}
+    def file(path):
+        m = path.stat(follow_symlinks=False)
+        assert stat.S_ISREG(m.st_mode) and m.st_mode == 0o100600 and m.st_nlink == 1
+        return {"dev": m.st_dev.to_bytes(8, "big"), "ino": m.st_ino.to_bytes(8, "big"), "uid": m.st_uid.to_bytes(4, "big"),
+                "mode": m.st_mode.to_bytes(4, "big"), "length": m.st_size.to_bytes(8, "big"), "nlink": m.st_nlink.to_bytes(8, "big"),
+                "mtime_seconds": m.st_mtime_ns//10**9, "mtime_nanoseconds": m.st_mtime_ns % 10**9,
+                "ctime_seconds": m.st_ctime_ns//10**9, "ctime_nanoseconds": m.st_ctime_ns % 10**9}
+    key = (source / "publisher").read_bytes()
+    assert key == (backups[0] / "saved").read_bytes()
+    completed = [e for e in old["events"] if e["kind"] == "residue_cleanup_completed"]
+    assert len(completed) == len(case["proofs"])
+    for event, proof in zip(completed, case["proofs"]):
+        assert event["operation_id"] == bytes.fromhex(proof["id"])
+        start = next(e for e in old["events"] if e["operation_id"] == event["started_operation_id"])
+        path = backups[proof["directory"]] / proof["name"]
+        assert start["preserved"] == {"name": proof["name"], "directory": directory(backups[proof["directory"]]), "identity": file(path)}
+        ciphertext = path.read_bytes()
+        assert hashlib.sha256(ciphertext).digest() == start["target"]["ciphertext_sha256"]
+        assert cbor2.loads(ciphertext)["public_key"] == start["target"]["public_key"]
+        try:
+            os.lstat(source / start["target"]["name"])
+        except FileNotFoundError:
+            pass
+        else:
+            raise AssertionError("old residue must be absent")
+    event = dict(common(len(old["events"])+1, "key_changes_resumed"),
+                 operation_id=bytes.fromhex(case["operation"]), actor_uid=os.geteuid().to_bytes(4, "big"), recorded_unix_seconds=42,
+                 reason="reviewed_current_key_and_preservations",
+                 current={"name": "publisher", "identity": file(source / "publisher"), "ciphertext_sha256": hashlib.sha256(key).digest(), "public_key": cbor2.loads(key)["public_key"]},
+                 preserved={"name": "saved", "directory": directory(backups[0]), "identity": file(backups[0] / "saved")},
+                 guard_identity=file(source / ".lngnb-key-hold"), cleanup_operations=[e["operation_id"] for e in completed])
+    assert encode(dict(old, events=old["events"]+[event])) == new_raw
+    assert hashlib.sha256(new_raw).hexdigest() == case["hash"]
+    root = hashlib.sha256(encode(dict(new, events=new["events"][:1]))).digest()
+    assert (source / ".lngnb-key-control").read_bytes() == b"lngnb:key-recovery:2\0" + new["source_marker"][21:] + root
+    assert (source / ".lngnb-key-hold").read_bytes() == b"lngnb:key-hold:1\0" + new["area_id"]
+    print(json.dumps({"checked": 1}))
+
+
 if __name__ == "__main__":
-    main()
+    if sys.argv[1:] == ["--recorded"]:
+        recorded()
+    else:
+        main()

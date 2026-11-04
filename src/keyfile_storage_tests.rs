@@ -11,6 +11,8 @@ use std::{
 static NEXT: AtomicU64 = AtomicU64::new(0);
 #[path = "keyfile_cleanup_start_tests.rs"]
 mod cleanup_start_tests;
+#[path = "keyfile_resume_record_tests.rs"]
+mod resume_record_tests;
 struct Area(PathBuf);
 impl Area {
     fn new() -> Self {
