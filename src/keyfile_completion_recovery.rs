@@ -87,7 +87,7 @@ impl KeyDirectory {
         {
             return invalid();
         }
-        let context = AbsentContext::open(
+        let context = CompletionContext::open(
             self,
             backup,
             residue,

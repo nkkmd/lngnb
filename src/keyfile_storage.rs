@@ -27,6 +27,7 @@ mod cleanup_start;
 pub use cleanup_start::{
     KeyCleanupCompletion, KeyCleanupDisposition, KeyCleanupExpected, KeyCleanupStart,
     KeyDirectoryIdentity, KeyFileIdentity, PreparedAbsentCleanup, PreparedKeyCleanup,
+    PreparedResidueRemoval,
 };
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyFileError {
@@ -47,6 +48,10 @@ pub enum KeyFileError {
     UnexpectedPublicKey,
     /// 認証した残存暗号文と、指定保全先の現在の完全bytesが一致しない。
     PreservationMismatch,
+    /// 対象unlinkを試行した後。名の不在/保存確定を断定しない。
+    ResidueRemovalUncertain,
+    /// 今回の対象不在/元directory保存確認済み、完了履歴は未記録。
+    ResidueCompletionRequired,
     /// 明示停止の二fileが不完全/不正/別領域に束縛されている。
     RecoveryStateInvalid,
     /// 明示停止の作成開始後。保存確定/未保存を断定せず全fileを保持する。
@@ -81,6 +86,8 @@ impl std::fmt::Display for KeyFileError {
             Self::RestorationReviewRequired => "key_restoration_committed_review_required",
             Self::UnexpectedPublicKey => "key_unexpected_public_key",
             Self::PreservationMismatch => "key_preservation_mismatch",
+            Self::ResidueRemovalUncertain => "key_residue_removal_uncertain",
+            Self::ResidueCompletionRequired => "key_residue_completion_required",
             Self::RecoveryStateInvalid => "key_recovery_state_invalid",
             Self::RecoveryHoldUncertain => "key_recovery_hold_uncertain",
             Self::RecoveryStateUncertain => "key_recovery_state_uncertain",

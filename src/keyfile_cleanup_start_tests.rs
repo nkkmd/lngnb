@@ -769,3 +769,6 @@ mod recovery_tests;
 
 #[path = "keyfile_cleanup_completion_tests.rs"]
 mod completion_tests;
+
+#[path = "keyfile_cleanup_remove_tests.rs"]
+mod removal_tests;
