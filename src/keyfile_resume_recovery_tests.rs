@@ -449,3 +449,498 @@ fn resume_recovery_full_inventory_needs_no_new_entry_but_over_limit_is_refused()
     assert_eq!(stdfs::read_dir(&f.a.0).unwrap().count(), 9_999);
     f.retained();
 }
+
+use crate::keyfile::KeyResumeRelease;
+use crate::keyfile::files::cleanup_start::resume_record::release::ReleaseStage as G;
+
+impl Fixture {
+    fn release(
+        &mut self,
+        intent: &KeyResumeIntent,
+        hook: &mut impl FnMut(G) -> Result<()>,
+    ) -> Result<KeyResumeRelease> {
+        let proofs: Vec<_> = self
+            .ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| KeyResumePreservation {
+                completed_operation_id: *id,
+                directory_index: self.indices[i],
+                name: &self.names[i],
+                passphrase: &self.pass,
+            })
+            .collect();
+        self.source
+            .as_mut()
+            .unwrap()
+            .recover_key_resume_release_with(
+                "publisher",
+                &self.pass,
+                &mut self.backups,
+                0,
+                "saved",
+                &proofs,
+                &self.expected,
+                intent,
+                hook,
+            )
+    }
+}
+
+#[test]
+fn resume_release_requires_fixed_ready_and_a_clean_inventory() {
+    for point in [S::Prepared, S::Exchanged, S::OldSnapshotRemoved] {
+        let mut f = Fixture::new(false, 0);
+        let intent = f.interrupt(point);
+        let guard = f.a.0.join(recovery_hold::GUARD);
+        let state = f.a.0.join(initial_state::STATE);
+        let fixed = stdfs::read(&state).unwrap();
+        let temporary = stdfs::read(f.temp()).ok();
+        let unknown = f.a.0.join(".lngnb-key-unknown");
+        stdfs::write(&unknown, []).unwrap();
+        assert!(f.release(&intent, &mut |_| Ok(())).is_err());
+        stdfs::remove_file(unknown).unwrap();
+        if temporary.is_some() {
+            assert!(f.release(&intent, &mut |_| Ok(())).is_err());
+            f.retained();
+            stdfs::remove_file(&guard).unwrap();
+            assert!(f.release(&intent, &mut |_| Ok(())).is_err());
+            assert_eq!(stdfs::read(f.temp()).ok(), temporary);
+            assert_eq!(stdfs::read(state).unwrap(), fixed);
+            continue;
+        }
+        for change in 0..5 {
+            let mut wrong = intent;
+            match change {
+                0 => wrong.before.initial.area_id[0] ^= 1,
+                1 => wrong.before.initial.snapshot_hash[0] ^= 1,
+                2 => wrong.before.snapshot_hash[0] ^= 1,
+                3 => wrong.after.generation += 1,
+                _ => wrong.operation_id[0] ^= 1,
+            }
+            assert!(f.release(&wrong, &mut |_| Ok(())).is_err());
+        }
+        f.retained();
+    }
+}
+
+#[test]
+fn resume_release_rechecks_all_proofs_and_recovers_an_absent_guard() {
+    let mut f = Fixture::new(true, 2);
+    let intent = f.interrupt(S::OldSnapshotRemoved);
+    let last_id = f.ids.pop().unwrap();
+    assert!(f.release(&intent, &mut |_| Ok(())).is_err());
+    f.ids.push(last_id);
+    let pass = std::mem::replace(&mut f.pass, "invalid fixture password".into());
+    assert!(f.release(&intent, &mut |_| Ok(())).is_err());
+    f.pass = pass;
+    let mut proofs: Vec<_> = f
+        .ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| KeyResumePreservation {
+            completed_operation_id: *id,
+            directory_index: f.indices[i],
+            name: &f.names[i],
+            passphrase: &f.pass,
+        })
+        .collect();
+    proofs[1].passphrase = "invalid past-preservation fixture password";
+    assert!(matches!(
+        f.source.as_mut().unwrap().recover_key_resume_release(
+            "publisher",
+            &f.pass,
+            &mut f.backups,
+            0,
+            "saved",
+            &proofs,
+            &f.expected,
+            &intent,
+        ),
+        Err(KeyFileError::Key(_))
+    ));
+    let backup = f.areas[f.indices[1]].0.join(&f.names[1]);
+    let hidden = backup.with_extension("hidden");
+    stdfs::rename(&backup, &hidden).unwrap();
+    assert!(f.release(&intent, &mut |_| Ok(())).is_err());
+    stdfs::rename(&hidden, &backup).unwrap();
+    // Rename changes the recorded ctime. A fresh fixture is needed for success.
+    f.retained();
+    let mut f = Fixture::new(true, 2);
+    let intent = f.interrupt(S::OldSnapshotRemoved);
+    let guard = f.a.0.join(recovery_hold::GUARD);
+    let held = stdfs::File::open(&guard).unwrap();
+    let fixed = stdfs::read(f.a.0.join(initial_state::STATE)).unwrap();
+    f.independent(intent);
+    assert_eq!(
+        f.release(&intent, &mut |_| Ok(())).unwrap(),
+        KeyResumeRelease::RemovedRecordedGuard(intent.after)
+    );
+    assert_eq!(held.metadata().unwrap().nlink(), 0);
+    assert!(!guard.exists());
+    assert_eq!(
+        stdfs::read(f.a.0.join(initial_state::STATE)).unwrap(),
+        fixed
+    );
+    f.independent_release(intent);
+    f.reopen();
+    for point in [G::BeforeDirectorySync, G::DirectorySynced] {
+        assert_eq!(
+            f.release(&intent, &mut |stage| if stage == point {
+                Err(KeyFileError::Io)
+            } else {
+                Ok(())
+            })
+            .unwrap_err(),
+            KeyFileError::RecoveryGuardReleaseUncertain,
+        );
+        assert!(!guard.exists());
+        f.reopen();
+    }
+    assert!(f.recover(&intent, &mut |_| Ok(())).is_err());
+    assert_eq!(
+        f.release(&intent, &mut |_| Ok(())).unwrap(),
+        KeyResumeRelease::ConfirmedGuardAbsent(intent.after)
+    );
+    let source = f.source.as_mut().unwrap();
+    e(
+        source.create("later", &f.pass),
+        KeyFileError::PendingRecovery,
+    );
+    e(
+        source.change_passphrase("publisher", &f.pass, &f.pass),
+        KeyFileError::PendingRecovery,
+    );
+    assert!(
+        source
+            .initialize_key_state(&intent.before.initial.area_id)
+            .is_err()
+    );
+}
+
+#[test]
+fn resume_release_failure_boundaries_require_explicit_retry() {
+    for point in [
+        G::Qualification(S::CurrentSynced),
+        G::Qualification(S::PreservationSynced(0)),
+        G::Qualification(S::DirectoriesSynced),
+        G::Qualification(S::ControlsSynced),
+        G::Qualification(S::Qualified),
+        G::BeforeUnlink,
+        G::Unlinked,
+        G::BeforeDirectorySync,
+        G::DirectorySynced,
+    ] {
+        let mut f = Fixture::new(false, 0);
+        let intent = f.interrupt(S::OldSnapshotRemoved);
+        let after_unlink = matches!(
+            point,
+            G::Unlinked | G::BeforeDirectorySync | G::DirectorySynced
+        );
+        let err = f
+            .release(&intent, &mut |stage| {
+                if stage == point {
+                    Err(KeyFileError::Io)
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err();
+        assert_eq!(
+            err,
+            if after_unlink {
+                KeyFileError::RecoveryGuardReleaseUncertain
+            } else {
+                KeyFileError::Io
+            }
+        );
+        assert_eq!(f.a.0.join(recovery_hold::GUARD).exists(), !after_unlink);
+        f.reopen();
+        let result = f.release(&intent, &mut |_| Ok(())).unwrap();
+        assert_eq!(
+            result,
+            if after_unlink {
+                KeyResumeRelease::ConfirmedGuardAbsent(intent.after)
+            } else {
+                KeyResumeRelease::RemovedRecordedGuard(intent.after)
+            }
+        );
+        assert!(!f.a.0.join(recovery_hold::GUARD).exists());
+    }
+}
+
+#[test]
+fn resume_release_preserves_replacements_before_and_after_unlink() {
+    for point in [G::BeforeUnlink, G::Unlinked, G::DirectorySynced] {
+        let mut f = Fixture::new(false, 0);
+        let intent = f.interrupt(S::OldSnapshotRemoved);
+        let guard = f.a.0.join(recovery_hold::GUARD);
+        let saved_guard = guard.with_file_name("saved-guard");
+        let bytes = f.guard.clone();
+        let err = f
+            .release(&intent, &mut |stage| {
+                if stage == point {
+                    if stage == G::BeforeUnlink {
+                        stdfs::rename(&guard, &saved_guard).unwrap();
+                    }
+                    stdfs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .mode(0o600)
+                        .open(&guard)
+                        .unwrap()
+                        .write_all(&bytes)
+                        .unwrap();
+                }
+                Ok(())
+            })
+            .unwrap_err();
+        assert_eq!(
+            err,
+            if point == G::BeforeUnlink {
+                KeyFileError::RecoveryChanged
+            } else {
+                KeyFileError::RecoveryGuardReleaseUncertain
+            }
+        );
+        assert_eq!(stdfs::read(&guard).unwrap(), bytes);
+        f.reopen();
+        assert!(f.release(&intent, &mut |_| Ok(())).is_err());
+        assert_eq!(stdfs::read(&guard).unwrap(), bytes);
+    }
+}
+
+#[test]
+fn resume_release_process_kill_and_lost_response_use_explicit_recovery() {
+    if let Some(mut context) = child_context() {
+        let source = PathBuf::from(std::env::var_os("LNGNB_PUBLIC_RESUME_SOURCE").unwrap());
+        let state = stdfs::read(source.join(initial_state::STATE)).unwrap();
+        let mut marker = stdfs::read(source.join(recovery_hold::MARKER)).unwrap();
+        marker.truncate(73);
+        marker[19] = b'1';
+        let initial = context.expected.state.initial;
+        let intent = KeyResumeIntent {
+            before: context.expected.state,
+            after: state_history::decode_history(
+                &state,
+                &marker,
+                initial.area_id,
+                initial.snapshot_hash,
+            )
+            .unwrap(),
+            operation_id: context.operation,
+        };
+        let proofs: Vec<_> = context
+            .manifest
+            .iter()
+            .map(|(id, index, name)| KeyResumePreservation {
+                completed_operation_id: *id,
+                directory_index: *index,
+                name,
+                passphrase: &context.pass,
+            })
+            .collect();
+        let point = std::env::var("LNGNB_PUBLIC_RESUME_POINT").unwrap();
+        if point == "FdExhausted" {
+            assert!(
+                Command::new("prlimit")
+                    .args(["--pid", &std::process::id().to_string(), "--nofile=32:32"])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let mut reserve = Vec::new();
+            loop {
+                match stdfs::File::open("/dev/null") {
+                    Ok(file) => reserve.push(file),
+                    Err(error) => {
+                        assert_eq!(error.raw_os_error(), Some(24));
+                        break;
+                    }
+                }
+            }
+            // Permit the initial directory scan, but exhaust fds while holding the state.
+            reserve.pop();
+            assert!(
+                context
+                    .source
+                    .recover_key_resume_release(
+                        "publisher",
+                        &context.pass,
+                        &mut context.backups,
+                        0,
+                        "saved",
+                        &proofs,
+                        &context.expected,
+                        &intent,
+                    )
+                    .is_err()
+            );
+            return;
+        }
+        let pause = || {
+            println!("READY");
+            std::io::stdout().flush().unwrap();
+            loop {
+                std::thread::park();
+            }
+        };
+        let receipt = context
+            .source
+            .recover_key_resume_release_with(
+                "publisher",
+                &context.pass,
+                &mut context.backups,
+                0,
+                "saved",
+                &proofs,
+                &context.expected,
+                &intent,
+                &mut |stage| {
+                    if format!("{stage:?}") == point {
+                        pause();
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            receipt,
+            KeyResumeRelease::RemovedRecordedGuard(intent.after)
+        );
+        // Test the caller's output failure separately from the completed storage result.
+        assert!(
+            std::io::Write::write_all(&mut stdfs::File::open("/dev/null").unwrap(), b"result")
+                .is_err()
+        );
+        assert_eq!(point, "OutputFailed");
+        pause();
+    }
+    for point in [
+        "BeforeUnlink",
+        "Unlinked",
+        "DirectorySynced",
+        "OutputFailed",
+        "FdExhausted",
+    ] {
+        let mut f = Fixture::new(false, 0);
+        let intent = f.interrupt(S::OldSnapshotRemoved);
+        f.source.take();
+        f.backups.clear();
+        let mut child = child_command(
+            &f,
+            "keyfile::files::tests::resume_record_tests::recovery_tests::resume_release_process_kill_and_lost_response_use_explicit_recovery",
+        )
+        .env("LNGNB_PUBLIC_RESUME_OLD", data_encoding::HEXLOWER.encode(&f.old))
+        .env("LNGNB_PUBLIC_RESUME_POINT", point)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn().unwrap();
+        if point == "FdExhausted" {
+            assert!(child.wait_with_output().unwrap().status.success());
+            f.reopen();
+            f.retained();
+            assert_eq!(
+                f.release(&intent, &mut |_| Ok(())).unwrap(),
+                KeyResumeRelease::RemovedRecordedGuard(intent.after)
+            );
+            continue;
+        }
+        let output = std::io::BufReader::new(child.stdout.take().unwrap());
+        let ready = output.lines().take(10).any(|line| line.unwrap() == "READY");
+        if ready {
+            child.kill().unwrap();
+        }
+        let status = child.wait().unwrap();
+        assert!(
+            ready && !status.success(),
+            "release kill boundary not reached: {point}"
+        );
+        f.reopen();
+        let expected = if point == "BeforeUnlink" {
+            KeyResumeRelease::RemovedRecordedGuard(intent.after)
+        } else {
+            KeyResumeRelease::ConfirmedGuardAbsent(intent.after)
+        };
+        assert_eq!(
+            f.source
+                .as_mut()
+                .unwrap()
+                .recover_key_resume_release(
+                    "publisher",
+                    &f.pass,
+                    &mut f.backups,
+                    0,
+                    "saved",
+                    &[],
+                    &f.expected,
+                    &intent,
+                )
+                .unwrap(),
+            expected
+        );
+        f.independent_release(intent);
+    }
+}
+
+#[test]
+fn resume_release_checks_held_state_and_preservations_again_before_unlink() {
+    for changed in ["state", "preserved", "guard"] {
+        let mut f = Fixture::new(true, 2);
+        let intent = f.interrupt(S::OldSnapshotRemoved);
+        let guard = f.a.0.join(recovery_hold::GUARD);
+        let path = match changed {
+            "state" => f.a.0.join(initial_state::STATE),
+            "preserved" => f.areas[f.indices[1]].0.join(&f.names[1]),
+            _ => guard.clone(),
+        };
+        let mut bytes = stdfs::read(&path).unwrap();
+        let saved = path.with_file_name("release-kept");
+        let error = f
+            .release(&intent, &mut |stage| {
+                if stage == G::BeforeUnlink {
+                    if changed == "guard" {
+                        bytes[0] ^= 1;
+                        stdfs::write(&path, &bytes).unwrap();
+                    } else {
+                        stdfs::rename(&path, &saved).unwrap();
+                        stdfs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .mode(0o600)
+                            .open(&path)
+                            .unwrap()
+                            .write_all(&bytes)
+                            .unwrap();
+                    }
+                }
+                Ok(())
+            })
+            .unwrap_err();
+        assert_eq!(error, KeyFileError::RecoveryChanged);
+        assert_eq!(stdfs::read(&path).unwrap(), bytes);
+        assert!(guard.exists());
+    }
+}
+
+#[test]
+fn resume_release_accepts_full_inventory_but_rejects_over_limit() {
+    let mut f = Fixture::new(false, 0);
+    let intent = f.interrupt(S::OldSnapshotRemoved);
+    for i in stdfs::read_dir(&f.a.0).unwrap().count()..10_000 {
+        stdfs::write(f.a.0.join(format!("ordinary-{i}")), []).unwrap();
+    }
+    let excess = f.a.0.join("excess");
+    stdfs::write(&excess, []).unwrap();
+    assert_eq!(
+        f.release(&intent, &mut |_| Ok(())).unwrap_err(),
+        KeyFileError::ScanLimit
+    );
+    f.retained();
+    stdfs::remove_file(excess).unwrap();
+    assert_eq!(
+        f.release(&intent, &mut |_| Ok(())).unwrap(),
+        KeyResumeRelease::RemovedRecordedGuard(intent.after)
+    );
+    assert_eq!(stdfs::read_dir(&f.a.0).unwrap().count(), 9_999);
+}

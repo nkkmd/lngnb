@@ -2,6 +2,8 @@
 use super::*;
 #[path = "keyfile_resume_recovery.rs"]
 pub(in super::super) mod recovery;
+#[path = "keyfile_resume_release.rs"]
+pub(in super::super) mod release;
 
 enum ResumeSnapshot<'a> {
     New {
@@ -12,6 +14,7 @@ enum ResumeSnapshot<'a> {
         old_bytes: Vec<u8>,
         new_bytes: Vec<u8>,
         intent: &'a KeyResumeIntent,
+        allow_absent_guard: bool,
     },
 }
 
@@ -156,7 +159,7 @@ pub struct PreparedKeyResume<'a> {
     preservations: Vec<Preservation>,
     absent_names: Vec<String>,
     marker: HeldFile,
-    guard: HeldFile,
+    guard: Option<HeldFile>,
     state: HeldFile,
     new_bytes: Vec<u8>,
     intent: KeyResumeIntent,
@@ -179,6 +182,14 @@ impl PreparedKeyResume<'_> {
         Ok(())
     }
     fn check(&self, temporary: Option<&str>) -> Result<usize> {
+        let count = self.check_files(temporary)?;
+        match &self.guard {
+            Some(guard) => guard.check(self.source, recovery_hold::GUARD, true)?,
+            None => absent(self.source, recovery_hold::GUARD)?,
+        }
+        Ok(count)
+    }
+    fn check_files(&self, temporary: Option<&str>) -> Result<usize> {
         self.source.secure()?;
         if KeyDirectoryIdentity::from_metadata(&io(self.source.dir.metadata())?)
             != self.source_identity
@@ -199,7 +210,6 @@ impl PreparedKeyResume<'_> {
         }
         self.marker
             .check(self.source, recovery_hold::MARKER, true)?;
-        self.guard.check(self.source, recovery_hold::GUARD, true)?;
         for n in &self.absent_names {
             absent(self.source, n)?;
         }
@@ -208,12 +218,13 @@ impl PreparedKeyResume<'_> {
     fn qualify(
         &self,
         temporary: Option<&str>,
+        reserve_entry: bool,
         hook: &mut impl FnMut(ResumeStage) -> Result<()>,
         extra: &mut impl FnMut() -> Result<()>,
     ) -> Result<()> {
         use ResumeStage as S;
         let mut check = || -> Result<()> {
-            if temporary.is_none() {
+            if reserve_entry {
                 self.check_held()?;
             } else {
                 self.check(temporary)?;
@@ -237,7 +248,9 @@ impl PreparedKeyResume<'_> {
         hook(S::DirectoriesSynced)?;
         check()?;
         self.marker.sync()?;
-        self.guard.sync()?;
+        if let Some(guard) = &self.guard {
+            guard.sync()?;
+        }
         self.state.sync()?;
         hook(S::ControlsSynced)?;
         check()?;
@@ -423,7 +436,7 @@ impl KeyDirectory {
             expected,
             ResumeSnapshot::New { operation, now },
         )?;
-        prepared.qualify(None, hook, &mut || Ok(()))?;
+        prepared.qualify(None, true, hook, &mut || Ok(()))?;
         Ok(prepared)
     }
     // Private qualification only. Existing bytes are never constructed or saved by recovery.
@@ -463,7 +476,22 @@ impl KeyDirectory {
             return invalid();
         }
         let marker = HeldFile::open(self, recovery_hold::MARKER, MAX_KEYFILE_BYTES)?;
-        let guard = HeldFile::open(self, recovery_hold::GUARD, MAX_KEYFILE_BYTES)?;
+        let guard = match HeldFile::open(self, recovery_hold::GUARD, MAX_KEYFILE_BYTES) {
+            Ok(guard) => Some(guard),
+            Err(KeyFileError::Missing)
+                if matches!(
+                    &snapshot,
+                    ResumeSnapshot::Existing {
+                        allow_absent_guard: true,
+                        ..
+                    }
+                ) =>
+            {
+                absent(self, recovery_hold::GUARD)?;
+                None
+            }
+            Err(error) => return Err(error),
+        };
         let state = HeldFile::open(self, initial_state::STATE, initial_state::STATE_LIMIT)?;
         let old_bytes = match &snapshot {
             ResumeSnapshot::New { .. } => state.bytes.clone(),
@@ -478,8 +506,10 @@ impl KeyDirectory {
         guard_bytes.extend(expected.state.initial.area_id);
         if self.marker_area_id(&source_marker)? != expected.state.initial.area_id
             || marker.bytes[73..] != expected.state.initial.snapshot_hash
-            || guard.bytes != guard_bytes
-            || KeyFileIdentity::from_metadata(&guard.metadata) != expected.guard
+            || guard.as_ref().is_some_and(|guard| {
+                guard.bytes != guard_bytes
+                    || KeyFileIdentity::from_metadata(&guard.metadata) != expected.guard
+            })
             || state_history::decode_history(
                 &old_bytes,
                 &source_marker,

@@ -52,7 +52,7 @@ def main():
     print(json.dumps({"checked": len(cases)}))
 
 
-def recorded():
+def recorded(released=False):
     """Current filesystem bytes/identities and full prefix; product performs AEAD authentication."""
     case = json.load(sys.stdin)
     source = Path(case["source"])
@@ -91,22 +91,35 @@ def recorded():
             pass
         else:
             raise AssertionError("old residue must be absent")
+    guard = source / ".lngnb-key-hold"
+    if released:
+        try:
+            os.lstat(guard)
+        except FileNotFoundError:
+            pass
+        else:
+            raise AssertionError("recorded guard name must be absent")
+        guard_identity = cbor2.loads(bytes.fromhex(case["guard"]))
+    else:
+        guard_identity = file(guard)
+        assert guard.read_bytes() == b"lngnb:key-hold:1\0" + new["area_id"]
     event = dict(common(len(old["events"])+1, "key_changes_resumed"),
                  operation_id=bytes.fromhex(case["operation"]), actor_uid=os.geteuid().to_bytes(4, "big"), recorded_unix_seconds=42,
                  reason="reviewed_current_key_and_preservations",
                  current={"name": "publisher", "identity": file(source / "publisher"), "ciphertext_sha256": hashlib.sha256(key).digest(), "public_key": cbor2.loads(key)["public_key"]},
                  preserved={"name": "saved", "directory": directory(backups[0]), "identity": file(backups[0] / "saved")},
-                 guard_identity=file(source / ".lngnb-key-hold"), cleanup_operations=[e["operation_id"] for e in completed])
+                 guard_identity=guard_identity, cleanup_operations=[e["operation_id"] for e in completed])
     assert encode(dict(old, events=old["events"]+[event])) == new_raw
     assert hashlib.sha256(new_raw).hexdigest() == case["hash"]
     root = hashlib.sha256(encode(dict(new, events=new["events"][:1]))).digest()
     assert (source / ".lngnb-key-control").read_bytes() == b"lngnb:key-recovery:2\0" + new["source_marker"][21:] + root
-    assert (source / ".lngnb-key-hold").read_bytes() == b"lngnb:key-hold:1\0" + new["area_id"]
     print(json.dumps({"checked": 1}))
 
 
 if __name__ == "__main__":
     if sys.argv[1:] == ["--recorded"]:
         recorded()
+    elif sys.argv[1:] == ["--released"]:
+        recorded(released=True)
     else:
         main()
