@@ -31,6 +31,15 @@ pub(super) fn verify_prefix(
     source_marker: &[u8],
     intent: &KeyResumeIntent,
 ) -> Result<Vec<u8>> {
+    verify_event_prefix(new_bytes, source_marker, intent, "key_changes_resumed")
+}
+
+pub(super) fn verify_event_prefix(
+    new_bytes: &[u8],
+    source_marker: &[u8],
+    intent: &KeyResumeIntent,
+    kind: &str,
+) -> Result<Vec<u8>> {
     // prefix再構成はhash/全件照合だけに使う。保存/欠損補完には使わない。
     let mut prefix = cbor::decode(new_bytes).map_err(|_| KeyFileError::RecoveryStateInvalid)?;
     let Value::Map(items) = &mut prefix else {
@@ -40,7 +49,7 @@ pub(super) fn verify_prefix(
         return invalid();
     };
     let event = events.pop().ok_or(KeyFileError::RecoveryStateInvalid)?;
-    if field(&event, "kind")? != &text("key_changes_resumed")
+    if field(&event, "kind")? != &text(kind)
         || field(&event, "operation_id")? != &bytes(intent.operation_id)
     {
         return invalid();
@@ -160,7 +169,6 @@ impl KeyDirectory {
         intent: &KeyResumeIntent,
         hook: &mut impl FnMut(ResumeStage) -> Result<()>,
     ) -> Result<KeyStateDiagnostic> {
-        use ResumeStage as S;
         name(current_name)?;
         name(backup_name)?;
         if expected.state != intent.before
@@ -227,6 +235,7 @@ impl KeyDirectory {
                 new_bytes,
                 intent,
                 allow_absent_guard: false,
+                expected_guard: None,
             },
         )?;
         if context.state.bytes != fixed.bytes
@@ -234,150 +243,128 @@ impl KeyDirectory {
         {
             return Err(KeyFileError::RecoveryChanged);
         }
-        let mut exchanged = false;
-        let mut removed = temporary.is_none();
-        let mut fixed_moved = None;
-        let mut temporary_moved = None;
-        check_layout(
-            &context,
+        recover_snapshot(
+            context,
             temporary.as_ref(),
             &temp,
+            needs_exchange,
+            intent,
+            hook,
+            true,
+        )
+    }
+}
+
+pub(super) fn recover_snapshot(
+    context: PreparedKeyResume<'_>,
+    temporary: Option<&HeldFile>,
+    temp: &str,
+    needs_exchange: bool,
+    intent: &KeyResumeIntent,
+    hook: &mut impl FnMut(ResumeStage) -> Result<()>,
+    verify_resume_diagnostic: bool,
+) -> Result<KeyStateDiagnostic> {
+    use ResumeStage as S;
+    let mut exchanged = false;
+    let mut removed = temporary.is_none();
+    let mut fixed_moved = None;
+    let mut temporary_moved = None;
+    check_layout(&context, temporary, temp, exchanged, removed, None, None)?;
+    let mut durable = false;
+    let recovered = (|| -> Result<KeyStateDiagnostic> {
+        context.qualify(Some(temp), false, hook, &mut || {
+            check_layout(&context, temporary, temp, false, removed, None, None)
+        })?;
+        if let Some(file) = temporary {
+            file.sync()?;
+        }
+        hook(S::SnapshotsSynced)?;
+        check_layout(&context, temporary, temp, exchanged, removed, None, None)?;
+        io(context.source.dir.sync_all())?;
+        hook(S::Prepared)?;
+        check_layout(&context, temporary, temp, exchanged, removed, None, None)?;
+        if needs_exchange {
+            hook(S::BeforeExchange)?;
+            check_layout(&context, temporary, temp, false, false, None, None)?;
+            os(fs::renameat_with(
+                &context.source.dir,
+                temp,
+                &context.source.dir,
+                initial_state::STATE,
+                RenameFlags::EXCHANGE,
+            ))?;
+            exchanged = true;
+            fixed_moved = Some(moved_metadata(&context.state)?);
+            temporary_moved = Some(moved_metadata(
+                temporary
+                    .as_ref()
+                    .ok_or(KeyFileError::RecoveryStateInvalid)?,
+            )?);
+            hook(S::Exchanged)?;
+        }
+        check_layout(
+            &context,
+            temporary,
+            temp,
             exchanged,
             removed,
-            None,
-            None,
+            fixed_moved.as_ref(),
+            temporary_moved.as_ref(),
         )?;
-        let mut durable = false;
-        let recovered = (|| -> Result<KeyStateDiagnostic> {
-            context.qualify(Some(&temp), false, hook, &mut || {
-                check_layout(
-                    &context,
-                    temporary.as_ref(),
-                    &temp,
-                    false,
-                    removed,
-                    None,
-                    None,
-                )
-            })?;
-            if let Some(file) = &temporary {
-                file.sync()?;
-            }
-            hook(S::SnapshotsSynced)?;
-            check_layout(
-                &context,
-                temporary.as_ref(),
-                &temp,
-                exchanged,
-                removed,
-                None,
-                None,
-            )?;
-            io(context.source.dir.sync_all())?;
-            hook(S::Prepared)?;
-            check_layout(
-                &context,
-                temporary.as_ref(),
-                &temp,
-                exchanged,
-                removed,
-                None,
-                None,
-            )?;
-            if needs_exchange {
-                hook(S::BeforeExchange)?;
-                check_layout(
-                    &context,
-                    temporary.as_ref(),
-                    &temp,
-                    false,
-                    false,
-                    None,
-                    None,
-                )?;
-                os(fs::renameat_with(
-                    &context.source.dir,
-                    temp.as_str(),
-                    &context.source.dir,
-                    initial_state::STATE,
-                    RenameFlags::EXCHANGE,
-                ))?;
-                exchanged = true;
-                fixed_moved = Some(moved_metadata(&context.state)?);
-                temporary_moved = Some(moved_metadata(
-                    temporary
-                        .as_ref()
-                        .ok_or(KeyFileError::RecoveryStateInvalid)?,
-                )?);
-                hook(S::Exchanged)?;
-            }
-            check_layout(
-                &context,
-                temporary.as_ref(),
-                &temp,
-                exchanged,
-                removed,
-                fixed_moved.as_ref(),
-                temporary_moved.as_ref(),
-            )?;
-            io(context.source.dir.sync_all())?;
-            check_layout(
-                &context,
-                temporary.as_ref(),
-                &temp,
-                exchanged,
-                removed,
-                fixed_moved.as_ref(),
-                temporary_moved.as_ref(),
-            )?;
-            durable = true;
-            hook(S::StateSynced)?;
-            hook(S::BeforeCleanup)?;
-            check_layout(
-                &context,
-                temporary.as_ref(),
-                &temp,
-                exchanged,
-                removed,
-                fixed_moved.as_ref(),
-                temporary_moved.as_ref(),
-            )?;
-            if !removed {
-                os(fs::unlinkat(
-                    &context.source.dir,
-                    temp.as_str(),
-                    AtFlags::empty(),
-                ))?;
-                removed = true;
-                hook(S::OldSnapshotRemoved)?;
-            }
-            io(context.source.dir.sync_all())?;
-            hook(S::CleanupSynced)?;
-            check_layout(
-                &context,
-                temporary.as_ref(),
-                &temp,
-                exchanged,
-                removed,
-                fixed_moved.as_ref(),
-                temporary_moved.as_ref(),
-            )?;
-            context.check(None)?;
-            if context
+        io(context.source.dir.sync_all())?;
+        check_layout(
+            &context,
+            temporary,
+            temp,
+            exchanged,
+            removed,
+            fixed_moved.as_ref(),
+            temporary_moved.as_ref(),
+        )?;
+        durable = true;
+        hook(S::StateSynced)?;
+        hook(S::BeforeCleanup)?;
+        check_layout(
+            &context,
+            temporary,
+            temp,
+            exchanged,
+            removed,
+            fixed_moved.as_ref(),
+            temporary_moved.as_ref(),
+        )?;
+        if !removed {
+            os(fs::unlinkat(&context.source.dir, temp, AtFlags::empty()))?;
+            removed = true;
+            hook(S::OldSnapshotRemoved)?;
+        }
+        io(context.source.dir.sync_all())?;
+        hook(S::CleanupSynced)?;
+        check_layout(
+            &context,
+            temporary,
+            temp,
+            exchanged,
+            removed,
+            fixed_moved.as_ref(),
+            temporary_moved.as_ref(),
+        )?;
+        context.check(None)?;
+        if verify_resume_diagnostic
+            && context
                 .source
                 .key_state_history(&intent.before.initial.area_id)?
                 != intent.after
-            {
-                return invalid();
-            }
-            Ok(intent.after)
-        })();
-        recovered.map_err(|_| {
-            if durable {
-                KeyFileError::RecoveryStateCleanupUncertain
-            } else {
-                KeyFileError::RecoveryStateUncertain
-            }
-        })
-    }
+        {
+            return invalid();
+        }
+        Ok(intent.after)
+    })();
+    recovered.map_err(|_| {
+        if durable {
+            KeyFileError::RecoveryStateCleanupUncertain
+        } else {
+            KeyFileError::RecoveryStateUncertain
+        }
+    })
 }
