@@ -282,13 +282,19 @@ impl Fixture {
         );
     }
     fn independent(&self, intent: KeyResumeIntent) {
+        self.independent_mode(intent, "--recorded");
+    }
+    fn independent_release(&self, intent: KeyResumeIntent) {
+        self.independent_mode(intent, "--released");
+    }
+    fn independent_mode(&self, intent: KeyResumeIntent, mode: &str) {
         let hex = |b: &[u8]| data_encoding::HEXLOWER.encode(b);
         let proofs:Vec<_>=self.ids.iter().enumerate().map(|(i,id)|serde_json::json!({"id":hex(id),"directory":self.indices[i],"name":self.names[i]})).collect();
         let input = serde_json::json!({"source":self.a.0,"backups":self.areas.iter().map(|a|&a.0).collect::<Vec<_>>(),"proofs":proofs,
-            "old":hex(&self.old),"new":hex(&stdfs::read(self.a.0.join(initial_state::STATE)).unwrap()),"operation":hex(&intent.operation_id),"hash":hex(&intent.after.snapshot_hash)});
+            "guard":hex(&cbor::encode(&iv(self.expected.guard)).unwrap()),"old":hex(&self.old),"new":hex(&stdfs::read(self.a.0.join(initial_state::STATE)).unwrap()),"operation":hex(&intent.operation_id),"hash":hex(&intent.after.snapshot_hash)});
         let mut child =
             Command::new(std::env::var_os("LNGNB_REFERENCE_PYTHON").expect("reference required"))
-                .args(["tests/key_resume_reference.py", "--recorded"])
+                .args(["tests/key_resume_reference.py", mode])
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())

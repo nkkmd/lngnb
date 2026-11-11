@@ -27,8 +27,8 @@ mod cleanup_start;
 pub use cleanup_start::{
     KeyCleanupCompletion, KeyCleanupDisposition, KeyCleanupExpected, KeyCleanupStart,
     KeyDirectoryIdentity, KeyFileIdentity, KeyResumeExpected, KeyResumeIntent,
-    KeyResumePreservation, PreparedAbsentCleanup, PreparedKeyCleanup, PreparedKeyResume,
-    PreparedResidueRemoval,
+    KeyResumePreservation, KeyResumeRelease, PreparedAbsentCleanup, PreparedKeyCleanup,
+    PreparedKeyResume, PreparedResidueRemoval,
 };
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyFileError {
@@ -61,6 +61,8 @@ pub enum KeyFileError {
     RecoveryStateUncertain,
     /// 履歴導入/追記/その復旧の保存確認後、一時名整理・最終照合等が未完了/不確実。
     RecoveryStateCleanupUncertain,
+    /// guard解除試行後または不在の今回保存確認中。現存・保存を断定しない。
+    RecoveryGuardReleaseUncertain,
     /// 交換/配置済みだがdirectory fsync成功を確認できない。成功/rollbackを断定しない。
     CommitUncertain,
     /// 新鍵の永続化確認済み。旧暗号文の整理だけが未完了/不確実。
@@ -93,6 +95,7 @@ impl std::fmt::Display for KeyFileError {
             Self::RecoveryHoldUncertain => "key_recovery_hold_uncertain",
             Self::RecoveryStateUncertain => "key_recovery_state_uncertain",
             Self::RecoveryStateCleanupUncertain => "key_recovery_state_cleanup_uncertain",
+            Self::RecoveryGuardReleaseUncertain => "key_recovery_guard_release_uncertain",
             Self::CommitUncertain => "key_commit_uncertain",
             Self::CleanupUncertain => "key_committed_cleanup_uncertain",
             Self::Key(e) => return e.fmt(f),

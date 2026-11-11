@@ -1,6 +1,57 @@
 //! 再開意思の追記だけの明示復旧。完全な既存snapshotだけを使いguardを保持する。
 use super::*;
 
+pub(super) fn source_marker(source: &KeyDirectory, intent: &KeyResumeIntent) -> Result<Vec<u8>> {
+    let marker = source.state_bytes(recovery_hold::MARKER, MAX_KEYFILE_BYTES)?;
+    if marker.len() != 105 || !marker.starts_with(b"lngnb:key-recovery:2\0") {
+        return invalid();
+    }
+    let mut source_marker = marker[..73].to_vec();
+    source_marker[19] = b'1';
+    let initial = intent.before.initial;
+    if source.marker_area_id(&source_marker)? != initial.area_id
+        || marker[73..] != initial.snapshot_hash
+    {
+        return invalid();
+    }
+    Ok(source_marker)
+}
+
+pub(super) fn decode_snapshot(
+    bytes: &[u8],
+    source_marker: &[u8],
+    intent: &KeyResumeIntent,
+) -> Result<KeyStateDiagnostic> {
+    let initial = intent.before.initial;
+    state_history::decode_history(bytes, source_marker, initial.area_id, initial.snapshot_hash)
+}
+
+pub(super) fn verify_prefix(
+    new_bytes: &[u8],
+    source_marker: &[u8],
+    intent: &KeyResumeIntent,
+) -> Result<Vec<u8>> {
+    // prefix再構成はhash/全件照合だけに使う。保存/欠損補完には使わない。
+    let mut prefix = cbor::decode(new_bytes).map_err(|_| KeyFileError::RecoveryStateInvalid)?;
+    let Value::Map(items) = &mut prefix else {
+        return invalid();
+    };
+    let Some((_, Value::Array(events))) = items.iter_mut().find(|(k, _)| k == "events") else {
+        return invalid();
+    };
+    let event = events.pop().ok_or(KeyFileError::RecoveryStateInvalid)?;
+    if field(&event, "kind")? != &text("key_changes_resumed")
+        || field(&event, "operation_id")? != &bytes(intent.operation_id)
+    {
+        return invalid();
+    }
+    let old_bytes = encoded(&prefix)?;
+    if decode_snapshot(&old_bytes, source_marker, intent)? != intent.before {
+        return invalid();
+    }
+    Ok(old_bytes)
+}
+
 fn moved_metadata(file: &HeldFile) -> Result<Metadata> {
     let after = io(file.file.metadata())?;
     let mut actual = KeyFileIdentity::from_metadata(&after);
@@ -134,26 +185,8 @@ impl KeyDirectory {
             Err(KeyFileError::Missing) => None,
             Err(e) => return Err(e),
         };
-        let marker = self.state_bytes(recovery_hold::MARKER, MAX_KEYFILE_BYTES)?;
-        if marker.len() != 105 || !marker.starts_with(b"lngnb:key-recovery:2\0") {
-            return invalid();
-        }
-        let mut source_marker = marker[..73].to_vec();
-        source_marker[19] = b'1';
-        let initial = intent.before.initial;
-        if self.marker_area_id(&source_marker)? != initial.area_id
-            || marker[73..] != initial.snapshot_hash
-        {
-            return invalid();
-        }
-        let decode = |bytes: &[u8]| {
-            state_history::decode_history(
-                bytes,
-                &source_marker,
-                initial.area_id,
-                initial.snapshot_hash,
-            )
-        };
+        let source_marker = source_marker(self, intent)?;
+        let decode = |bytes: &[u8]| decode_snapshot(bytes, &source_marker, intent);
         let fixed_state = decode(&fixed.bytes)?;
         let needs_exchange = fixed_state == intent.before;
         let new_bytes = if needs_exchange {
@@ -175,24 +208,8 @@ impl KeyDirectory {
             }
             fixed.bytes.clone()
         };
-        // prefix再構成はhash/全件照合だけに使う。保存/欠損補完には使わない。
-        let mut prefix =
-            cbor::decode(&new_bytes).map_err(|_| KeyFileError::RecoveryStateInvalid)?;
-        let Value::Map(items) = &mut prefix else {
-            return invalid();
-        };
-        let Some((_, Value::Array(events))) = items.iter_mut().find(|(k, _)| k == "events") else {
-            return invalid();
-        };
-        let event = events.pop().ok_or(KeyFileError::RecoveryStateInvalid)?;
-        if field(&event, "kind")? != &text("key_changes_resumed")
-            || field(&event, "operation_id")? != &bytes(intent.operation_id)
-        {
-            return invalid();
-        }
-        let old_bytes = encoded(&prefix)?;
-        if decode(&old_bytes)? != intent.before
-            || (needs_exchange && fixed.bytes != old_bytes)
+        let old_bytes = verify_prefix(&new_bytes, &source_marker, intent)?;
+        if (needs_exchange && fixed.bytes != old_bytes)
             || (!needs_exchange && temporary.as_ref().is_some_and(|f| f.bytes != old_bytes))
         {
             return invalid();
@@ -209,6 +226,7 @@ impl KeyDirectory {
                 old_bytes,
                 new_bytes,
                 intent,
+                allow_absent_guard: false,
             },
         )?;
         if context.state.bytes != fixed.bytes
@@ -231,7 +249,7 @@ impl KeyDirectory {
         )?;
         let mut durable = false;
         let recovered = (|| -> Result<KeyStateDiagnostic> {
-            context.qualify(Some(&temp), hook, &mut || {
+            context.qualify(Some(&temp), false, hook, &mut || {
                 check_layout(
                     &context,
                     temporary.as_ref(),
@@ -345,7 +363,11 @@ impl KeyDirectory {
                 temporary_moved.as_ref(),
             )?;
             context.check(None)?;
-            if context.source.key_state_history(&initial.area_id)? != intent.after {
+            if context
+                .source
+                .key_state_history(&intent.before.initial.area_id)?
+                != intent.after
+            {
                 return invalid();
             }
             Ok(intent.after)

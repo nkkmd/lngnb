@@ -17,18 +17,18 @@ pub(in super::super::super) enum RemovalStage {
     CompletionPrepared,
 }
 
-pub(super) struct RemovedTarget {
+pub(in super::super) struct RemovedTarget {
     held: HeldFile,
     after: Metadata,
 }
 impl RemovedTarget {
-    fn capture(held: HeldFile) -> Result<Self> {
+    pub(in super::super) fn capture(held: HeldFile) -> Result<Self> {
         let after = io(held.file.metadata())?;
         let removed = Self { held, after };
         removed.check()?;
         Ok(removed)
     }
-    pub(super) fn check(&self) -> Result<()> {
+    pub(in super::super) fn check(&self) -> Result<()> {
         let before = io(self.held.file.metadata())?;
         let original = KeyFileIdentity::from_metadata(&self.held.metadata);
         let mut current = KeyFileIdentity::from_metadata(&before);
