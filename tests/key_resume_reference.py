@@ -27,6 +27,40 @@ def resumed_snapshot(count):
     return value
 
 
+def passphrase_journal():
+    """Independently encode each complete prefix for §5.113."""
+    cases = json.load(sys.stdin)
+    assert [case["base"] for case in cases] == [2, 22, 254, 1020]
+    for case in cases:
+        base = case["base"]
+        value = resumed_snapshot(base)
+        current = value["events"][-1]["current"]
+        def local_identity(ino, length):
+            return dict(current["identity"], ino=ino.to_bytes(8, "big"),
+                        length=length.to_bytes(8, "big"))
+        new_identity = local_identity(2**64 - 5, 512)
+        start_id = (base + 1).to_bytes(32, "big")
+        prepared_id = (base + 2).to_bytes(32, "big")
+        events = [
+            ("started", dict(name="publisher", old_identity=current["identity"],
+                             old_ciphertext_sha256=b"\x33"*32, new_ciphertext_sha256=b"\x55"*32,
+                             new_ciphertext_length=512, public_key=b"\x44"*32,
+                             guard_identity=local_identity(2**64 - 4, 49))),
+            ("prepared", dict(started_operation_id=start_id, new_identity=new_identity)),
+            ("completed", dict(started_operation_id=start_id, prepared_operation_id=prepared_id,
+                               installed_identity=dict(new_identity, ctime_seconds=-(2**63), ctime_nanoseconds=1),
+                               disposition=case["disposition"])),
+        ]
+        for offset, (stage, fields) in enumerate(events, 1):
+            previous_hash = hashlib.sha256(encode(value)).digest()
+            event = dict(common(base + offset, f"key_passphrase_change_{stage}"),
+                         actor_uid=(3).to_bytes(4, "big"),
+                         previous_snapshot_sha256=previous_hash, **fields)
+            value["events"].append(event)
+            assert encode(value) == bytes.fromhex(case["snapshots"][offset - 1])
+    print(json.dumps({"checked": 3 * len(cases)}))
+
+
 def main():
     cases = json.load(sys.stdin)
     assert [v["count"] for v in cases] == [2, 4, 24, 256, 1024]
@@ -119,6 +153,8 @@ def recorded(released=False):
 if __name__ == "__main__":
     if sys.argv[1:] == ["--recorded"]:
         recorded()
+    elif sys.argv[1:] == ["--passphrase-journal"]:
+        passphrase_journal()
     elif sys.argv[1:] == ["--released"]:
         recorded(released=True)
     else:
