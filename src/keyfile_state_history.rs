@@ -9,6 +9,8 @@ const STARTED: &str = "residue_cleanup_started";
 const COMPLETED: &str = "residue_cleanup_completed";
 const ABSENT: &str = "confirmed_absent_on_recovery";
 const RESUMED: &str = "key_changes_resumed";
+#[path = "keyfile_passphrase_journal.rs"]
+mod journal;
 #[path = "keyfile_resume_codec.rs"]
 mod resume;
 const COMMON: [&str; 6] = [
@@ -24,8 +26,22 @@ const COMMON: [&str; 6] = [
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyHistoryState {
     Held,
-    Active { started_operation_id: [u8; 32] },
-    Ready { resumed_operation_id: [u8; 32] },
+    Active {
+        started_operation_id: [u8; 32],
+    },
+    Ready {
+        resumed_operation_id: [u8; 32],
+    },
+    PassphraseChangeStarted {
+        started_operation_id: [u8; 32],
+    },
+    PassphraseChangePrepared {
+        prepared_operation_id: [u8; 32],
+    },
+    /// 履歴上のReady。guard解除・通常変更資格の確認は別途必要。
+    PassphraseChangeCompleted {
+        completed_operation_id: [u8; 32],
+    },
 }
 
 /// 現在の有界読取りの整合だけ。認証・過去のfsync・保全確定の証明ではない。
@@ -240,13 +256,15 @@ pub(super) fn decode_history(
     let mut ids = BTreeSet::from([operation_id]);
     let mut active = None;
     let mut ready = None;
+    let mut change = None;
     let mut completions = Vec::new();
     let mut prefix_bytes = initial_bytes.len();
     let completion_bytes = maximum_completion_bytes()?;
     for (i, event) in events.iter().enumerate().skip(1) {
         let count = i + 1;
         let kind = text(field(event, "kind")?)?;
-        if ready.is_some() {
+        let journal_keys = journal::additional_keys(kind);
+        if ready.is_some() != journal_keys.is_some() {
             return invalid();
         }
         let additional: &[&str] = match kind {
@@ -259,7 +277,7 @@ pub(super) fn decode_history(
                 "cleanup_operations",
                 "reason",
             ],
-            _ => return invalid(),
+            _ => journal_keys.ok_or(KeyFileError::RecoveryStateInvalid)?,
         };
         let mut expected = COMMON.to_vec();
         expected.extend_from_slice(additional);
@@ -273,7 +291,14 @@ pub(super) fn decode_history(
         bytes::<4>(field(event, "actor_uid")?)?;
         equal_text(field(event, "rules")?, RULES)?;
         prefix_bytes += encoded(event)?.len() + array_head(count) - array_head(i);
-        if kind == STARTED {
+        if journal_keys.is_some() {
+            change = Some(journal::validate(
+                &value,
+                &events[..count],
+                source,
+                prefix_bytes,
+            )?);
+        } else if kind == STARTED {
             if active.is_some()
                 || !completion_fits(
                     count,
@@ -311,7 +336,7 @@ pub(super) fn decode_history(
         initial,
         generation: events.len() as u64,
         snapshot_hash: Sha256::digest(snapshot).into(),
-        state: match (ready, active) {
+        state: change.unwrap_or(match (ready, active) {
             (Some(resumed_operation_id), _) => KeyHistoryState::Ready {
                 resumed_operation_id,
             },
@@ -319,7 +344,7 @@ pub(super) fn decode_history(
                 started_operation_id,
             },
             (None, None) => KeyHistoryState::Held,
-        },
+        }),
     })
 }
 
@@ -348,6 +373,15 @@ impl KeyDirectory {
             .try_into()
             .map_err(|_| KeyFileError::RecoveryStateInvalid)?;
         let result = decode_history(&snapshot, &source, area_id, root)?;
+        // 現物を伴う通常変更の診断・復旧は専用の接続で扱う。
+        if matches!(
+            result.state,
+            KeyHistoryState::PassphraseChangeStarted { .. }
+                | KeyHistoryState::PassphraseChangePrepared { .. }
+                | KeyHistoryState::PassphraseChangeCompleted { .. }
+        ) {
+            return invalid();
+        }
         if matches!(result.state, KeyHistoryState::Ready { .. }) {
             let value = cbor::decode(&snapshot).map_err(|_| KeyFileError::RecoveryStateInvalid)?;
             let Value::Array(events) = field(&value, "events")? else {

@@ -526,3 +526,6 @@ fn resume_diagnostic_keeps_guard_stop_and_initial_api_boundaries() {
     drop(dir);
     stdfs::remove_dir_all(path).unwrap();
 }
+
+#[path = "keyfile_passphrase_journal_tests.rs"]
+mod passphrase_tests;
