@@ -2360,7 +2360,7 @@ lib7件を追加。状態と全prefix/root・旧actorUID非遡及、各map全キ
 | `key_passphrase_change_prepared` | `previous_snapshot_sha256`、`started_operation_id`、`new_identity`。直前の開始を参照。新identityは開始の新長・元領域dev/uid・通常file 0600・単一linkと一致し、旧鍵・guardと別inode。開始のhash/公開鍵と対応する認証済み新暗号文を、指定名で今回file/directory fsyncした後に追記する | 変更開始 → 交換準備済み |
 | `key_passphrase_change_completed` | `previous_snapshot_sha256`、`started_operation_id`、`prepared_operation_id`、`installed_identity`、`disposition`。直前の準備とその開始を参照。installed_identityは準備の新identityとctimeを除く全項目が一致し、現在通常名の交換後の全属性を記録。dispositionは `removed_retained_old_ciphertext` または `confirmed_old_ciphertext_absent` | 交換準備済み → 論理Ready |
 
-開始は末尾Readyに限る。変更開始・交換準備済みでは表の次eventだけを受理する。完了後も解除と次回更新の明示準備は別境界。Held、整理Active、変更中の状態からの別開始、参照抜け、未来参照、再完了、余分なキー、未知kindを拒否する。変更後の通常名・期待公開鍵・暗号文hashは開始と完了の参照から導く。先行再開時の旧暗号文保全を、新暗号文と一致する保全として扱わない。各回の新暗号文と完全一致する別領域保全の要否は、次回更新の資格接続前に定める。ここでは連続更新を有効化しない。
+開始は末尾Readyに限る。最初の開始は直前の再開eventのcurrentと通常名・旧identity全項目・旧暗号文hash・期待公開鍵を一致させ、codecと現物照合の双方で検査する。変更開始・交換準備済みでは表の次eventだけを受理する。完了後も解除と次回更新の明示準備は別境界。Held、整理Active、変更中の状態からの別開始、参照抜け、未来参照、再完了、余分なキー、未知kindを拒否する。変更後の通常名・期待公開鍵・暗号文hashは開始と完了の参照から導く。先行再開時の旧暗号文保全を、新暗号文と一致する保全として扱わない。各回の新暗号文と完全一致する別領域保全の要否は、次回更新の資格接続前に定める。ここでは連続更新を有効化しない。
 
 開始前と全履歴検査中の各開始prefixで、その開始・準備・最長dispositionの完了を含む最大CBOR長と件数を予約する。件数増加による配列ヘッダ幅と将来の整数・時刻の最大符号化幅を含め、上限1 MiB/1024件を検査する。準備prefixも完了一件の予約を検査する。directory一覧上限は10,000件。開始前はguardと追記一時名の二枠が必要で、鍵一時名を作る前に開始追記の一時名を整理する。鍵一時名と準備追記一時名は同時に存在するため、鍵一時名作成前に二枠を検査する。各作成直前にも実数を確認する。
 
@@ -2371,11 +2371,11 @@ lib7件を追加。状態と全prefix/root・旧actorUID非遡及、各map全キ
 | 保存済み根拠・配置 | 復旧条件 |
 |---|---|
 | 開始以前、または開始だけで準備候補なし | 旧通常名とguardを保持。開始だけで新fileの作成元inodeは確定できない。完全に見える新候補も含め、自動採用・再作成・交換・unlinkを拒否する。完全な準備snapshot候補がある場合は、指定した控えで追記復旧を先に行う |
-| 開始・準備・完了の追記中断 | 各段階の完全な固定snapshotと一時候補だけを明示控えの旧新hash・操作ID・全prefixで照合し、今回のfile/directory fsyncを行う。各段階の現物条件も確認し、候補・操作ID・暗号文を再生成しない。成功後もguardを保持する |
+| 開始・準備・完了の追記中断 | 各段階の完全な固定snapshotと一時候補だけを明示控えの旧新hash・操作ID・全prefixで照合し、今回のfile/directory fsyncを行う。開始では旧通常名の現存と鍵一時名の正確不在、準備では旧通常名と記録した新一時名、完了では記録した新通常名の現存と鍵一時名の正確不在を照合する。全段階で記録guardの現存と未知予約名の不在を要求し、候補・操作ID・暗号文を再生成しない。成功後もguardを保持する |
 | 固定準備済み・旧通常名と新一時名 | 旧新の記録inode・全属性、hashとA11認証による同じ期待公開鍵、guard、追記一時名不在を確認。両fileとdirectoryを今回fsyncしてから、保持fdで同一性を再照合し一度だけ交換できる |
 | 固定準備済み・新通常名と旧一時名 | 両記録inodeと交換に対応する配置を確認し、記録値とのctime差だけを許す。完全bytes/hashと認証、今回のfile/directory fsync、交換後に観測した全属性を再照合してから、保持した旧fdに対応する一名だけをunlinkできる。保持fdのlink数0、許容したctime差以外の全属性と完全bytes、名前の正確不在をdirectory fsync前後に確認した場合に `removed_retained_old_ciphertext` を記録する |
-| 固定準備済み・新通常名と一時名の正確不在 | 新通常名を準備記録のinode・属性・hash・期待公開鍵と照合し、新パスフレーズで認証。guard・全履歴・残存物不在を再検査し今回の保存を確認した場合だけ `confirmed_old_ciphertext_absent` を記録できる。旧鍵認証、過去のunlinkやfsyncの成功は主張しない |
-| 固定完了・追記一時名なし | 新通常名は完了の全identity、開始のhash/公開鍵、新パスフレーズで再認証。開始に束縛したguardが現存なら直前照合後に一度だけunlinkし、保持fdと名前の正確不在を今回のdirectory fsync前後に照合。不在なら同じ控えで今回の保存を確認する。追記一時名とguard不在の併存は拒否する |
+| 固定準備済み・新通常名と一時名の正確不在 | 新通常名を準備記録のinode・ctime以外の全属性・hash・期待公開鍵と照合し、新パスフレーズで認証。再openで確認した全属性を保持し、以後はctimeも一致を要求する。guard・全履歴・残存物不在を再検査し今回の保存を確認した場合だけ `confirmed_old_ciphertext_absent` を記録できる。旧鍵認証、過去のunlinkやfsyncの成功は主張しない |
+| 固定完了・追記一時名なし | 鍵一時名の正確不在と未知予約名の不在を要求する。新通常名は完了の全identity、開始のhash/公開鍵、新パスフレーズで再認証。開始に束縛したguardが現存なら直前照合後に一度だけunlinkし、保持fdと名前の正確不在を今回のdirectory fsync前後に照合。不在なら同じ控えで今回の保存を確認する。追記一時名とguard不在の併存は拒否する |
 
 別inode、不完全候補、想定外の配置、未知予約名、欠損・不一致・認証失敗・資源不足は保全停止。解除試行後はguardの現存や保存成否を断定しない。完了とguard解除の保存確認後に出力を失った場合も、明示した同じ控えで保存を再確認できる。論理Readyや確認済み受領値だけで次の書込みへ進まない。
 
