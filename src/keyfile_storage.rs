@@ -27,8 +27,8 @@ mod cleanup_start;
 pub use cleanup_start::{
     KeyCleanupCompletion, KeyCleanupDisposition, KeyCleanupExpected, KeyCleanupStart,
     KeyDirectoryIdentity, KeyFileIdentity, KeyResumeExpected, KeyResumeIntent,
-    KeyResumePreservation, KeyResumeRelease, PreparedAbsentCleanup, PreparedKeyCleanup,
-    PreparedKeyResume, PreparedResidueRemoval,
+    KeyResumePreservation, KeyResumeRelease, PreparedAbsentCleanup, PreparedFirstPassphraseChange,
+    PreparedKeyCleanup, PreparedKeyResume, PreparedResidueRemoval,
 };
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyFileError {

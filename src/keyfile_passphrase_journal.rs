@@ -150,6 +150,64 @@ fn maximum_event_bytes(kind: &str, sequence: usize, identity: Value) -> Result<u
     .len())
 }
 
+/// 現在のReadyに続く開始・準備・完了の最大サイズを、guard作成前に検査する。
+pub(in super::super) fn first_change_fits(
+    count: usize,
+    prefix_bytes: usize,
+    current_name: &str,
+    current_identity: &Value,
+    new_length: usize,
+    limit: usize,
+) -> Result<bool> {
+    if count > 1021 || !(1..=MAX_KEYFILE_BYTES).contains(&new_length) {
+        return Ok(false);
+    }
+    let hash = || Value::Bytes(vec![0; 32]);
+    let mut guard = current_identity.clone();
+    let Value::Map(fields) = &mut guard else {
+        return invalid();
+    };
+    // guardの可変整数を最大符号化長にする。length等のbyte stringは固定幅。
+    for (key, value) in fields {
+        match key.as_str() {
+            "mtime_seconds" | "ctime_seconds" => *value = Value::Int(i64::MAX),
+            "mtime_nanoseconds" | "ctime_nanoseconds" => *value = Value::Int(999_999_999),
+            _ => (),
+        }
+    }
+    let begin = Value::Map(
+        [
+            ("sequence", Value::Int((count + 1) as i64)),
+            ("operation_id", hash()),
+            ("kind", Value::Text(BEGIN.into())),
+            ("actor_uid", Value::Bytes(vec![0; 4])),
+            ("recorded_unix_seconds", Value::Int(i64::MAX)),
+            ("rules", Value::Text(RULES.into())),
+            ("previous_snapshot_sha256", hash()),
+            ("name", Value::Text(current_name.into())),
+            ("old_identity", current_identity.clone()),
+            ("old_ciphertext_sha256", hash()),
+            ("new_ciphertext_sha256", hash()),
+            ("new_ciphertext_length", Value::Int(new_length as i64)),
+            ("public_key", hash()),
+            ("guard_identity", guard),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.into(), value))
+        .collect(),
+    );
+    let Some(started_size) = prefix_bytes
+        .checked_add(encoded(&begin)?.len())
+        .and_then(|size| size.checked_add(array_head(count + 1) - array_head(count)))
+    else {
+        return Ok(false);
+    };
+    if started_size > limit {
+        return Ok(false);
+    }
+    reserved_fits(count + 1, started_size, current_identity, true, limit)
+}
+
 pub(super) fn reserved_fits(
     count: usize,
     prefix_bytes: usize,

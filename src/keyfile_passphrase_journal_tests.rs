@@ -247,3 +247,38 @@ fn passphrase_journal_rejects_raw_duplicate_event_keys() {
         assert!(decode_history(&malformed, &source(), [0x42; 32], root()).is_err());
     }
 }
+
+#[test]
+fn passphrase_journal_ready_reserves_three_widest_events() {
+    for count in [22, 254, 1020, 1022] {
+        let ready = ready(count);
+        let raw = encoded(&ready).unwrap();
+        let Value::Array(events) = field(&ready, "events").unwrap() else {
+            panic!()
+        };
+        let current = field(events.last().unwrap(), "current").unwrap();
+        let identity = field(current, "identity").unwrap();
+        let [_, _, mut complete] = snapshots(count, REMOVED);
+        for (index, key) in [
+            (count, "guard_identity"),
+            (count + 1, "new_identity"),
+            (count + 2, "installed_identity"),
+        ] {
+            let event = event_mut(&mut complete, index);
+            set(event, "recorded_unix_seconds", Value::Int(i64::MAX));
+            let mut identity = field(event, key).unwrap().clone();
+            for key in ["mtime_seconds", "ctime_seconds"] {
+                set(&mut identity, key, Value::Int(i64::MAX));
+            }
+            for key in ["mtime_nanoseconds", "ctime_nanoseconds"] {
+                set(&mut identity, key, Value::Int(999_999_999));
+            }
+            set(event, key, identity);
+        }
+        let limit = encoded(&complete).unwrap().len();
+        let fits =
+            |limit| first_change_fits(count, raw.len(), "publisher", identity, 512, limit).unwrap();
+        assert!(!fits(limit - 1));
+        assert_eq!(fits(limit), count != 1022);
+    }
+}

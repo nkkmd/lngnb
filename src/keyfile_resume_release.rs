@@ -60,14 +60,7 @@ impl KeyDirectory {
         intent: &KeyResumeIntent,
         hook: &mut impl FnMut(ReleaseStage) -> Result<()>,
     ) -> Result<KeyResumeRelease> {
-        inventory(self, None)?;
-        let fixed = HeldFile::open(self, initial_state::STATE, initial_state::STATE_LIMIT)?;
-        let marker = source_marker(self, intent)?;
-        if decode_snapshot(&fixed.bytes, &marker, intent)? != intent.after {
-            return invalid();
-        }
-        let old_bytes = verify_prefix(&fixed.bytes, &marker, intent)?;
-        let mut context = self.prepare_resume_snapshot(
+        let mut context = self.open_fixed_resume(
             current_name,
             passphrase,
             backups,
@@ -75,18 +68,8 @@ impl KeyDirectory {
             backup_name,
             proofs,
             expected,
-            ResumeSnapshot::Existing {
-                old_bytes,
-                new_bytes: fixed.bytes.clone(),
-                intent,
-                allow_absent_guard: true,
-            },
+            intent,
         )?;
-        if context.state.bytes != fixed.bytes
-            || fingerprint(&context.state.metadata) != fingerprint(&fixed.metadata)
-        {
-            return Err(KeyFileError::RecoveryChanged);
-        }
         context.qualify_release(hook)?;
         let removed = if let Some(guard) = context.guard.take() {
             hook(ReleaseStage::BeforeUnlink)?;
@@ -126,6 +109,131 @@ impl KeyDirectory {
         } else {
             KeyResumeRelease::ConfirmedGuardAbsent(intent.after)
         })
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn open_fixed_resume<'a>(
+        &'a mut self,
+        current_name: &str,
+        passphrase: &str,
+        backups: &'a mut [KeyDirectory],
+        current_backup: usize,
+        backup_name: &str,
+        proofs: &[KeyResumePreservation<'_>],
+        expected: &KeyResumeExpected,
+        intent: &KeyResumeIntent,
+    ) -> Result<PreparedKeyResume<'a>> {
+        inventory(self, None)?;
+        let fixed = HeldFile::open(self, initial_state::STATE, initial_state::STATE_LIMIT)?;
+        let marker = source_marker(self, intent)?;
+        if decode_snapshot(&fixed.bytes, &marker, intent)? != intent.after {
+            return invalid();
+        }
+        let old_bytes = verify_prefix(&fixed.bytes, &marker, intent)?;
+        let context = self.prepare_resume_snapshot(
+            current_name,
+            passphrase,
+            backups,
+            current_backup,
+            backup_name,
+            proofs,
+            expected,
+            ResumeSnapshot::Existing {
+                old_bytes,
+                new_bytes: fixed.bytes.clone(),
+                intent,
+                allow_absent_guard: true,
+            },
+        )?;
+        if context.state.bytes != fixed.bytes
+            || fingerprint(&context.state.metadata) != fingerprint(&fixed.metadata)
+        {
+            return Err(KeyFileError::RecoveryChanged);
+        }
+        Ok(context)
+    }
+
+    /// 再開記録と現物を検査し、最初の通常変更用の非破壊準備を返す。
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_first_passphrase_change<'a>(
+        &'a mut self,
+        current_name: &str,
+        old_passphrase: &str,
+        new_passphrase: &str,
+        backups: &'a mut [KeyDirectory],
+        current_backup: usize,
+        backup_name: &str,
+        proofs: &[KeyResumePreservation<'_>],
+        expected: &KeyResumeExpected,
+        intent: &KeyResumeIntent,
+    ) -> Result<PreparedFirstPassphraseChange<'a>> {
+        absent(self, recovery_hold::GUARD)?;
+        let context = self.open_fixed_resume(
+            current_name,
+            old_passphrase,
+            backups,
+            current_backup,
+            backup_name,
+            proofs,
+            expected,
+            intent,
+        )?;
+        if context.guard.is_some() {
+            return invalid();
+        }
+        let key = unlock(&context.current.bytes, old_passphrase)?;
+        let new_ciphertext = key.encrypt(new_passphrase)?;
+        if unlock(&new_ciphertext, new_passphrase)?.public_key() != expected.public_key {
+            return Err(KeyFileError::UnexpectedPublicKey);
+        }
+        let new_hash = Sha256::digest(&new_ciphertext).into();
+        if expected.ciphertext_sha256 == new_hash {
+            return invalid();
+        }
+        if !state_history::first_change_fits(
+            intent.after.generation as usize,
+            context.state.bytes.len(),
+            &context.current_name,
+            &expected.current.value(),
+            new_ciphertext.len(),
+            initial_state::STATE_LIMIT,
+        )? {
+            return invalid();
+        }
+        let prepared = PreparedFirstPassphraseChange {
+            context,
+            new_ciphertext,
+            new_hash,
+        };
+        prepared.recheck()?;
+        prepared
+            .context
+            .qualify(None, false, &mut |_| Ok(()), &mut || Ok(()))?;
+        prepared.recheck()?;
+        Ok(prepared)
+    }
+}
+
+/// 同じ排他と現物fdを保持する準備。パスフレーズや復号鍵を保持しない。
+/// この値の取得・破棄で履歴や鍵を変更しない。
+pub struct PreparedFirstPassphraseChange<'a> {
+    context: PreparedKeyResume<'a>,
+    new_ciphertext: Vec<u8>,
+    new_hash: [u8; 32],
+}
+
+impl PreparedFirstPassphraseChange<'_> {
+    pub fn new_ciphertext_metadata(&self) -> (usize, [u8; 32]) {
+        (self.new_ciphertext.len(), self.new_hash)
+    }
+
+    /// 保持した現物と、guard・履歴一時名用の二枠を再確認する。
+    pub fn recheck(&self) -> Result<()> {
+        if self.context.check(None)? > SCAN_LIMIT - 2 {
+            return Err(KeyFileError::ScanLimit);
+        }
+        self.context
+            .state
+            .check(self.context.source, initial_state::STATE, true)
     }
 }
 

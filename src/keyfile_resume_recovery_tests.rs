@@ -944,3 +944,143 @@ fn resume_release_accepts_full_inventory_but_rejects_over_limit() {
     );
     assert_eq!(stdfs::read_dir(&f.a.0).unwrap().count(), 9_999);
 }
+
+impl Fixture {
+    fn prepare_passphrase_change(
+        &mut self,
+        intent: &KeyResumeIntent,
+        new_passphrase: &str,
+    ) -> Result<PreparedFirstPassphraseChange<'_>> {
+        let proofs: Vec<_> = self
+            .ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| KeyResumePreservation {
+                completed_operation_id: *id,
+                directory_index: self.indices[i],
+                name: &self.names[i],
+                passphrase: &self.pass,
+            })
+            .collect();
+        self.source
+            .as_mut()
+            .unwrap()
+            .prepare_first_passphrase_change(
+                "publisher",
+                &self.pass,
+                new_passphrase,
+                &mut self.backups,
+                0,
+                "saved",
+                &proofs,
+                &self.expected,
+                intent,
+            )
+    }
+}
+
+#[test]
+fn first_passphrase_preparation_keeps_files_and_rechecks_preservation() {
+    let mut f = Fixture::new(true, 2);
+    let intent = f.interrupt(S::OldSnapshotRemoved);
+    let guard = f.a.0.join(recovery_hold::GUARD);
+    let fixed = f.a.0.join(initial_state::STATE);
+    let marker = f.a.0.join(recovery_hold::MARKER);
+    let publisher = f.a.0.join("publisher");
+    let backup = f.areas[0].0.join("saved");
+    let before = stdfs::read(&fixed).unwrap();
+    let marker_before = stdfs::read(&marker).unwrap();
+    let key_before = stdfs::read(&publisher).unwrap();
+    let backup_before = stdfs::read(&backup).unwrap();
+    let new_passphrase = "different public passphrase";
+    assert!(
+        f.prepare_passphrase_change(&intent, new_passphrase)
+            .is_err()
+    );
+    assert!(guard.exists());
+    f.release(&intent, &mut |_| Ok(())).unwrap();
+    let mut stale = intent;
+    stale.after.snapshot_hash[0] ^= 1;
+    assert!(f.prepare_passphrase_change(&stale, new_passphrase).is_err());
+    assert!(f.prepare_passphrase_change(&intent, "").is_err());
+    let old = std::mem::replace(&mut f.pass, "wrong public passphrase".into());
+    assert!(
+        f.prepare_passphrase_change(&intent, new_passphrase)
+            .is_err()
+    );
+    f.pass = old;
+    let missing = f.ids.pop().unwrap();
+    assert!(
+        f.prepare_passphrase_change(&intent, new_passphrase)
+            .is_err()
+    );
+    f.ids.push(missing);
+    let unexpected = f.a.0.join(".lngnb-key-unknown");
+    stdfs::write(&unexpected, []).unwrap();
+    assert!(
+        f.prepare_passphrase_change(&intent, new_passphrase)
+            .is_err()
+    );
+    stdfs::remove_file(unexpected).unwrap();
+    {
+        let old_hash = f.expected.ciphertext_sha256;
+        let prepared = f
+            .prepare_passphrase_change(&intent, new_passphrase)
+            .unwrap();
+        let (length, hash) = prepared.new_ciphertext_metadata();
+        assert!((1..=4096).contains(&length));
+        assert_ne!(hash, old_hash);
+        prepared.recheck().unwrap();
+        // 同じbytesの書き戻しでも、記録済みidentityが変われば失効。
+        let moved = backup.with_extension("old");
+        stdfs::rename(&backup, &moved).unwrap();
+        stdfs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&backup)
+            .unwrap()
+            .write_all(&backup_before)
+            .unwrap();
+        assert!(prepared.recheck().is_err());
+    }
+    assert!(!guard.exists());
+    assert_eq!(stdfs::read(&fixed).unwrap(), before);
+    assert_eq!(stdfs::read(&marker).unwrap(), marker_before);
+    assert_eq!(stdfs::read(&publisher).unwrap(), key_before);
+    assert_eq!(stdfs::read(&backup).unwrap(), backup_before);
+    assert_eq!(
+        f.source
+            .as_mut()
+            .unwrap()
+            .change_passphrase("publisher", &f.pass, new_passphrase)
+            .err(),
+        Some(KeyFileError::PendingRecovery),
+    );
+}
+
+#[test]
+fn first_passphrase_preparation_requires_two_directory_slots() {
+    let mut f = Fixture::new(false, 0);
+    let intent = f.interrupt(S::OldSnapshotRemoved);
+    f.release(&intent, &mut |_| Ok(())).unwrap();
+    let path = f.a.0.clone();
+    let entries = stdfs::read_dir(&path).unwrap().count();
+    for index in entries..10_000 - 2 {
+        stdfs::write(path.join(format!("filler-{index}")), []).unwrap();
+    }
+    let prepared = f
+        .prepare_passphrase_change(&intent, "new public passphrase")
+        .unwrap();
+    let extra = path.join("one-slot-left");
+    stdfs::write(&extra, []).unwrap();
+    assert_eq!(prepared.recheck().err(), Some(KeyFileError::ScanLimit));
+    drop(prepared);
+    assert_eq!(
+        f.prepare_passphrase_change(&intent, "new public passphrase")
+            .err(),
+        Some(KeyFileError::ScanLimit),
+    );
+    assert!(!path.join(recovery_hold::GUARD).exists());
+    assert_eq!(stdfs::read_dir(&path).unwrap().count(), 9_999);
+}
