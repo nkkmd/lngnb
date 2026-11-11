@@ -1084,3 +1084,178 @@ fn first_passphrase_preparation_requires_two_directory_slots() {
     assert!(!path.join(recovery_hold::GUARD).exists());
     assert_eq!(stdfs::read_dir(&path).unwrap().count(), 9_999);
 }
+
+impl Fixture {
+    fn recover_passphrase_start(
+        &mut self,
+        resume: &KeyResumeIntent,
+        start: &KeyPassphraseStartIntent,
+    ) -> Result<KeyStateDiagnostic> {
+        let proofs: Vec<_> = self
+            .ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| KeyResumePreservation {
+                completed_operation_id: *id,
+                directory_index: self.indices[i],
+                name: &self.names[i],
+                passphrase: &self.pass,
+            })
+            .collect();
+        self.source.as_mut().unwrap().recover_key_passphrase_start(
+            "publisher",
+            &self.pass,
+            &mut self.backups,
+            0,
+            "saved",
+            &proofs,
+            &self.expected,
+            resume,
+            start,
+        )
+    }
+}
+
+#[test]
+fn passphrase_start_record_and_recovery_keep_guard_and_original_key() {
+    for stage in [
+        None,
+        Some(S::Prepared),
+        Some(S::Exchanged),
+        Some(S::OldSnapshotRemoved),
+    ] {
+        let mut f = Fixture::new(false, 0);
+        let resume = f.interrupt(S::OldSnapshotRemoved);
+        f.release(&resume, &mut |_| Ok(())).unwrap();
+        let source = f.a.0.clone();
+        let publisher = source.join("publisher");
+        let before = stdfs::read(&publisher).unwrap();
+        let mut prepared = f
+            .prepare_passphrase_change(&resume, "new public passphrase")
+            .unwrap()
+            .prepare_start()
+            .unwrap();
+        let intent = prepared.intent();
+        assert_eq!(intent.before, resume.after);
+        let result = prepared.record_with(&mut |step| {
+            if stage == Some(step) {
+                Err(KeyFileError::Io)
+            } else {
+                Ok(())
+            }
+        });
+        if stage.is_some() {
+            assert!(result.is_err());
+        } else {
+            assert_eq!(result.unwrap(), intent.after);
+        }
+        drop(prepared);
+        f.reopen();
+        let mut wrong = intent;
+        wrong.after.snapshot_hash[0] ^= 1;
+        assert!(f.recover_passphrase_start(&resume, &wrong).is_err());
+        assert_eq!(
+            f.recover_passphrase_start(&resume, &intent).unwrap(),
+            intent.after
+        );
+        assert_eq!(stdfs::read(&publisher).unwrap(), before);
+        assert!(source.join(recovery_hold::GUARD).exists());
+        let journal_temp = source.join(format!(
+            ".lngnb-key-state-update-{}",
+            data_encoding::HEXLOWER.encode(&intent.operation_id)
+        ));
+        let key_temp = source.join(format!(
+            ".lngnb-key-passphrase-{}",
+            data_encoding::HEXLOWER.encode(&intent.operation_id)
+        ));
+        assert!(!journal_temp.exists());
+        assert!(!key_temp.exists());
+        stdfs::write(&key_temp, []).unwrap();
+        assert!(f.recover_passphrase_start(&resume, &intent).is_err());
+        assert!(key_temp.exists());
+    }
+}
+
+#[test]
+fn passphrase_start_recovery_rejects_missing_partial_and_replaced_guard() {
+    for failure in 0..3 {
+        let mut f = Fixture::new(false, 0);
+        let resume = f.interrupt(S::OldSnapshotRemoved);
+        f.release(&resume, &mut |_| Ok(())).unwrap();
+        let source = f.a.0.clone();
+        let mut prepared = f
+            .prepare_passphrase_change(&resume, "new public passphrase")
+            .unwrap()
+            .prepare_start()
+            .unwrap();
+        let intent = prepared.intent();
+        if failure == 0 {
+            drop(prepared);
+        } else {
+            let stage = if failure == 1 {
+                S::Created
+            } else {
+                S::Prepared
+            };
+            assert!(
+                prepared
+                    .record_with(&mut |step| if step == stage {
+                        Err(KeyFileError::Io)
+                    } else {
+                        Ok(())
+                    })
+                    .is_err()
+            );
+            drop(prepared);
+        }
+        let guard = source.join(recovery_hold::GUARD);
+        if failure == 2 {
+            let original = stdfs::read(&guard).unwrap();
+            stdfs::rename(&guard, source.join("retained-guard")).unwrap();
+            stdfs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&guard)
+                .unwrap()
+                .write_all(&original)
+                .unwrap();
+        }
+        let state = source.join(initial_state::STATE);
+        let fixed = stdfs::read(&state).unwrap();
+        f.reopen();
+        assert!(f.recover_passphrase_start(&resume, &intent).is_err());
+        assert!(guard.exists());
+        assert_eq!(stdfs::read(&state).unwrap(), fixed);
+    }
+}
+
+#[test]
+fn passphrase_start_guard_interruption_keeps_fixed_ready_and_stops_retry() {
+    for boundary in [S::StartGuardCreated, S::StartGuardSynced] {
+        let mut f = Fixture::new(false, 0);
+        let resume = f.interrupt(S::OldSnapshotRemoved);
+        f.release(&resume, &mut |_| Ok(())).unwrap();
+        let source = f.a.0.clone();
+        let state = source.join(initial_state::STATE);
+        let before = stdfs::read(&state).unwrap();
+        let prepared = f
+            .prepare_passphrase_change(&resume, "new public passphrase")
+            .unwrap();
+        let failed = prepared.prepare_start_with(&mut |stage| {
+            if stage == boundary {
+                Err(KeyFileError::Io)
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(failed.err(), Some(KeyFileError::RecoveryHoldUncertain));
+        f.reopen();
+        assert!(
+            f.prepare_passphrase_change(&resume, "new public passphrase")
+                .is_err()
+        );
+        assert!(source.join(recovery_hold::GUARD).exists());
+        assert_eq!(stdfs::read(&state).unwrap(), before);
+    }
+}

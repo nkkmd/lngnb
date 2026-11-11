@@ -142,6 +142,7 @@ impl KeyDirectory {
                 new_bytes: fixed.bytes.clone(),
                 intent,
                 allow_absent_guard: true,
+                expected_guard: None,
             },
         )?;
         if context.state.bytes != fixed.bytes
@@ -216,9 +217,9 @@ impl KeyDirectory {
 /// 同じ排他と現物fdを保持する準備。パスフレーズや復号鍵を保持しない。
 /// この値の取得・破棄で履歴や鍵を変更しない。
 pub struct PreparedFirstPassphraseChange<'a> {
-    context: PreparedKeyResume<'a>,
-    new_ciphertext: Vec<u8>,
-    new_hash: [u8; 32],
+    pub(super) context: PreparedKeyResume<'a>,
+    pub(super) new_ciphertext: Vec<u8>,
+    pub(super) new_hash: [u8; 32],
 }
 
 impl PreparedFirstPassphraseChange<'_> {

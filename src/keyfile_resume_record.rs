@@ -15,6 +15,7 @@ enum ResumeSnapshot<'a> {
         new_bytes: Vec<u8>,
         intent: &'a KeyResumeIntent,
         allow_absent_guard: bool,
+        expected_guard: Option<KeyFileIdentity>,
     },
 }
 
@@ -50,6 +51,8 @@ pub(in super::super) enum ResumeStage {
     DirectoriesSynced,
     ControlsSynced,
     Qualified,
+    StartGuardCreated,
+    StartGuardSynced,
     BeforeCreate,
     Created,
     Written,
@@ -266,8 +269,15 @@ impl PreparedKeyResume<'_> {
         self.record_with(&mut |_| Ok(()))
     }
     pub(in super::super) fn record_with(
-        self,
+        mut self,
         hook: &mut impl FnMut(ResumeStage) -> Result<()>,
+    ) -> Result<KeyStateDiagnostic> {
+        self.record_snapshot_with(hook, true)
+    }
+    fn record_snapshot_with(
+        &mut self,
+        hook: &mut impl FnMut(ResumeStage) -> Result<()>,
+        verify_resume_diagnostic: bool,
     ) -> Result<KeyStateDiagnostic> {
         use ResumeStage as S;
         if self.check(None)? >= SCAN_LIMIT {
@@ -346,10 +356,11 @@ impl PreparedKeyResume<'_> {
             self.check(None)?;
             self.source
                 .state_binding(initial_state::STATE, &self.new_bytes, &file)?;
-            if self
-                .source
-                .key_state_history(&self.intent.after.initial.area_id)?
-                != self.intent.after
+            if verify_resume_diagnostic
+                && self
+                    .source
+                    .key_state_history(&self.intent.after.initial.area_id)?
+                    != self.intent.after
             {
                 return invalid();
             }
@@ -476,6 +487,13 @@ impl KeyDirectory {
             return invalid();
         }
         let marker = HeldFile::open(self, recovery_hold::MARKER, MAX_KEYFILE_BYTES)?;
+        let guard_identity = match &snapshot {
+            ResumeSnapshot::Existing {
+                expected_guard: Some(guard),
+                ..
+            } => *guard,
+            _ => expected.guard,
+        };
         let guard = match HeldFile::open(self, recovery_hold::GUARD, MAX_KEYFILE_BYTES) {
             Ok(guard) => Some(guard),
             Err(KeyFileError::Missing)
@@ -508,7 +526,7 @@ impl KeyDirectory {
             || marker.bytes[73..] != expected.state.initial.snapshot_hash
             || guard.as_ref().is_some_and(|guard| {
                 guard.bytes != guard_bytes
-                    || KeyFileIdentity::from_metadata(&guard.metadata) != expected.guard
+                    || KeyFileIdentity::from_metadata(&guard.metadata) != guard_identity
             })
             || state_history::decode_history(
                 &old_bytes,
@@ -728,3 +746,6 @@ impl KeyDirectory {
         Ok(prepared)
     }
 }
+
+#[path = "keyfile_passphrase_start.rs"]
+pub(super) mod passphrase_start;
