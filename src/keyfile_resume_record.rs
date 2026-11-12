@@ -55,6 +55,10 @@ pub(in super::super) enum ResumeStage {
     StagedKeyWritten,
     StagedKeyFileSynced,
     StagedKeyDirectorySynced,
+    BeforeOldKeyUnlink,
+    OldKeyUnlinked,
+    BeforeOldKeyDirectorySync,
+    OldKeyDirectorySynced,
     BeforeKeyExchange,
     KeyExchanged,
     KeyExchangeDirectorySynced,
@@ -406,6 +410,12 @@ impl PreparedKeyResume<'_> {
     }
 }
 
+enum ResumeCurrent<'a> {
+    Original,
+    Moved(&'a str, HeldFile),
+    Installed(HeldFile),
+}
+
 impl KeyDirectory {
     /// backup sliceは異なる領域を一つずつ開いて渡す。同じ領域の複数保全fileはindexを共有する。
     /// 入力の全過去保全を認証し、今回のfile/directory fsyncを確認して保持する。
@@ -493,7 +503,7 @@ impl KeyDirectory {
         expected: &KeyResumeExpected,
         snapshot: ResumeSnapshot<'_>,
     ) -> Result<PreparedKeyResume<'a>> {
-        self.prepare_resume_snapshot_with_moved_key(
+        self.prepare_resume_snapshot_with_current(
             current_name,
             passphrase,
             backups,
@@ -502,12 +512,12 @@ impl KeyDirectory {
             proofs,
             expected,
             snapshot,
-            None,
+            ResumeCurrent::Original,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn prepare_resume_snapshot_with_moved_key<'a>(
+    fn prepare_resume_snapshot_with_current<'a>(
         &'a mut self,
         current_name: &str,
         passphrase: &str,
@@ -517,7 +527,7 @@ impl KeyDirectory {
         proofs: &[KeyResumePreservation<'_>],
         expected: &KeyResumeExpected,
         snapshot: ResumeSnapshot<'_>,
-        moved_key: Option<(&str, HeldFile)>,
+        binding: ResumeCurrent<'_>,
     ) -> Result<PreparedKeyResume<'a>> {
         name(current_name)?;
         name(backup_name)?;
@@ -639,32 +649,52 @@ impl KeyDirectory {
         if used.iter().any(|v| !v) {
             return invalid();
         }
-        let (current_path, current, current_identity) = if let Some((path, held)) = moved_key {
-            held.check(self, path, true)?;
-            let mut identity = KeyFileIdentity::from_metadata(&held.metadata);
-            identity.ctime_seconds = expected.current.ctime_seconds;
-            identity.ctime_nanoseconds = expected.current.ctime_nanoseconds;
-            (path, held, identity)
-        } else {
-            let held = HeldFile::open(self, current_name, MAX_KEYFILE_BYTES)?;
-            let identity = KeyFileIdentity::from_metadata(&held.metadata);
-            (current_name, held, identity)
+        let (current_path, current, installed) = match binding {
+            ResumeCurrent::Original => (
+                current_name,
+                HeldFile::open(self, current_name, MAX_KEYFILE_BYTES)?,
+                false,
+            ),
+            ResumeCurrent::Moved(path, held) => {
+                held.check(self, path, true)?;
+                (path, held, false)
+            }
+            ResumeCurrent::Installed(held) => {
+                held.check(self, current_name, true)?;
+                (current_name, held, true)
+            }
         };
         let current_preserved =
             HeldFile::open(&backups[current_backup], backup_name, MAX_KEYFILE_BYTES)?;
-        if current_identity != expected.current
-            || KeyFileIdentity::from_metadata(&current_preserved.metadata) != expected.preserved
-            || <[u8; 32]>::from(Sha256::digest(&current.bytes)) != expected.ciphertext_sha256
-        {
+        if KeyFileIdentity::from_metadata(&current_preserved.metadata) != expected.preserved {
             return Err(KeyFileError::RecoveryChanged);
         }
-        if current.bytes != current_preserved.bytes {
-            return Err(KeyFileError::PreservationMismatch);
-        }
-        for bytes in [&current.bytes, &current_preserved.bytes] {
-            if unlock(bytes, passphrase)?.public_key() != expected.public_key {
+        if installed {
+            if <[u8; 32]>::from(Sha256::digest(&current_preserved.bytes))
+                != expected.ciphertext_sha256
+            {
+                return Err(KeyFileError::RecoveryChanged);
+            }
+        } else {
+            let mut identity = KeyFileIdentity::from_metadata(&current.metadata);
+            if current_path != current_name {
+                identity.ctime_seconds = expected.current.ctime_seconds;
+                identity.ctime_nanoseconds = expected.current.ctime_nanoseconds;
+            }
+            if identity != expected.current
+                || <[u8; 32]>::from(Sha256::digest(&current.bytes)) != expected.ciphertext_sha256
+            {
+                return Err(KeyFileError::RecoveryChanged);
+            }
+            if current.bytes != current_preserved.bytes {
+                return Err(KeyFileError::PreservationMismatch);
+            }
+            if unlock(&current.bytes, passphrase)?.public_key() != expected.public_key {
                 return Err(KeyFileError::UnexpectedPublicKey);
             }
+        }
+        if unlock(&current_preserved.bytes, passphrase)?.public_key() != expected.public_key {
+            return Err(KeyFileError::UnexpectedPublicKey);
         }
         let mut preservations = vec![Preservation {
             directory: current_backup,
