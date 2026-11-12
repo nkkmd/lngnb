@@ -649,14 +649,6 @@ impl KeyDirectory {
         if used.iter().any(|v| !v) {
             return invalid();
         }
-        let current_preserved =
-            HeldFile::open(&backups[current_backup], backup_name, MAX_KEYFILE_BYTES)?;
-        if KeyFileIdentity::from_metadata(&current_preserved.metadata) != expected.preserved
-            || <[u8; 32]>::from(Sha256::digest(&current_preserved.bytes))
-                != expected.ciphertext_sha256
-        {
-            return Err(KeyFileError::RecoveryChanged);
-        }
         let (current_path, current, installed) = match binding {
             ResumeCurrent::Original => (
                 current_name,
@@ -672,6 +664,11 @@ impl KeyDirectory {
                 (current_name, held, true)
             }
         };
+        let current_preserved =
+            HeldFile::open(&backups[current_backup], backup_name, MAX_KEYFILE_BYTES)?;
+        if KeyFileIdentity::from_metadata(&current_preserved.metadata) != expected.preserved {
+            return Err(KeyFileError::RecoveryChanged);
+        }
         if installed {
             if <[u8; 32]>::from(Sha256::digest(&current_preserved.bytes))
                 != expected.ciphertext_sha256
