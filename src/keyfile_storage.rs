@@ -26,9 +26,9 @@ pub use state_history::{KeyHistoryState, KeyStateDiagnostic};
 mod cleanup_start;
 pub use cleanup_start::{
     KeyCleanupCompletion, KeyCleanupDisposition, KeyCleanupExpected, KeyCleanupStart,
-    KeyDirectoryIdentity, KeyFileIdentity, KeyPassphrasePreparedIntent, KeyPassphraseStartIntent,
-    KeyResumeExpected, KeyResumeIntent, KeyResumePreservation, KeyResumeRelease,
-    PreparedAbsentCleanup, PreparedFirstPassphraseChange, PreparedKeyCleanup,
+    KeyDirectoryIdentity, KeyFileIdentity, KeyPassphraseExchange, KeyPassphrasePreparedIntent,
+    KeyPassphraseStartIntent, KeyResumeExpected, KeyResumeIntent, KeyResumePreservation,
+    KeyResumeRelease, PreparedAbsentCleanup, PreparedFirstPassphraseChange, PreparedKeyCleanup,
     PreparedKeyPassphraseRecord, PreparedKeyPassphraseStart, PreparedKeyResume,
     PreparedResidueRemoval,
 };

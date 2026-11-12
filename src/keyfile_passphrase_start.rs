@@ -389,16 +389,7 @@ impl KeyDirectory {
         start: &KeyPassphraseStartIntent,
         prepared: &KeyPassphrasePreparedIntent,
     ) -> Result<KeyStateDiagnostic> {
-        if prepared.before != start.after
-            || prepared.after.initial != prepared.before.initial
-            || prepared.before.generation.checked_add(1) != Some(prepared.after.generation)
-            || prepared.after.state
-                != (KeyHistoryState::PassphraseChangePrepared {
-                    prepared_operation_id: prepared.operation_id,
-                })
-        {
-            return invalid();
-        }
+        check_prepared_intent(start, prepared)?;
         self.recover_passphrase_snapshot(
             current_name,
             old_passphrase,
@@ -427,16 +418,7 @@ impl KeyDirectory {
         start: &KeyPassphraseStartIntent,
         prepared: Option<(&KeyPassphrasePreparedIntent, &str)>,
     ) -> Result<KeyStateDiagnostic> {
-        if start.before != resume.after
-            || start.after.initial != start.before.initial
-            || start.before.generation.checked_add(1) != Some(start.after.generation)
-            || start.after.state
-                != (KeyHistoryState::PassphraseChangeStarted {
-                    started_operation_id: start.operation_id,
-                })
-        {
-            return invalid();
-        }
+        check_start_intent(resume, start)?;
         let start_intent = KeyResumeIntent {
             before: start.before,
             after: start.after,
@@ -550,3 +532,38 @@ impl KeyDirectory {
         )
     }
 }
+
+fn check_start_intent(resume: &KeyResumeIntent, start: &KeyPassphraseStartIntent) -> Result<()> {
+    if start.before != resume.after
+        || start.after.initial != start.before.initial
+        || start.before.generation.checked_add(1) != Some(start.after.generation)
+        || start.after.state
+            != (KeyHistoryState::PassphraseChangeStarted {
+                started_operation_id: start.operation_id,
+            })
+    {
+        return invalid();
+    }
+    Ok(())
+}
+
+fn check_prepared_intent(
+    start: &KeyPassphraseStartIntent,
+    prepared: &KeyPassphrasePreparedIntent,
+) -> Result<()> {
+    if prepared.before != start.after
+        || prepared.after.initial != prepared.before.initial
+        || prepared.before.generation.checked_add(1) != Some(prepared.after.generation)
+        || prepared.after.state
+            != (KeyHistoryState::PassphraseChangePrepared {
+                prepared_operation_id: prepared.operation_id,
+            })
+    {
+        return invalid();
+    }
+    Ok(())
+}
+
+#[path = "keyfile_passphrase_exchange.rs"]
+mod exchange;
+pub use exchange::KeyPassphraseExchange;

@@ -1433,3 +1433,279 @@ fn passphrase_staging_interruption_keeps_old_key_and_guard() {
         assert!(path.join(recovery_hold::GUARD).exists());
     }
 }
+
+impl Fixture {
+    fn exchange_passphrase(
+        &mut self,
+        resume: &KeyResumeIntent,
+        start: &KeyPassphraseStartIntent,
+        prepared: &KeyPassphrasePreparedIntent,
+        passphrase: &str,
+        hook: &mut impl FnMut(S) -> Result<()>,
+    ) -> Result<KeyPassphraseExchange> {
+        let proofs: Vec<_> = self
+            .ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| KeyResumePreservation {
+                completed_operation_id: *id,
+                directory_index: self.indices[i],
+                name: &self.names[i],
+                passphrase: &self.pass,
+            })
+            .collect();
+        self.source.as_mut().unwrap().exchange_key_passphrase_with(
+            "publisher",
+            &self.pass,
+            passphrase,
+            &mut self.backups,
+            0,
+            "saved",
+            &proofs,
+            &self.expected,
+            resume,
+            start,
+            prepared,
+            hook,
+        )
+    }
+}
+
+#[test]
+fn passphrase_key_exchange_retries_without_reversing_and_retains_both_keys() {
+    const NEW_PASS: &str = "new public passphrase";
+    if let Some(mut context) = child_context() {
+        let path = PathBuf::from(std::env::var_os("LNGNB_PUBLIC_RESUME_SOURCE").unwrap());
+        let mut marker = stdfs::read(path.join(recovery_hold::MARKER)).unwrap();
+        marker.truncate(73);
+        marker[19] = b'1';
+        let initial = context.expected.state.initial;
+        let decode = |snapshot: &Value| {
+            state_history::decode_history(
+                &cbor::encode(snapshot).unwrap(),
+                &marker,
+                initial.area_id,
+                initial.snapshot_hash,
+            )
+            .unwrap()
+        };
+        let last_id = |snapshot: &Value| {
+            let Value::Bytes(id) =
+                crate::keyfile::get(events(snapshot).last().unwrap(), "operation_id").unwrap()
+            else {
+                panic!("fixture operation ID");
+            };
+            id.as_slice().try_into().unwrap()
+        };
+        let pop = |snapshot: &mut Value| {
+            let mut prefix = events(snapshot).to_vec();
+            prefix.pop().unwrap();
+            set(snapshot, "events", Value::Array(prefix));
+        };
+        let mut snapshot =
+            cbor::decode(&stdfs::read(path.join(initial_state::STATE)).unwrap()).unwrap();
+        let prepared_after = decode(&snapshot);
+        let prepared_id = last_id(&snapshot);
+        pop(&mut snapshot);
+        let started_after = decode(&snapshot);
+        let start_id = last_id(&snapshot);
+        pop(&mut snapshot);
+        let ready = decode(&snapshot);
+        let resume = KeyResumeIntent {
+            before: context.expected.state,
+            after: ready,
+            operation_id: last_id(&snapshot),
+        };
+        let start = KeyPassphraseStartIntent {
+            before: ready,
+            after: started_after,
+            operation_id: start_id,
+        };
+        let prepared = KeyPassphrasePreparedIntent {
+            before: started_after,
+            after: prepared_after,
+            operation_id: prepared_id,
+        };
+        let proofs: Vec<_> = context
+            .manifest
+            .iter()
+            .map(|(id, index, name)| KeyResumePreservation {
+                completed_operation_id: *id,
+                directory_index: *index,
+                name,
+                passphrase: &context.pass,
+            })
+            .collect();
+        let point = std::env::var("LNGNB_PUBLIC_RESUME_POINT").unwrap();
+        let pause = || {
+            println!("READY");
+            std::io::stdout().flush().unwrap();
+            loop {
+                std::thread::park();
+            }
+        };
+        assert_eq!(
+            context
+                .source
+                .exchange_key_passphrase_with(
+                    "publisher",
+                    &context.pass,
+                    NEW_PASS,
+                    &mut context.backups,
+                    0,
+                    "saved",
+                    &proofs,
+                    &context.expected,
+                    &resume,
+                    &start,
+                    &prepared,
+                    &mut |stage| {
+                        if format!("{stage:?}") == point {
+                            pause();
+                        }
+                        Ok(())
+                    },
+                )
+                .unwrap(),
+            KeyPassphraseExchange::Exchanged
+        );
+        assert_eq!(point, "OutputFailed");
+        assert!(
+            stdfs::File::open("/dev/null")
+                .unwrap()
+                .write_all(b"result")
+                .is_err()
+        );
+        pause();
+    }
+    for (stage, kill) in [
+        (None, None),
+        (Some(S::BeforeKeyExchange), None),
+        (Some(S::KeyExchanged), None),
+        (Some(S::KeyExchangeDirectorySynced), None),
+        (Some(S::BeforeKeyExchange), Some("BeforeKeyExchange")),
+        (Some(S::KeyExchanged), Some("KeyExchanged")),
+        (
+            Some(S::KeyExchangeDirectorySynced),
+            Some("KeyExchangeDirectorySynced"),
+        ),
+        (None, Some("OutputFailed")),
+    ] {
+        let mut f = Fixture::new(false, 0);
+        let resume = f.interrupt(S::OldSnapshotRemoved);
+        f.release(&resume, &mut |_| Ok(())).unwrap();
+        let path = f.a.0.clone();
+        let normal = path.join("publisher");
+        let old = stdfs::read(&normal).unwrap();
+        let mut begin = f
+            .prepare_passphrase_change(&resume, NEW_PASS)
+            .unwrap()
+            .prepare_start()
+            .unwrap();
+        let start = begin.intent();
+        begin.record().unwrap();
+        let record = begin.prepare_ciphertext(NEW_PASS).unwrap();
+        let prepared = record.intent();
+        record.record().unwrap();
+        let temporary = path.join(format!(
+            ".lngnb-key-passphrase-{}",
+            data_encoding::HEXLOWER.encode(&start.operation_id)
+        ));
+        let new = stdfs::read(&temporary).unwrap();
+        let state = stdfs::read(path.join(initial_state::STATE)).unwrap();
+        let mut wrong = prepared;
+        wrong.after.snapshot_hash[0] ^= 1;
+        assert!(
+            f.exchange_passphrase(&resume, &start, &wrong, NEW_PASS, &mut |_| Ok(()))
+                .is_err()
+        );
+        assert!(
+            f.exchange_passphrase(
+                &resume,
+                &start,
+                &prepared,
+                "wrong public passphrase",
+                &mut |_| Ok(())
+            )
+            .is_err()
+        );
+        assert_eq!(stdfs::read(&normal).unwrap(), old);
+        if let Some(point) = kill {
+            f.source.take();
+            f.backups.clear();
+            let mut child = child_command(
+                &f,
+                "keyfile::files::tests::resume_record_tests::recovery_tests::passphrase_key_exchange_retries_without_reversing_and_retains_both_keys",
+            )
+            .env("LNGNB_PUBLIC_RESUME_OLD", data_encoding::HEXLOWER.encode(&f.old))
+            .env("LNGNB_PUBLIC_RESUME_POINT", point)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn().unwrap();
+            let output = std::io::BufReader::new(child.stdout.take().unwrap());
+            let ready = output.lines().take(10).any(|line| line.unwrap() == "READY");
+            if ready {
+                child.kill().unwrap();
+            }
+            let result = child.wait_with_output().unwrap();
+            assert!(
+                ready && !result.status.success(),
+                "{point}: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        } else {
+            let first = f.exchange_passphrase(&resume, &start, &prepared, NEW_PASS, &mut |point| {
+                if stage == Some(point) {
+                    Err(KeyFileError::Io)
+                } else {
+                    Ok(())
+                }
+            });
+            match stage {
+                None => assert_eq!(first.unwrap(), KeyPassphraseExchange::Exchanged),
+                Some(S::BeforeKeyExchange) => assert_eq!(first.err(), Some(KeyFileError::Io)),
+                _ => assert_eq!(first.err(), Some(KeyFileError::CommitUncertain)),
+            }
+        }
+        f.reopen();
+        let result = f
+            .exchange_passphrase(&resume, &start, &prepared, NEW_PASS, &mut |_| Ok(()))
+            .unwrap();
+        assert_eq!(
+            result,
+            if stage == Some(S::BeforeKeyExchange) {
+                KeyPassphraseExchange::Exchanged
+            } else {
+                KeyPassphraseExchange::ConfirmedExchanged
+            }
+        );
+        assert_eq!(stdfs::read(&normal).unwrap(), new);
+        assert_eq!(stdfs::read(&temporary).unwrap(), old);
+        assert_eq!(stdfs::read(path.join(initial_state::STATE)).unwrap(), state);
+        assert!(path.join(recovery_hold::GUARD).exists());
+        assert!(
+            f.recover_passphrase_prepared(&resume, &start, &prepared, NEW_PASS)
+                .is_err()
+        );
+        let displaced = path.join("displaced-old");
+        stdfs::rename(&temporary, &displaced).unwrap();
+        assert!(
+            f.exchange_passphrase(&resume, &start, &prepared, NEW_PASS, &mut |_| Ok(()))
+                .is_err()
+        );
+        stdfs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)
+            .unwrap()
+            .write_all(&old)
+            .unwrap();
+        assert!(
+            f.exchange_passphrase(&resume, &start, &prepared, NEW_PASS, &mut |_| Ok(()))
+                .is_err()
+        );
+        assert_eq!(stdfs::read(&normal).unwrap(), new);
+        assert_eq!(stdfs::read(&temporary).unwrap(), old);
+    }
+}
