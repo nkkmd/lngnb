@@ -1546,31 +1546,65 @@ fn passphrase_key_exchange_retries_without_reversing_and_retains_both_keys() {
                 std::thread::park();
             }
         };
-        assert_eq!(
-            context
-                .source
-                .exchange_key_passphrase_with(
-                    "publisher",
-                    &context.pass,
-                    NEW_PASS,
-                    &mut context.backups,
-                    0,
-                    "saved",
-                    &proofs,
-                    &context.expected,
-                    &resume,
-                    &start,
-                    &prepared,
-                    &mut |stage| {
-                        if format!("{stage:?}") == point {
-                            pause();
-                        }
-                        Ok(())
-                    },
-                )
-                .unwrap(),
-            KeyPassphraseExchange::Exchanged
-        );
+        let mut hook = |stage| {
+            if format!("{stage:?}") == point {
+                pause();
+            }
+            Ok(())
+        };
+        if let Ok(ctime) = std::env::var("LNGNB_PUBLIC_CLEANUP_OLD_CTIME") {
+            let (seconds, nanoseconds) = ctime.split_once(':').unwrap();
+            let temporary = path.join(format!(
+                ".lngnb-key-passphrase-{}",
+                data_encoding::HEXLOWER.encode(&start_id)
+            ));
+            context.expected.current = identity(&temporary);
+            context.expected.current.ctime_seconds = seconds.parse().unwrap();
+            context.expected.current.ctime_nanoseconds = nanoseconds.parse().unwrap();
+            context.expected.ciphertext_sha256 =
+                Sha256::digest(stdfs::read(&temporary).unwrap()).into();
+            assert_eq!(
+                context
+                    .source
+                    .cleanup_key_passphrase_with(
+                        "publisher",
+                        &context.pass,
+                        NEW_PASS,
+                        &mut context.backups,
+                        0,
+                        "saved",
+                        &proofs,
+                        &context.expected,
+                        &resume,
+                        &start,
+                        &prepared,
+                        &mut hook,
+                    )
+                    .unwrap(),
+                KeyPassphraseCleanup::RemovedRetainedOldCiphertext
+            );
+        } else {
+            assert_eq!(
+                context
+                    .source
+                    .exchange_key_passphrase_with(
+                        "publisher",
+                        &context.pass,
+                        NEW_PASS,
+                        &mut context.backups,
+                        0,
+                        "saved",
+                        &proofs,
+                        &context.expected,
+                        &resume,
+                        &start,
+                        &prepared,
+                        &mut hook,
+                    )
+                    .unwrap(),
+                KeyPassphraseExchange::Exchanged
+            );
+        }
         assert_eq!(point, "OutputFailed");
         assert!(
             stdfs::File::open("/dev/null")
@@ -1708,6 +1742,188 @@ fn passphrase_key_exchange_retries_without_reversing_and_retains_both_keys() {
                 .is_err()
         );
         assert_eq!(stdfs::read(&normal).unwrap(), new);
+        assert_eq!(stdfs::read(&temporary).unwrap(), old);
+    }
+}
+
+impl Fixture {
+    fn cleanup_passphrase(
+        &mut self,
+        resume: &KeyResumeIntent,
+        start: &KeyPassphraseStartIntent,
+        prepared: &KeyPassphrasePreparedIntent,
+        passphrase: &str,
+        hook: &mut impl FnMut(S) -> Result<()>,
+    ) -> Result<KeyPassphraseCleanup> {
+        let proofs: Vec<_> = self
+            .ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| KeyResumePreservation {
+                completed_operation_id: *id,
+                directory_index: self.indices[i],
+                name: &self.names[i],
+                passphrase: &self.pass,
+            })
+            .collect();
+        self.source.as_mut().unwrap().cleanup_key_passphrase_with(
+            "publisher",
+            &self.pass,
+            passphrase,
+            &mut self.backups,
+            0,
+            "saved",
+            &proofs,
+            &self.expected,
+            resume,
+            start,
+            prepared,
+            hook,
+        )
+    }
+}
+
+#[test]
+fn passphrase_old_ciphertext_cleanup_rechecks_absence_and_keeps_guard() {
+    const NEW_PASS: &str = "new public passphrase";
+    for (point, kill) in [
+        (None, None),
+        (Some(S::BeforeOldKeyUnlink), None),
+        (Some(S::OldKeyUnlinked), None),
+        (Some(S::BeforeOldKeyDirectorySync), None),
+        (Some(S::OldKeyDirectorySynced), None),
+        (Some(S::BeforeOldKeyUnlink), Some("BeforeOldKeyUnlink")),
+        (Some(S::OldKeyUnlinked), Some("OldKeyUnlinked")),
+        (
+            Some(S::BeforeOldKeyDirectorySync),
+            Some("BeforeOldKeyDirectorySync"),
+        ),
+        (
+            Some(S::OldKeyDirectorySynced),
+            Some("OldKeyDirectorySynced"),
+        ),
+        (None, Some("OutputFailed")),
+    ] {
+        let mut f = Fixture::new(false, 0);
+        let resume = f.interrupt(S::OldSnapshotRemoved);
+        f.release(&resume, &mut |_| Ok(())).unwrap();
+        let path = f.a.0.clone();
+        let normal = path.join("publisher");
+        let old = stdfs::read(&normal).unwrap();
+        let mut begin = f
+            .prepare_passphrase_change(&resume, NEW_PASS)
+            .unwrap()
+            .prepare_start()
+            .unwrap();
+        let start = begin.intent();
+        begin.record().unwrap();
+        let record = begin.prepare_ciphertext(NEW_PASS).unwrap();
+        let prepared = record.intent();
+        record.record().unwrap();
+        let temporary = path.join(format!(
+            ".lngnb-key-passphrase-{}",
+            data_encoding::HEXLOWER.encode(&start.operation_id)
+        ));
+        let new = stdfs::read(&temporary).unwrap();
+        let state = stdfs::read(path.join(initial_state::STATE)).unwrap();
+        let guard = stdfs::read(path.join(recovery_hold::GUARD)).unwrap();
+        assert!(
+            f.cleanup_passphrase(&resume, &start, &prepared, NEW_PASS, &mut |_| Ok(()))
+                .is_err()
+        );
+        assert_eq!(stdfs::read(&normal).unwrap(), old);
+        f.exchange_passphrase(&resume, &start, &prepared, NEW_PASS, &mut |_| Ok(()))
+            .unwrap();
+        assert!(
+            f.cleanup_passphrase(
+                &resume,
+                &start,
+                &prepared,
+                "wrong public passphrase",
+                &mut |_| Ok(())
+            )
+            .is_err()
+        );
+        assert_eq!(stdfs::read(&temporary).unwrap(), old);
+        if let Some(stage) = kill {
+            f.source.take();
+            f.backups.clear();
+            let mut child = child_command(
+                &f,
+                "keyfile::files::tests::resume_record_tests::recovery_tests::passphrase_key_exchange_retries_without_reversing_and_retains_both_keys",
+            )
+            .env("LNGNB_PUBLIC_RESUME_OLD", data_encoding::HEXLOWER.encode(&f.old))
+            .env("LNGNB_PUBLIC_RESUME_POINT", stage)
+            .env("LNGNB_PUBLIC_CLEANUP_OLD_CTIME", format!("{}:{}", f.expected.current.ctime_seconds, f.expected.current.ctime_nanoseconds))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn().unwrap();
+            let output = std::io::BufReader::new(child.stdout.take().unwrap());
+            let ready = output.lines().take(10).any(|line| line.unwrap() == "READY");
+            if ready {
+                child.kill().unwrap();
+            }
+            let result = child.wait_with_output().unwrap();
+            assert!(
+                ready && !result.status.success(),
+                "{stage}: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        } else {
+            let first = f.cleanup_passphrase(&resume, &start, &prepared, NEW_PASS, &mut |stage| {
+                if point == Some(stage) {
+                    Err(KeyFileError::Io)
+                } else {
+                    Ok(())
+                }
+            });
+            match point {
+                None => assert_eq!(
+                    first.unwrap(),
+                    KeyPassphraseCleanup::RemovedRetainedOldCiphertext
+                ),
+                Some(S::BeforeOldKeyUnlink) => assert_eq!(first.err(), Some(KeyFileError::Io)),
+                _ => assert_eq!(first.err(), Some(KeyFileError::CleanupUncertain)),
+            }
+        }
+        f.reopen();
+        let second = f
+            .cleanup_passphrase(&resume, &start, &prepared, NEW_PASS, &mut |_| Ok(()))
+            .unwrap();
+        assert_eq!(
+            second,
+            if point == Some(S::BeforeOldKeyUnlink) {
+                KeyPassphraseCleanup::RemovedRetainedOldCiphertext
+            } else {
+                KeyPassphraseCleanup::ConfirmedOldCiphertextAbsent
+            }
+        );
+        assert_eq!(stdfs::read(&normal).unwrap(), new);
+        assert_eq!(stdfs::read(path.join(initial_state::STATE)).unwrap(), state);
+        assert_eq!(stdfs::read(path.join(recovery_hold::GUARD)).unwrap(), guard);
+        assert!(!temporary.exists());
+
+        // 再確認のfsync境界で同じbytesの別inodeが再出現しても削除しない。
+        assert!(
+            f.cleanup_passphrase(&resume, &start, &prepared, NEW_PASS, &mut |stage| {
+                if stage == S::Qualified {
+                    stdfs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .mode(0o600)
+                        .open(&temporary)
+                        .unwrap()
+                        .write_all(&old)
+                        .unwrap();
+                }
+                Ok(())
+            })
+            .is_err()
+        );
+        assert!(
+            f.cleanup_passphrase(&resume, &start, &prepared, NEW_PASS, &mut |_| Ok(()))
+                .is_err()
+        );
         assert_eq!(stdfs::read(&temporary).unwrap(), old);
     }
 }

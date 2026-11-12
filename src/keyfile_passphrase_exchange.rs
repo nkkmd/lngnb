@@ -1,4 +1,5 @@
 //! 固定準備記録に束縛した二つの暗号文の交換と、その配置の明示確認。
+use super::super::super::completion::removal::RemovedTarget;
 use super::*;
 
 /// 今回保存を確認した交換結果。旧暗号文とguardは保持する。
@@ -6,6 +7,24 @@ use super::*;
 pub enum KeyPassphraseExchange {
     Exchanged,
     ConfirmedExchanged,
+}
+
+/// 今回確認した旧暗号文の整理結果。guardと準備履歴を保持する。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyPassphraseCleanup {
+    RemovedRetainedOldCiphertext,
+    ConfirmedOldCiphertextAbsent,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Action {
+    Exchange,
+    Cleanup,
+}
+
+enum Outcome {
+    Exchange(KeyPassphraseExchange),
+    Cleanup(KeyPassphraseCleanup),
 }
 
 impl KeyDirectory {
@@ -57,6 +76,111 @@ impl KeyDirectory {
         prepared: &KeyPassphrasePreparedIntent,
         hook: &mut impl FnMut(ResumeStage) -> Result<()>,
     ) -> Result<KeyPassphraseExchange> {
+        match self.apply_passphrase_layout(
+            current_name,
+            old_passphrase,
+            new_passphrase,
+            backups,
+            current_backup,
+            backup_name,
+            proofs,
+            expected,
+            resume,
+            start,
+            prepared,
+            Action::Exchange,
+            hook,
+        )? {
+            Outcome::Exchange(result) => Ok(result),
+            Outcome::Cleanup(_) => invalid(),
+        }
+    }
+
+    /// 交換後の旧暗号文を整理するか、一時名の正確不在を明示確認する。
+    #[allow(clippy::too_many_arguments)]
+    pub fn cleanup_key_passphrase(
+        &mut self,
+        current_name: &str,
+        old_passphrase: &str,
+        new_passphrase: &str,
+        backups: &mut [KeyDirectory],
+        current_backup: usize,
+        backup_name: &str,
+        proofs: &[KeyResumePreservation<'_>],
+        expected: &KeyResumeExpected,
+        resume: &KeyResumeIntent,
+        start: &KeyPassphraseStartIntent,
+        prepared: &KeyPassphrasePreparedIntent,
+    ) -> Result<KeyPassphraseCleanup> {
+        self.cleanup_key_passphrase_with(
+            current_name,
+            old_passphrase,
+            new_passphrase,
+            backups,
+            current_backup,
+            backup_name,
+            proofs,
+            expected,
+            resume,
+            start,
+            prepared,
+            &mut |_| Ok(()),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in super::super::super::super) fn cleanup_key_passphrase_with(
+        &mut self,
+        current_name: &str,
+        old_passphrase: &str,
+        new_passphrase: &str,
+        backups: &mut [KeyDirectory],
+        current_backup: usize,
+        backup_name: &str,
+        proofs: &[KeyResumePreservation<'_>],
+        expected: &KeyResumeExpected,
+        resume: &KeyResumeIntent,
+        start: &KeyPassphraseStartIntent,
+        prepared: &KeyPassphrasePreparedIntent,
+        hook: &mut impl FnMut(ResumeStage) -> Result<()>,
+    ) -> Result<KeyPassphraseCleanup> {
+        match self.apply_passphrase_layout(
+            current_name,
+            old_passphrase,
+            new_passphrase,
+            backups,
+            current_backup,
+            backup_name,
+            proofs,
+            expected,
+            resume,
+            start,
+            prepared,
+            Action::Cleanup,
+            hook,
+        )? {
+            Outcome::Cleanup(result) => Ok(result),
+            Outcome::Exchange(_) => invalid(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_passphrase_layout(
+        &mut self,
+        current_name: &str,
+        old_passphrase: &str,
+        new_passphrase: &str,
+        backups: &mut [KeyDirectory],
+        current_backup: usize,
+        backup_name: &str,
+        proofs: &[KeyResumePreservation<'_>],
+        expected: &KeyResumeExpected,
+        resume: &KeyResumeIntent,
+        start: &KeyPassphraseStartIntent,
+        prepared: &KeyPassphrasePreparedIntent,
+        action: Action,
+        hook: &mut impl FnMut(ResumeStage) -> Result<()>,
+    ) -> Result<Outcome> {
         name(current_name)?;
         check_start_intent(resume, start)?;
         check_prepared_intent(start, prepared)?;
@@ -105,12 +229,26 @@ impl KeyDirectory {
             .ok_or(KeyFileError::RecoveryStateInvalid)?;
         let new_identity = field(preparation, "new_identity")?;
         let normal = HeldFile::open(self, current_name, MAX_KEYFILE_BYTES)?;
-        let temporary = HeldFile::open(self, &key_name, MAX_KEYFILE_BYTES)?;
+        let temporary = match HeldFile::open(self, &key_name, MAX_KEYFILE_BYTES) {
+            Ok(file) => Some(file),
+            Err(KeyFileError::Missing) if action == Action::Cleanup => {
+                absent(self, &key_name)?;
+                None
+            }
+            Err(error) => return Err(error),
+        };
         let before_exchange = KeyFileIdentity::from_metadata(&normal.metadata) == expected.current;
         let (new_name, new, moved_old) = if before_exchange {
-            (key_name.as_str(), temporary, None)
+            if action == Action::Cleanup {
+                return invalid();
+            }
+            (
+                key_name.as_str(),
+                temporary.ok_or(KeyFileError::Missing)?,
+                None,
+            )
         } else {
-            (current_name, normal, Some((key_name.as_str(), temporary)))
+            (current_name, normal, temporary)
         };
         let mut identity = KeyFileIdentity::from_metadata(&new.metadata).value();
         if !before_exchange {
@@ -127,7 +265,16 @@ impl KeyDirectory {
             return Err(KeyFileError::RecoveryChanged);
         }
         authenticate_staged(&new.bytes, event, new_passphrase)?;
-        let mut context = self.prepare_resume_snapshot_with_moved_key(
+        let absent_old = !before_exchange && moved_old.is_none();
+        let (binding, staged) = if absent_old {
+            (ResumeCurrent::Installed(new), None)
+        } else {
+            let binding = moved_old.map_or(ResumeCurrent::Original, |held| {
+                ResumeCurrent::Moved(&key_name, held)
+            });
+            (binding, Some((new_name.to_owned(), new)))
+        };
+        let mut context = self.prepare_resume_snapshot_with_current(
             current_name,
             old_passphrase,
             backups,
@@ -142,15 +289,21 @@ impl KeyDirectory {
                 allow_absent_guard: false,
                 expected_guard: Some(guard),
             },
-            moved_old,
+            binding,
         )?;
         if context.state.bytes != fixed.bytes
             || fingerprint(&context.state.metadata) != fingerprint(&fixed.metadata)
         {
             return Err(KeyFileError::RecoveryChanged);
         }
+        if absent_old {
+            context.qualify(None, false, hook, &mut || absent(context.source, &key_name))?;
+            return Ok(Outcome::Cleanup(
+                KeyPassphraseCleanup::ConfirmedOldCiphertextAbsent,
+            ));
+        }
         // 一覧で許す予約名は交換の前後とも開始ID由来の一名だけ。
-        let mut staged = (new_name.to_owned(), new);
+        let mut staged = staged.ok_or(KeyFileError::RecoveryStateInvalid)?;
         let check = |context: &PreparedKeyResume<'_>, staged: &(String, HeldFile)| -> Result<()> {
             context.check(Some(&key_name))?;
             context
@@ -163,8 +316,41 @@ impl KeyDirectory {
         context.qualify(Some(&key_name), false, hook, &mut || {
             check(&context, &staged)
         })?;
+        if action == Action::Cleanup {
+            hook(ResumeStage::BeforeOldKeyUnlink)?;
+            check(&context, &staged)?;
+            context.current.check(context.source, &key_name, true)?;
+            return (|| -> Result<_> {
+                os(fs::unlinkat(
+                    &context.source.dir,
+                    key_name.as_str(),
+                    AtFlags::empty(),
+                ))?;
+                let old = std::mem::replace(&mut context.current, staged.1);
+                context.current_name = staged.0;
+                let removed = RemovedTarget::capture(old)?;
+                hook(ResumeStage::OldKeyUnlinked)?;
+                hook(ResumeStage::BeforeOldKeyDirectorySync)?;
+                let check = || -> Result<()> {
+                    context.check(None)?;
+                    context
+                        .state
+                        .check(context.source, initial_state::STATE, true)?;
+                    removed.check()?;
+                    absent(context.source, &key_name)
+                };
+                check()?;
+                io(context.source.dir.sync_all())?;
+                hook(ResumeStage::OldKeyDirectorySynced)?;
+                check()?;
+                Ok(Outcome::Cleanup(
+                    KeyPassphraseCleanup::RemovedRetainedOldCiphertext,
+                ))
+            })()
+            .map_err(|_| KeyFileError::CleanupUncertain);
+        }
         if !before_exchange {
-            return Ok(KeyPassphraseExchange::ConfirmedExchanged);
+            return Ok(Outcome::Exchange(KeyPassphraseExchange::ConfirmedExchanged));
         }
         hook(ResumeStage::BeforeKeyExchange)?;
         check(&context, &staged)?;
@@ -184,7 +370,7 @@ impl KeyDirectory {
             io(context.source.dir.sync_all())?;
             hook(ResumeStage::KeyExchangeDirectorySynced)?;
             check(&context, &staged)?;
-            Ok(KeyPassphraseExchange::Exchanged)
+            Ok(Outcome::Exchange(KeyPassphraseExchange::Exchanged))
         })()
         .map_err(|_| KeyFileError::CommitUncertain)
     }

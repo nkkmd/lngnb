@@ -566,4 +566,4 @@ fn check_prepared_intent(
 
 #[path = "keyfile_passphrase_exchange.rs"]
 mod exchange;
-pub use exchange::KeyPassphraseExchange;
+pub use exchange::{KeyPassphraseCleanup, KeyPassphraseExchange};
