@@ -55,6 +55,9 @@ pub(in super::super) enum ResumeStage {
     StagedKeyWritten,
     StagedKeyFileSynced,
     StagedKeyDirectorySynced,
+    BeforeKeyExchange,
+    KeyExchanged,
+    KeyExchangeDirectorySynced,
     StartGuardCreated,
     StartGuardSynced,
     BeforeCreate,
@@ -490,6 +493,32 @@ impl KeyDirectory {
         expected: &KeyResumeExpected,
         snapshot: ResumeSnapshot<'_>,
     ) -> Result<PreparedKeyResume<'a>> {
+        self.prepare_resume_snapshot_with_moved_key(
+            current_name,
+            passphrase,
+            backups,
+            current_backup,
+            backup_name,
+            proofs,
+            expected,
+            snapshot,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_resume_snapshot_with_moved_key<'a>(
+        &'a mut self,
+        current_name: &str,
+        passphrase: &str,
+        backups: &'a mut [KeyDirectory],
+        current_backup: usize,
+        backup_name: &str,
+        proofs: &[KeyResumePreservation<'_>],
+        expected: &KeyResumeExpected,
+        snapshot: ResumeSnapshot<'_>,
+        moved_key: Option<(&str, HeldFile)>,
+    ) -> Result<PreparedKeyResume<'a>> {
         name(current_name)?;
         name(backup_name)?;
         self.secure()?;
@@ -610,10 +639,20 @@ impl KeyDirectory {
         if used.iter().any(|v| !v) {
             return invalid();
         }
-        let current = HeldFile::open(self, current_name, MAX_KEYFILE_BYTES)?;
+        let (current_path, current, current_identity) = if let Some((path, held)) = moved_key {
+            held.check(self, path, true)?;
+            let mut identity = KeyFileIdentity::from_metadata(&held.metadata);
+            identity.ctime_seconds = expected.current.ctime_seconds;
+            identity.ctime_nanoseconds = expected.current.ctime_nanoseconds;
+            (path, held, identity)
+        } else {
+            let held = HeldFile::open(self, current_name, MAX_KEYFILE_BYTES)?;
+            let identity = KeyFileIdentity::from_metadata(&held.metadata);
+            (current_name, held, identity)
+        };
         let current_preserved =
             HeldFile::open(&backups[current_backup], backup_name, MAX_KEYFILE_BYTES)?;
-        if KeyFileIdentity::from_metadata(&current.metadata) != expected.current
+        if current_identity != expected.current
             || KeyFileIdentity::from_metadata(&current_preserved.metadata) != expected.preserved
             || <[u8; 32]>::from(Sha256::digest(&current.bytes)) != expected.ciphertext_sha256
         {
@@ -760,7 +799,7 @@ impl KeyDirectory {
             backups,
             source_identity,
             backup_identities,
-            current_name: current_name.into(),
+            current_name: current_path.into(),
             current,
             preservations,
             absent_names,

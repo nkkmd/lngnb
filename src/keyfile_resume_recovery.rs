@@ -61,7 +61,7 @@ pub(super) fn verify_event_prefix(
     Ok(old_bytes)
 }
 
-fn moved_metadata(file: &HeldFile) -> Result<Metadata> {
+pub(super) fn moved_metadata(file: &HeldFile) -> Result<Metadata> {
     let after = io(file.file.metadata())?;
     let mut actual = KeyFileIdentity::from_metadata(&after);
     let original = KeyFileIdentity::from_metadata(&file.metadata);
