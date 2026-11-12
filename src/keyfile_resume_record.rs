@@ -672,7 +672,13 @@ impl KeyDirectory {
                 (current_name, held, true)
             }
         };
-        if !installed {
+        if installed {
+            if <[u8; 32]>::from(Sha256::digest(&current_preserved.bytes))
+                != expected.ciphertext_sha256
+            {
+                return Err(KeyFileError::RecoveryChanged);
+            }
+        } else {
             let mut identity = KeyFileIdentity::from_metadata(&current.metadata);
             if current_path != current_name {
                 identity.ctime_seconds = expected.current.ctime_seconds;
