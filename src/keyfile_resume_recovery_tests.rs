@@ -1511,6 +1511,8 @@ fn passphrase_key_exchange_retries_without_reversing_and_retains_both_keys() {
         let start_id = last_id(&snapshot);
         pop(&mut snapshot);
         let ready = decode(&snapshot);
+        context.expected.guard =
+            state_history::recorded_guard_identity(events(&snapshot).last().unwrap()).unwrap();
         let resume = KeyResumeIntent {
             before: context.expected.state,
             after: ready,
