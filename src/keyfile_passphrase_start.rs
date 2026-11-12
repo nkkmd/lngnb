@@ -135,7 +135,7 @@ impl<'a> release::PreparedFirstPassphraseChange<'a> {
     }
 }
 
-impl<'a> PreparedKeyPassphraseStart<'a> {
+impl PreparedKeyPassphraseStart<'_> {
     pub fn intent(&self) -> KeyPassphraseStartIntent {
         let KeyResumeIntent {
             before,
