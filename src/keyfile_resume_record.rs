@@ -51,6 +51,10 @@ pub(in super::super) enum ResumeStage {
     DirectoriesSynced,
     ControlsSynced,
     Qualified,
+    StagedKeyCreated,
+    StagedKeyWritten,
+    StagedKeyFileSynced,
+    StagedKeyDirectorySynced,
     StartGuardCreated,
     StartGuardSynced,
     BeforeCreate,
@@ -113,6 +117,14 @@ fn absent(source: &KeyDirectory, n: &str) -> Result<()> {
 }
 // 初回/整理APIの走査は緩めない。今回の指定一時名だけを別途許す。
 fn inventory(source: &KeyDirectory, temporary: Option<&str>) -> Result<usize> {
+    inventory_with_key(source, temporary, None)
+}
+
+fn inventory_with_key(
+    source: &KeyDirectory,
+    temporary: Option<&str>,
+    key_temporary: Option<&str>,
+) -> Result<usize> {
     source.secure()?;
     let before = fingerprint(&io(source.dir.metadata())?);
     let entries = io(std::fs::read_dir(format!(
@@ -135,6 +147,7 @@ fn inventory(source: &KeyDirectory, temporary: Option<&str>) -> Result<usize> {
             ]
             .contains(&n)
             && temporary.map(str::as_bytes) != Some(n)
+            && key_temporary.map(str::as_bytes) != Some(n)
         {
             return Err(KeyFileError::PendingRecovery);
         }
@@ -165,6 +178,7 @@ pub struct PreparedKeyResume<'a> {
     guard: Option<HeldFile>,
     state: HeldFile,
     new_bytes: Vec<u8>,
+    staged_key: Option<(String, HeldFile)>,
     intent: KeyResumeIntent,
 }
 impl PreparedKeyResume<'_> {
@@ -216,7 +230,13 @@ impl PreparedKeyResume<'_> {
         for n in &self.absent_names {
             absent(self.source, n)?;
         }
-        inventory(self.source, temporary)
+        let key_temporary = if let Some((name, held)) = &self.staged_key {
+            held.check(self.source, name, true)?;
+            Some(name.as_str())
+        } else {
+            None
+        };
+        inventory_with_key(self.source, temporary, key_temporary)
     }
     fn qualify(
         &self,
@@ -364,6 +384,13 @@ impl PreparedKeyResume<'_> {
             {
                 return invalid();
             }
+            let state = HeldFile {
+                metadata: io(file.metadata())?,
+                file,
+                bytes: self.new_bytes.clone(),
+            };
+            state.check(self.source, initial_state::STATE, true)?;
+            self.state = state;
             Ok(self.intent.after)
         })();
         result.map_err(|_| {
@@ -741,6 +768,7 @@ impl KeyDirectory {
             guard,
             state,
             new_bytes,
+            staged_key: None,
             intent,
         };
         Ok(prepared)

@@ -4,6 +4,7 @@ use super::recovery::{
 };
 use super::*;
 
+const PREPARED: &str = "key_passphrase_change_prepared";
 const START: &str = "key_passphrase_change_started";
 
 /// 開始追記の明示復旧に使う控え。ファイルの変更資格を保持しない。
@@ -20,6 +21,7 @@ pub struct PreparedKeyPassphraseStart<'a> {
     context: PreparedKeyResume<'a>,
     // 後続の準備段階は同じ暗号文を使用する必要がある。
     new_ciphertext: Vec<u8>,
+    recorded: bool,
 }
 
 impl<'a> release::PreparedFirstPassphraseChange<'a> {
@@ -128,6 +130,7 @@ impl<'a> release::PreparedFirstPassphraseChange<'a> {
         Ok(PreparedKeyPassphraseStart {
             context,
             new_ciphertext: self.new_ciphertext,
+            recorded: false,
         })
     }
 }
@@ -162,7 +165,182 @@ impl PreparedKeyPassphraseStart<'_> {
         &mut self,
         hook: &mut impl FnMut(ResumeStage) -> Result<()>,
     ) -> Result<KeyStateDiagnostic> {
-        self.context.record_snapshot_with(hook, false)
+        if self.recorded {
+            return invalid();
+        }
+        let diagnostic = self.context.record_snapshot_with(hook, false)?;
+        self.recorded = true;
+        Ok(diagnostic)
+    }
+}
+
+fn staged_name(started_operation_id: &[u8; 32]) -> String {
+    format!(
+        ".lngnb-key-passphrase-{}",
+        data_encoding::HEXLOWER.encode(started_operation_id)
+    )
+}
+
+fn authenticate_staged(bytes: &[u8], event: &Value, passphrase: &str) -> Result<()> {
+    if field(event, "new_ciphertext_length")? != &Value::Int(bytes.len() as i64)
+        || id(field(event, "new_ciphertext_sha256")?)? != <[u8; 32]>::from(Sha256::digest(bytes))
+    {
+        return invalid();
+    }
+    if unlock(bytes, passphrase)?.public_key() != id(field(event, "public_key")?)? {
+        return Err(KeyFileError::UnexpectedPublicKey);
+    }
+    Ok(())
+}
+
+/// 準備追記の明示復旧に使う控え。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeyPassphrasePreparedIntent {
+    pub before: KeyStateDiagnostic,
+    pub after: KeyStateDiagnostic,
+    pub operation_id: [u8; 32],
+}
+
+/// 新暗号文の保存を確認し、追記前の控えを取得できる状態。
+pub struct PreparedKeyPassphraseRecord<'a>(PreparedKeyResume<'a>);
+
+impl PreparedKeyPassphraseRecord<'_> {
+    pub fn intent(&self) -> KeyPassphrasePreparedIntent {
+        let intent = self.0.intent;
+        KeyPassphrasePreparedIntent {
+            before: intent.before,
+            after: intent.after,
+            operation_id: intent.operation_id,
+        }
+    }
+
+    pub fn record(self) -> Result<KeyStateDiagnostic> {
+        self.record_with(&mut |_| Ok(()))
+    }
+
+    pub(in super::super::super) fn record_with(
+        mut self,
+        hook: &mut impl FnMut(ResumeStage) -> Result<()>,
+    ) -> Result<KeyStateDiagnostic> {
+        self.0.record_snapshot_with(hook, false)
+    }
+}
+
+impl<'a> PreparedKeyPassphraseStart<'a> {
+    /// 開始追記に成功した同じ排他の下で新暗号文を一時保存する。
+    pub fn prepare_ciphertext(
+        self,
+        new_passphrase: &str,
+    ) -> Result<PreparedKeyPassphraseRecord<'a>> {
+        self.prepare_ciphertext_with(new_passphrase, &mut |_| Ok(()))
+    }
+
+    pub(in super::super::super) fn prepare_ciphertext_with(
+        self,
+        new_passphrase: &str,
+        hook: &mut impl FnMut(ResumeStage) -> Result<()>,
+    ) -> Result<PreparedKeyPassphraseRecord<'a>> {
+        if !self.recorded {
+            return invalid();
+        }
+        let mut context = self.context;
+        let before = context.intent.after;
+        let marker = source_marker(context.source, &context.intent)?;
+        let name = staged_name(&context.intent.operation_id);
+        let mut snapshot =
+            cbor::decode(&context.new_bytes).map_err(|_| KeyFileError::RecoveryStateInvalid)?;
+        authenticate_staged(
+            &self.new_ciphertext,
+            array(field(&snapshot, "events")?)?
+                .last()
+                .ok_or(KeyFileError::RecoveryStateInvalid)?,
+            new_passphrase,
+        )?;
+        let mut operation = [0; 32];
+        crate::keyfile::random(&mut operation)?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| KeyFileError::RecoveryStateInvalid)?
+            .as_secs();
+        let now = i64::try_from(now).map_err(|_| KeyFileError::RecoveryStateInvalid)?;
+        context
+            .state
+            .check(context.source, initial_state::STATE, true)?;
+        if context.check(None)? > SCAN_LIMIT - 2 {
+            return Err(KeyFileError::ScanLimit);
+        }
+        absent(context.source, &name)?;
+        let result = (|| -> Result<_> {
+            let mut file = File::from(os(fs::openat(
+                &context.source.dir,
+                name.as_str(),
+                OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::RUSR | Mode::WUSR,
+            ))?);
+            hook(ResumeStage::StagedKeyCreated)?;
+            os(fs::fchmod(&file, Mode::RUSR | Mode::WUSR))?;
+            io(file.write_all(&self.new_ciphertext))?;
+            hook(ResumeStage::StagedKeyWritten)?;
+            let held = HeldFile {
+                metadata: io(file.metadata())?,
+                file,
+                bytes: self.new_ciphertext,
+            };
+            held.check(context.source, &name, true)?;
+            held.sync()?;
+            hook(ResumeStage::StagedKeyFileSynced)?;
+            held.check(context.source, &name, true)?;
+            context.staged_key = Some((name, held));
+            context.check(None)?;
+            context
+                .state
+                .check(context.source, initial_state::STATE, true)?;
+            io(context.source.dir.sync_all())?;
+            hook(ResumeStage::StagedKeyDirectorySynced)?;
+            if context.check(None)? >= SCAN_LIMIT {
+                return Err(KeyFileError::ScanLimit);
+            }
+            context
+                .state
+                .check(context.source, initial_state::STATE, true)?;
+            let (_, held) = context
+                .staged_key
+                .as_ref()
+                .ok_or(KeyFileError::RecoveryStateInvalid)?;
+            let Value::Map(fields) = &mut snapshot else {
+                return invalid();
+            };
+            let Some((_, Value::Array(events))) = fields.iter_mut().find(|(k, _)| k == "events")
+            else {
+                return invalid();
+            };
+            events.push(map(vec![
+                ("sequence", Value::Int((before.generation + 1) as i64)),
+                ("operation_id", bytes(operation)),
+                ("kind", text(PREPARED)),
+                (
+                    "actor_uid",
+                    bytes(context.source_identity.uid.to_be_bytes()),
+                ),
+                ("recorded_unix_seconds", Value::Int(now)),
+                ("rules", text("lngnb-key-operations-1")),
+                ("previous_snapshot_sha256", bytes(before.snapshot_hash)),
+                ("started_operation_id", bytes(context.intent.operation_id)),
+                (
+                    "new_identity",
+                    KeyFileIdentity::from_metadata(&held.metadata).value(),
+                ),
+            ]));
+            context.new_bytes = encoded(&snapshot)?;
+            let after = decode_snapshot(&context.new_bytes, &marker, &context.intent)?;
+            context.intent = KeyResumeIntent {
+                before,
+                after,
+                operation_id: operation,
+            };
+            Ok(PreparedKeyPassphraseRecord(context))
+        })();
+        result.map_err(|_| KeyFileError::RecoveryStateUncertain)
     }
 }
 
@@ -181,6 +359,74 @@ impl KeyDirectory {
         resume: &KeyResumeIntent,
         start: &KeyPassphraseStartIntent,
     ) -> Result<KeyStateDiagnostic> {
+        self.recover_passphrase_snapshot(
+            current_name,
+            old_passphrase,
+            backups,
+            current_backup,
+            backup_name,
+            proofs,
+            expected,
+            resume,
+            start,
+            None,
+        )
+    }
+
+    /// 準備追記を完全な既存snapshotと記録済み新一時鍵から復旧する。
+    #[allow(clippy::too_many_arguments)]
+    pub fn recover_key_passphrase_prepared(
+        &mut self,
+        current_name: &str,
+        old_passphrase: &str,
+        new_passphrase: &str,
+        backups: &mut [KeyDirectory],
+        current_backup: usize,
+        backup_name: &str,
+        proofs: &[KeyResumePreservation<'_>],
+        expected: &KeyResumeExpected,
+        resume: &KeyResumeIntent,
+        start: &KeyPassphraseStartIntent,
+        prepared: &KeyPassphrasePreparedIntent,
+    ) -> Result<KeyStateDiagnostic> {
+        if prepared.before != start.after
+            || prepared.after.initial != prepared.before.initial
+            || prepared.before.generation.checked_add(1) != Some(prepared.after.generation)
+            || prepared.after.state
+                != (KeyHistoryState::PassphraseChangePrepared {
+                    prepared_operation_id: prepared.operation_id,
+                })
+        {
+            return invalid();
+        }
+        self.recover_passphrase_snapshot(
+            current_name,
+            old_passphrase,
+            backups,
+            current_backup,
+            backup_name,
+            proofs,
+            expected,
+            resume,
+            start,
+            Some((prepared, new_passphrase)),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn recover_passphrase_snapshot(
+        &mut self,
+        current_name: &str,
+        old_passphrase: &str,
+        backups: &mut [KeyDirectory],
+        current_backup: usize,
+        backup_name: &str,
+        proofs: &[KeyResumePreservation<'_>],
+        expected: &KeyResumeExpected,
+        resume: &KeyResumeIntent,
+        start: &KeyPassphraseStartIntent,
+        prepared: Option<(&KeyPassphrasePreparedIntent, &str)>,
+    ) -> Result<KeyStateDiagnostic> {
         if start.before != resume.after
             || start.after.initial != start.before.initial
             || start.before.generation.checked_add(1) != Some(start.after.generation)
@@ -191,16 +437,22 @@ impl KeyDirectory {
         {
             return invalid();
         }
-        let intent = KeyResumeIntent {
+        let start_intent = KeyResumeIntent {
             before: start.before,
             after: start.after,
             operation_id: start.operation_id,
         };
+        let intent = prepared.map_or(start_intent, |(prepared, _)| KeyResumeIntent {
+            before: prepared.before,
+            after: prepared.after,
+            operation_id: prepared.operation_id,
+        });
         let temp = format!(
             ".lngnb-key-state-update-{}",
-            data_encoding::HEXLOWER.encode(&start.operation_id)
+            data_encoding::HEXLOWER.encode(&intent.operation_id)
         );
-        inventory(self, Some(&temp))?;
+        let key_name = prepared.map(|_| staged_name(&start.operation_id));
+        inventory_with_key(self, Some(&temp), key_name.as_deref())?;
         let fixed = HeldFile::open(self, initial_state::STATE, initial_state::STATE_LIMIT)?;
         let temporary = match HeldFile::open(self, &temp, initial_state::STATE_LIMIT) {
             Ok(file) => Some(file),
@@ -210,37 +462,62 @@ impl KeyDirectory {
         let marker = source_marker(self, resume)?;
         let decode = |file: &HeldFile| decode_snapshot(&file.bytes, &marker, resume);
         let fixed_diagnostic = decode(&fixed)?;
-        let needs_exchange = fixed_diagnostic == start.before;
-        let started = if needs_exchange {
-            let candidate = temporary
-                .as_ref()
-                .ok_or(KeyFileError::RecoveryStateInvalid)?;
-            if decode(candidate)? != start.after {
-                return invalid();
-            }
-            candidate
+        let needs_exchange = fixed_diagnostic == intent.before;
+        let (new, old) = if needs_exchange {
+            (
+                temporary
+                    .as_ref()
+                    .ok_or(KeyFileError::RecoveryStateInvalid)?,
+                Some(&fixed),
+            )
         } else {
-            if fixed_diagnostic != start.after {
-                return invalid();
-            }
-            &fixed
+            (&fixed, temporary.as_ref())
         };
-        let ready = verify_event_prefix(&started.bytes, &marker, &intent, START)?;
-        let old_ready = if needs_exchange {
-            Some(&fixed)
-        } else {
-            temporary.as_ref()
-        };
-        if old_ready.is_some_and(|held| held.bytes != ready) {
+        if decode(new)? != intent.after {
             return invalid();
         }
+        let prefix = verify_event_prefix(
+            &new.bytes,
+            &marker,
+            &intent,
+            if prepared.is_some() { PREPARED } else { START },
+        )?;
+        if old.is_some_and(|held| held.bytes != prefix) {
+            return invalid();
+        }
+        let (started, ready) = if prepared.is_some() {
+            let ready = verify_event_prefix(&prefix, &marker, &start_intent, START)?;
+            (prefix, ready)
+        } else {
+            (new.bytes.clone(), prefix)
+        };
         let old_bytes = verify_prefix(&ready, &marker, resume)?;
-        let value = cbor::decode(&started.bytes).map_err(|_| KeyFileError::RecoveryStateInvalid)?;
+        let value = cbor::decode(&started).map_err(|_| KeyFileError::RecoveryStateInvalid)?;
         let event = array(field(&value, "events")?)?
             .last()
             .ok_or(KeyFileError::RecoveryStateInvalid)?;
         let guard = state_history::recorded_guard_identity(event)?;
-        let context = self.prepare_resume_snapshot(
+        let staged_key = if let (Some(key_name), Some((_, passphrase))) = (key_name, prepared) {
+            let value = cbor::decode(&new.bytes).map_err(|_| KeyFileError::RecoveryStateInvalid)?;
+            let preparation = array(field(&value, "events")?)?
+                .last()
+                .ok_or(KeyFileError::RecoveryStateInvalid)?;
+            let held = HeldFile::open(self, &key_name, MAX_KEYFILE_BYTES)?;
+            if !equal(
+                field(preparation, "new_identity")?,
+                &KeyFileIdentity::from_metadata(&held.metadata).value(),
+            )? {
+                return Err(KeyFileError::RecoveryChanged);
+            }
+            authenticate_staged(&held.bytes, event, passphrase)?;
+            held.check(self, &key_name, true)?;
+            held.sync()?;
+            held.check(self, &key_name, true)?;
+            Some((key_name, held))
+        } else {
+            None
+        };
+        let mut context = self.prepare_resume_snapshot(
             current_name,
             old_passphrase,
             backups,
@@ -261,6 +538,7 @@ impl KeyDirectory {
         {
             return Err(KeyFileError::RecoveryChanged);
         }
+        context.staged_key = staged_key;
         recover_snapshot(
             context,
             temporary.as_ref(),

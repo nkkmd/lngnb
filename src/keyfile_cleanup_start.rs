@@ -10,7 +10,10 @@ use crate::cbor::{self, Value};
 pub use completion::{
     KeyCleanupCompletion, KeyCleanupDisposition, PreparedAbsentCleanup, PreparedResidueRemoval,
 };
-pub use resume_record::passphrase_start::{KeyPassphraseStartIntent, PreparedKeyPassphraseStart};
+pub use resume_record::passphrase_start::{
+    KeyPassphrasePreparedIntent, KeyPassphraseStartIntent, PreparedKeyPassphraseRecord,
+    PreparedKeyPassphraseStart,
+};
 pub use resume_record::release::{KeyResumeRelease, PreparedFirstPassphraseChange};
 pub use resume_record::{
     KeyResumeExpected, KeyResumeIntent, KeyResumePreservation, PreparedKeyResume,
