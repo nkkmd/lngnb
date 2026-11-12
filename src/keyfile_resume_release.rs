@@ -60,7 +60,7 @@ impl KeyDirectory {
         intent: &KeyResumeIntent,
         hook: &mut impl FnMut(ReleaseStage) -> Result<()>,
     ) -> Result<KeyResumeRelease> {
-        let mut context = self.open_fixed_resume(
+        let context = self.open_fixed_resume(
             current_name,
             passphrase,
             backups,
@@ -70,45 +70,7 @@ impl KeyDirectory {
             expected,
             intent,
         )?;
-        context.qualify_release(hook)?;
-        let removed = if let Some(guard) = context.guard.take() {
-            hook(ReleaseStage::BeforeUnlink)?;
-            context.check_release_files()?;
-            check_guard_for_unlink(context.source, &guard)?;
-            let removed = (|| {
-                os(fs::unlinkat(
-                    &context.source.dir,
-                    recovery_hold::GUARD,
-                    AtFlags::empty(),
-                ))?;
-                let removed = RemovedTarget::capture(guard)?;
-                hook(ReleaseStage::Unlinked)?;
-                Ok(removed)
-            })();
-            Some(removed.map_err(|_: KeyFileError| KeyFileError::RecoveryGuardReleaseUncertain)?)
-        } else {
-            None
-        };
-        let check = || -> Result<()> {
-            context.check_release_files()?;
-            if let Some(removed) = &removed {
-                removed.check()?;
-            }
-            absent(context.source, recovery_hold::GUARD)
-        };
-        let mut confirm = || -> Result<()> {
-            hook(ReleaseStage::BeforeDirectorySync)?;
-            check()?;
-            io(context.source.dir.sync_all())?;
-            hook(ReleaseStage::DirectorySynced)?;
-            check()
-        };
-        confirm().map_err(|_| KeyFileError::RecoveryGuardReleaseUncertain)?;
-        Ok(if removed.is_some() {
-            KeyResumeRelease::RemovedRecordedGuard(intent.after)
-        } else {
-            KeyResumeRelease::ConfirmedGuardAbsent(intent.after)
-        })
+        context.release_recorded_guard(intent.after, hook)
     }
     #[allow(clippy::too_many_arguments)]
     fn open_fixed_resume<'a>(
@@ -239,6 +201,52 @@ impl PreparedFirstPassphraseChange<'_> {
 }
 
 impl PreparedKeyResume<'_> {
+    pub(super) fn release_recorded_guard(
+        mut self,
+        diagnostic: KeyStateDiagnostic,
+        hook: &mut impl FnMut(ReleaseStage) -> Result<()>,
+    ) -> Result<KeyResumeRelease> {
+        self.qualify_release(hook)?;
+        let removed = if let Some(guard) = self.guard.take() {
+            hook(ReleaseStage::BeforeUnlink)?;
+            self.check_release_files()?;
+            check_guard_for_unlink(self.source, &guard)?;
+            let removed = (|| {
+                os(fs::unlinkat(
+                    &self.source.dir,
+                    recovery_hold::GUARD,
+                    AtFlags::empty(),
+                ))?;
+                let removed = RemovedTarget::capture(guard)?;
+                hook(ReleaseStage::Unlinked)?;
+                Ok(removed)
+            })();
+            Some(removed.map_err(|_: KeyFileError| KeyFileError::RecoveryGuardReleaseUncertain)?)
+        } else {
+            None
+        };
+        let check = || -> Result<()> {
+            self.check_release_files()?;
+            if let Some(removed) = &removed {
+                removed.check()?;
+            }
+            absent(self.source, recovery_hold::GUARD)
+        };
+        let mut confirm = || -> Result<()> {
+            hook(ReleaseStage::BeforeDirectorySync)?;
+            check()?;
+            io(self.source.dir.sync_all())?;
+            hook(ReleaseStage::DirectorySynced)?;
+            check()
+        };
+        confirm().map_err(|_| KeyFileError::RecoveryGuardReleaseUncertain)?;
+        Ok(if removed.is_some() {
+            KeyResumeRelease::RemovedRecordedGuard(diagnostic)
+        } else {
+            KeyResumeRelease::ConfirmedGuardAbsent(diagnostic)
+        })
+    }
+
     fn check_release_files(&self) -> Result<()> {
         self.check_files(None)?;
         self.state.check(self.source, initial_state::STATE, true)

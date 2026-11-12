@@ -1504,11 +1504,23 @@ fn passphrase_key_exchange_retries_without_reversing_and_retains_both_keys() {
         };
         let mut snapshot =
             cbor::decode(&stdfs::read(path.join(initial_state::STATE)).unwrap()).unwrap();
+        let release = std::env::var_os("LNGNB_PUBLIC_RELEASE_PASSPHRASE").is_some();
+        let completed = release.then(|| {
+            let after = decode(&snapshot);
+            let operation_id = last_id(&snapshot);
+            pop(&mut snapshot);
+            KeyPassphraseCompletedIntent {
+                before: decode(&snapshot),
+                after,
+                operation_id,
+            }
+        });
         let prepared_after = decode(&snapshot);
         let prepared_id = last_id(&snapshot);
         pop(&mut snapshot);
         let started_after = decode(&snapshot);
         let start_id = last_id(&snapshot);
+        let started_event = events(&snapshot).last().unwrap().clone();
         pop(&mut snapshot);
         let ready = decode(&snapshot);
         context.expected.guard =
@@ -1552,7 +1564,61 @@ fn passphrase_key_exchange_retries_without_reversing_and_retains_both_keys() {
             }
             Ok(())
         };
-        if let Ok(ctime) = std::env::var("LNGNB_PUBLIC_CLEANUP_OLD_CTIME") {
+        if let Some(completed) = completed {
+            let identity_value = crate::keyfile::get(&started_event, "old_identity").unwrap();
+            let value = |key| crate::keyfile::get(identity_value, key).unwrap();
+            let raw = |key| match value(key) {
+                Value::Bytes(b) => b.as_slice(),
+                _ => panic!("fixture identity"),
+            };
+            let integer = |key| match value(key) {
+                Value::Int(n) => *n,
+                _ => panic!("fixture identity"),
+            };
+            context.expected.current = KeyFileIdentity {
+                dev: u64::from_be_bytes(raw("dev").try_into().unwrap()),
+                ino: u64::from_be_bytes(raw("ino").try_into().unwrap()),
+                length: u64::from_be_bytes(raw("length").try_into().unwrap()),
+                nlink: u64::from_be_bytes(raw("nlink").try_into().unwrap()),
+                uid: u32::from_be_bytes(raw("uid").try_into().unwrap()),
+                mode: u32::from_be_bytes(raw("mode").try_into().unwrap()),
+                mtime_seconds: integer("mtime_seconds"),
+                mtime_nanoseconds: integer("mtime_nanoseconds"),
+                ctime_seconds: integer("ctime_seconds"),
+                ctime_nanoseconds: integer("ctime_nanoseconds"),
+            };
+            let paths: Vec<PathBuf> =
+                serde_json::from_str(&std::env::var("LNGNB_PUBLIC_RESUME_BACKUPS").unwrap())
+                    .unwrap();
+            context.expected.ciphertext_sha256 =
+                Sha256::digest(stdfs::read(paths[0].join("saved")).unwrap()).into();
+            assert_eq!(
+                context
+                    .source
+                    .recover_key_passphrase_release_with(
+                        "publisher",
+                        &context.pass,
+                        NEW_PASS,
+                        &mut context.backups,
+                        0,
+                        "saved",
+                        &proofs,
+                        &context.expected,
+                        &resume,
+                        &start,
+                        &prepared,
+                        &completed,
+                        &mut |stage| {
+                            if format!("{stage:?}") == point {
+                                pause();
+                            }
+                            Ok(())
+                        },
+                    )
+                    .unwrap(),
+                KeyResumeRelease::RemovedRecordedGuard(completed.after)
+            );
+        } else if let Ok(ctime) = std::env::var("LNGNB_PUBLIC_CLEANUP_OLD_CTIME") {
             let (seconds, nanoseconds) = ctime.split_once(':').unwrap();
             let temporary = path.join(format!(
                 ".lngnb-key-passphrase-{}",
@@ -2201,5 +2267,176 @@ fn passphrase_completion_preserves_disposition_and_recovers_complete_candidates(
         }
         assert_eq!(stdfs::read(normal).unwrap(), new);
         assert_eq!(stdfs::read(path.join(recovery_hold::GUARD)).unwrap(), guard);
+    }
+}
+
+#[test]
+fn passphrase_release_requires_fixed_completion_and_rechecks_guard_absence() {
+    const NEW_PASS: &str = "new public passphrase";
+    for (point, kill) in [
+        (None, None),
+        (Some(G::BeforeUnlink), None),
+        (Some(G::Unlinked), None),
+        (Some(G::BeforeDirectorySync), None),
+        (Some(G::DirectorySynced), None),
+        (Some(G::BeforeUnlink), Some("BeforeUnlink")),
+        (Some(G::Unlinked), Some("Unlinked")),
+        (Some(G::BeforeDirectorySync), Some("BeforeDirectorySync")),
+        (Some(G::DirectorySynced), Some("DirectorySynced")),
+        (None, Some("OutputFailed")),
+    ] {
+        let mut f = Fixture::new(true, 2);
+        let resume = f.interrupt(S::OldSnapshotRemoved);
+        f.release(&resume, &mut |_| Ok(())).unwrap();
+        let path = f.a.0.clone();
+        let mut begin = f
+            .prepare_passphrase_change(&resume, NEW_PASS)
+            .unwrap()
+            .prepare_start()
+            .unwrap();
+        let start = begin.intent();
+        begin.record().unwrap();
+        let record = begin.prepare_ciphertext(NEW_PASS).unwrap();
+        let prepared = record.intent();
+        record.record().unwrap();
+        f.exchange_passphrase(&resume, &start, &prepared, NEW_PASS, &mut |_| Ok(()))
+            .unwrap();
+        let completion = f
+            .prepare_passphrase_completion(&resume, &start, &prepared, NEW_PASS)
+            .unwrap();
+        let intent = completion.intent();
+        assert!(
+            completion
+                .record_with(&mut |stage| if stage == S::Exchanged {
+                    Err(KeyFileError::Io)
+                } else {
+                    Ok(())
+                })
+                .is_err()
+        );
+        let release = |f: &mut Fixture, hook: &mut dyn FnMut(G) -> Result<()>| {
+            let proofs: Vec<_> = f
+                .ids
+                .iter()
+                .enumerate()
+                .map(|(i, id)| KeyResumePreservation {
+                    completed_operation_id: *id,
+                    directory_index: f.indices[i],
+                    name: &f.names[i],
+                    passphrase: &f.pass,
+                })
+                .collect();
+            f.source
+                .as_mut()
+                .unwrap()
+                .recover_key_passphrase_release_with(
+                    "publisher",
+                    &f.pass,
+                    NEW_PASS,
+                    &mut f.backups,
+                    0,
+                    "saved",
+                    &proofs,
+                    &f.expected,
+                    &resume,
+                    &start,
+                    &prepared,
+                    &intent,
+                    &mut |stage| hook(stage),
+                )
+        };
+        let guard = path.join(recovery_hold::GUARD);
+        let guard_bytes = stdfs::read(&guard).unwrap();
+        assert!(release(&mut f, &mut |_| Ok(())).is_err());
+        assert_eq!(stdfs::read(&guard).unwrap(), guard_bytes);
+        f.recover_passphrase_completed(&resume, &start, &prepared, &intent, NEW_PASS)
+            .unwrap();
+        let fixed = path.join(initial_state::STATE);
+        let state = stdfs::read(&fixed).unwrap();
+        let normal = path.join("publisher");
+        let ciphertext = stdfs::read(&normal).unwrap();
+        if let Some(stage) = kill {
+            f.source.take();
+            f.backups.clear();
+            let mut child = child_command(
+                &f,
+                "keyfile::files::tests::resume_record_tests::recovery_tests::passphrase_key_exchange_retries_without_reversing_and_retains_both_keys",
+            )
+            .env("LNGNB_PUBLIC_RESUME_OLD", data_encoding::HEXLOWER.encode(&f.old))
+            .env("LNGNB_PUBLIC_RESUME_POINT", stage)
+            .env("LNGNB_PUBLIC_RELEASE_PASSPHRASE", "1")
+            .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+            let output = std::io::BufReader::new(child.stdout.take().unwrap());
+            let ready = output.lines().take(10).any(|line| line.unwrap() == "READY");
+            if ready {
+                child.kill().unwrap();
+            }
+            let result = child.wait_with_output().unwrap();
+            assert!(
+                ready && !result.status.success(),
+                "{stage}: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        } else {
+            let result = release(&mut f, &mut |stage| {
+                if point == Some(stage) {
+                    Err(KeyFileError::Io)
+                } else {
+                    Ok(())
+                }
+            });
+            match point {
+                None => assert_eq!(
+                    result.unwrap(),
+                    KeyResumeRelease::RemovedRecordedGuard(intent.after)
+                ),
+                Some(G::BeforeUnlink) => assert_eq!(result.err(), Some(KeyFileError::Io)),
+                _ => assert_eq!(
+                    result.err(),
+                    Some(KeyFileError::RecoveryGuardReleaseUncertain)
+                ),
+            }
+        }
+        f.reopen();
+        assert_eq!(
+            release(&mut f, &mut |_| Ok(())).unwrap(),
+            if point == Some(G::BeforeUnlink) {
+                KeyResumeRelease::RemovedRecordedGuard(intent.after)
+            } else {
+                KeyResumeRelease::ConfirmedGuardAbsent(intent.after)
+            }
+        );
+        assert!(!guard.exists());
+        assert!(
+            f.recover_passphrase_completed(&resume, &start, &prepared, &intent, NEW_PASS)
+                .is_err()
+        );
+        assert!(
+            f.source
+                .as_mut()
+                .unwrap()
+                .change_passphrase("publisher", NEW_PASS, "another public passphrase")
+                .is_err()
+        );
+        assert!(
+            release(&mut f, &mut |stage| {
+                if stage == G::BeforeDirectorySync {
+                    stdfs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .mode(0o600)
+                        .open(&guard)
+                        .unwrap()
+                        .write_all(&guard_bytes)
+                        .unwrap();
+                }
+                Ok(())
+            })
+            .is_err()
+        );
+        assert!(release(&mut f, &mut |_| Ok(())).is_err());
+        assert_eq!(stdfs::read(guard).unwrap(), guard_bytes);
+        assert_eq!(stdfs::read(fixed).unwrap(), state);
+        assert_eq!(stdfs::read(normal).unwrap(), ciphertext);
     }
 }
