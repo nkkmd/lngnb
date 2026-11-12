@@ -4,6 +4,7 @@ use super::recovery::{
 };
 use super::*;
 
+const COMPLETED: &str = "key_passphrase_change_completed";
 const PREPARED: &str = "key_passphrase_change_prepared";
 const START: &str = "key_passphrase_change_started";
 
@@ -370,6 +371,7 @@ impl KeyDirectory {
             resume,
             start,
             None,
+            None,
         )
     }
 
@@ -401,6 +403,50 @@ impl KeyDirectory {
             resume,
             start,
             Some((prepared, new_passphrase)),
+            None,
+        )
+    }
+
+    /// 完全な完了候補だけを、記録guardを保持したまま復旧する。
+    #[allow(clippy::too_many_arguments)]
+    pub fn recover_key_passphrase_completed(
+        &mut self,
+        current_name: &str,
+        old_passphrase: &str,
+        new_passphrase: &str,
+        backups: &mut [KeyDirectory],
+        current_backup: usize,
+        backup_name: &str,
+        proofs: &[KeyResumePreservation<'_>],
+        expected: &KeyResumeExpected,
+        resume: &KeyResumeIntent,
+        start: &KeyPassphraseStartIntent,
+        prepared: &KeyPassphrasePreparedIntent,
+        completed: &KeyPassphraseCompletedIntent,
+    ) -> Result<KeyStateDiagnostic> {
+        check_prepared_intent(start, prepared)?;
+        if completed.before != prepared.after
+            || completed.after.initial != completed.before.initial
+            || completed.before.generation.checked_add(1) != Some(completed.after.generation)
+            || completed.after.state
+                != (KeyHistoryState::PassphraseChangeCompleted {
+                    completed_operation_id: completed.operation_id,
+                })
+        {
+            return invalid();
+        }
+        self.recover_passphrase_snapshot(
+            current_name,
+            old_passphrase,
+            backups,
+            current_backup,
+            backup_name,
+            proofs,
+            expected,
+            resume,
+            start,
+            Some((prepared, new_passphrase)),
+            Some(completed),
         )
     }
 
@@ -417,6 +463,7 @@ impl KeyDirectory {
         resume: &KeyResumeIntent,
         start: &KeyPassphraseStartIntent,
         prepared: Option<(&KeyPassphrasePreparedIntent, &str)>,
+        completed: Option<&KeyPassphraseCompletedIntent>,
     ) -> Result<KeyStateDiagnostic> {
         check_start_intent(resume, start)?;
         let start_intent = KeyResumeIntent {
@@ -424,17 +471,30 @@ impl KeyDirectory {
             after: start.after,
             operation_id: start.operation_id,
         };
-        let intent = prepared.map_or(start_intent, |(prepared, _)| KeyResumeIntent {
+        let prepared_intent = prepared.map_or(start_intent, |(prepared, _)| KeyResumeIntent {
             before: prepared.before,
             after: prepared.after,
             operation_id: prepared.operation_id,
+        });
+        let intent = completed.map_or(prepared_intent, |completed| KeyResumeIntent {
+            before: completed.before,
+            after: completed.after,
+            operation_id: completed.operation_id,
         });
         let temp = format!(
             ".lngnb-key-state-update-{}",
             data_encoding::HEXLOWER.encode(&intent.operation_id)
         );
         let key_name = prepared.map(|_| staged_name(&start.operation_id));
-        inventory_with_key(self, Some(&temp), key_name.as_deref())?;
+        inventory_with_key(
+            self,
+            Some(&temp),
+            if completed.is_none() {
+                key_name.as_deref()
+            } else {
+                None
+            },
+        )?;
         let fixed = HeldFile::open(self, initial_state::STATE, initial_state::STATE_LIMIT)?;
         let temporary = match HeldFile::open(self, &temp, initial_state::STATE_LIMIT) {
             Ok(file) => Some(file),
@@ -462,14 +522,25 @@ impl KeyDirectory {
             &new.bytes,
             &marker,
             &intent,
-            if prepared.is_some() { PREPARED } else { START },
+            if completed.is_some() {
+                COMPLETED
+            } else if prepared.is_some() {
+                PREPARED
+            } else {
+                START
+            },
         )?;
         if old.is_some_and(|held| held.bytes != prefix) {
             return invalid();
         }
         let (started, ready) = if prepared.is_some() {
-            let ready = verify_event_prefix(&prefix, &marker, &start_intent, START)?;
-            (prefix, ready)
+            let started = if completed.is_some() {
+                verify_event_prefix(&prefix, &marker, &prepared_intent, PREPARED)?
+            } else {
+                prefix
+            };
+            let ready = verify_event_prefix(&started, &marker, &start_intent, START)?;
+            (started, ready)
         } else {
             (new.bytes.clone(), prefix)
         };
@@ -479,27 +550,41 @@ impl KeyDirectory {
             .last()
             .ok_or(KeyFileError::RecoveryStateInvalid)?;
         let guard = state_history::recorded_guard_identity(event)?;
+        let mut binding = ResumeCurrent::Original;
+        let mut absent_key = None;
         let staged_key = if let (Some(key_name), Some((_, passphrase))) = (key_name, prepared) {
             let value = cbor::decode(&new.bytes).map_err(|_| KeyFileError::RecoveryStateInvalid)?;
             let preparation = array(field(&value, "events")?)?
                 .last()
                 .ok_or(KeyFileError::RecoveryStateInvalid)?;
-            let held = HeldFile::open(self, &key_name, MAX_KEYFILE_BYTES)?;
+            let (path, identity_key) = if completed.is_some() {
+                absent(self, &key_name)?;
+                (current_name, "installed_identity")
+            } else {
+                (key_name.as_str(), "new_identity")
+            };
+            let held = HeldFile::open(self, path, MAX_KEYFILE_BYTES)?;
             if !equal(
-                field(preparation, "new_identity")?,
+                field(preparation, identity_key)?,
                 &KeyFileIdentity::from_metadata(&held.metadata).value(),
             )? {
                 return Err(KeyFileError::RecoveryChanged);
             }
             authenticate_staged(&held.bytes, event, passphrase)?;
-            held.check(self, &key_name, true)?;
-            held.sync()?;
-            held.check(self, &key_name, true)?;
-            Some((key_name, held))
+            held.check(self, path, true)?;
+            if completed.is_some() {
+                binding = ResumeCurrent::Installed(held);
+                absent_key = Some(key_name);
+                None
+            } else {
+                held.sync()?;
+                held.check(self, path, true)?;
+                Some((key_name, held))
+            }
         } else {
             None
         };
-        let mut context = self.prepare_resume_snapshot(
+        let mut context = self.prepare_resume_snapshot_with_current(
             current_name,
             old_passphrase,
             backups,
@@ -514,6 +599,7 @@ impl KeyDirectory {
                 allow_absent_guard: false,
                 expected_guard: Some(guard),
             },
+            binding,
         )?;
         if context.state.bytes != fixed.bytes
             || fingerprint(&context.state.metadata) != fingerprint(&fixed.metadata)
@@ -521,6 +607,7 @@ impl KeyDirectory {
             return Err(KeyFileError::RecoveryChanged);
         }
         context.staged_key = staged_key;
+        context.absent_names.extend(absent_key);
         recover_snapshot(
             context,
             temporary.as_ref(),
@@ -567,3 +654,94 @@ fn check_prepared_intent(
 #[path = "keyfile_passphrase_exchange.rs"]
 mod exchange;
 pub use exchange::{KeyPassphraseCleanup, KeyPassphraseExchange};
+
+/// 完了追記の中断を明示復旧するための控え。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeyPassphraseCompletedIntent {
+    pub before: KeyStateDiagnostic,
+    pub after: KeyStateDiagnostic,
+    pub operation_id: [u8; 32],
+}
+
+/// 同じ排他と現物fdに束縛した完了追記の準備。
+pub struct PreparedKeyPassphraseCompletion<'a>(PreparedKeyResume<'a>);
+
+impl<'a> PreparedKeyPassphraseCompletion<'a> {
+    fn new(
+        mut context: PreparedKeyResume<'a>,
+        cleanup: KeyPassphraseCleanup,
+        resume: &KeyResumeIntent,
+        start: &KeyPassphraseStartIntent,
+        prepared: &KeyPassphrasePreparedIntent,
+    ) -> Result<Self> {
+        context.check_held()?;
+        let marker = source_marker(context.source, resume)?;
+        let mut operation = [0; 32];
+        crate::keyfile::random(&mut operation)?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| KeyFileError::RecoveryStateInvalid)?
+            .as_secs();
+        let now = i64::try_from(now).map_err(|_| KeyFileError::RecoveryStateInvalid)?;
+        let mut snapshot =
+            cbor::decode(&context.state.bytes).map_err(|_| KeyFileError::RecoveryStateInvalid)?;
+        let Value::Map(fields) = &mut snapshot else {
+            return invalid();
+        };
+        let Some((_, Value::Array(events))) = fields.iter_mut().find(|(key, _)| key == "events")
+        else {
+            return invalid();
+        };
+        let disposition = match cleanup {
+            KeyPassphraseCleanup::RemovedRetainedOldCiphertext => "removed_retained_old_ciphertext",
+            KeyPassphraseCleanup::ConfirmedOldCiphertextAbsent => "confirmed_old_ciphertext_absent",
+        };
+        let before = prepared.after;
+        events.push(map(vec![
+            ("sequence", Value::Int((before.generation + 1) as i64)),
+            ("operation_id", bytes(operation)),
+            ("kind", text(COMPLETED)),
+            (
+                "actor_uid",
+                bytes(context.source_identity.uid.to_be_bytes()),
+            ),
+            ("recorded_unix_seconds", Value::Int(now)),
+            ("rules", text("lngnb-key-operations-1")),
+            ("previous_snapshot_sha256", bytes(before.snapshot_hash)),
+            ("started_operation_id", bytes(start.operation_id)),
+            ("prepared_operation_id", bytes(prepared.operation_id)),
+            (
+                "installed_identity",
+                KeyFileIdentity::from_metadata(&context.current.metadata).value(),
+            ),
+            ("disposition", text(disposition)),
+        ]));
+        context.new_bytes = encoded(&snapshot)?;
+        let after = decode_snapshot(&context.new_bytes, &marker, resume)?;
+        context.intent = KeyResumeIntent {
+            before,
+            after,
+            operation_id: operation,
+        };
+        Ok(Self(context))
+    }
+
+    pub fn intent(&self) -> KeyPassphraseCompletedIntent {
+        KeyPassphraseCompletedIntent {
+            before: self.0.intent.before,
+            after: self.0.intent.after,
+            operation_id: self.0.intent.operation_id,
+        }
+    }
+
+    pub fn record(self) -> Result<KeyStateDiagnostic> {
+        self.record_with(&mut |_| Ok(()))
+    }
+
+    pub(in super::super::super) fn record_with(
+        mut self,
+        hook: &mut impl FnMut(ResumeStage) -> Result<()>,
+    ) -> Result<KeyStateDiagnostic> {
+        self.0.record_snapshot_with(hook, false)
+    }
+}

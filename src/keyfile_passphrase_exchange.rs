@@ -22,9 +22,9 @@ enum Action {
     Cleanup,
 }
 
-enum Outcome {
+enum Outcome<'a> {
     Exchange(KeyPassphraseExchange),
-    Cleanup(KeyPassphraseCleanup),
+    Cleanup(KeyPassphraseCleanup, Box<PreparedKeyResume<'a>>),
 }
 
 impl KeyDirectory {
@@ -92,7 +92,7 @@ impl KeyDirectory {
             hook,
         )? {
             Outcome::Exchange(result) => Ok(result),
-            Outcome::Cleanup(_) => invalid(),
+            Outcome::Cleanup(..) => invalid(),
         }
     }
 
@@ -159,18 +159,56 @@ impl KeyDirectory {
             Action::Cleanup,
             hook,
         )? {
-            Outcome::Cleanup(result) => Ok(result),
+            Outcome::Cleanup(result, _) => Ok(result),
+            Outcome::Exchange(_) => invalid(),
+        }
+    }
+
+    /// 整理と保存確認を行い、完了追記に必要な排他とfdを保持する。
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_key_passphrase_completion<'a>(
+        &'a mut self,
+        current_name: &str,
+        old_passphrase: &str,
+        new_passphrase: &str,
+        backups: &'a mut [KeyDirectory],
+        current_backup: usize,
+        backup_name: &str,
+        proofs: &[KeyResumePreservation<'_>],
+        expected: &KeyResumeExpected,
+        resume: &KeyResumeIntent,
+        start: &KeyPassphraseStartIntent,
+        prepared: &KeyPassphrasePreparedIntent,
+    ) -> Result<PreparedKeyPassphraseCompletion<'a>> {
+        match self.apply_passphrase_layout(
+            current_name,
+            old_passphrase,
+            new_passphrase,
+            backups,
+            current_backup,
+            backup_name,
+            proofs,
+            expected,
+            resume,
+            start,
+            prepared,
+            Action::Cleanup,
+            &mut |_| Ok(()),
+        )? {
+            Outcome::Cleanup(result, context) => {
+                PreparedKeyPassphraseCompletion::new(*context, result, resume, start, prepared)
+            }
             Outcome::Exchange(_) => invalid(),
         }
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn apply_passphrase_layout(
-        &mut self,
+    fn apply_passphrase_layout<'a>(
+        &'a mut self,
         current_name: &str,
         old_passphrase: &str,
         new_passphrase: &str,
-        backups: &mut [KeyDirectory],
+        backups: &'a mut [KeyDirectory],
         current_backup: usize,
         backup_name: &str,
         proofs: &[KeyResumePreservation<'_>],
@@ -180,7 +218,7 @@ impl KeyDirectory {
         prepared: &KeyPassphrasePreparedIntent,
         action: Action,
         hook: &mut impl FnMut(ResumeStage) -> Result<()>,
-    ) -> Result<Outcome> {
+    ) -> Result<Outcome<'a>> {
         name(current_name)?;
         check_start_intent(resume, start)?;
         check_prepared_intent(start, prepared)?;
@@ -298,8 +336,10 @@ impl KeyDirectory {
         }
         if absent_old {
             context.qualify(None, false, hook, &mut || absent(context.source, &key_name))?;
+            context.absent_names.push(key_name);
             return Ok(Outcome::Cleanup(
                 KeyPassphraseCleanup::ConfirmedOldCiphertextAbsent,
+                Box::new(context),
             ));
         }
         // 一覧で許す予約名は交換の前後とも開始ID由来の一名だけ。
@@ -343,8 +383,11 @@ impl KeyDirectory {
                 io(context.source.dir.sync_all())?;
                 hook(ResumeStage::OldKeyDirectorySynced)?;
                 check()?;
+                context.absent_names.push(key_name);
+                context.removed_key = Some(removed);
                 Ok(Outcome::Cleanup(
                     KeyPassphraseCleanup::RemovedRetainedOldCiphertext,
+                    Box::new(context),
                 ))
             })()
             .map_err(|_| KeyFileError::CleanupUncertain);

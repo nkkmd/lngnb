@@ -11,8 +11,9 @@ pub use completion::{
     KeyCleanupCompletion, KeyCleanupDisposition, PreparedAbsentCleanup, PreparedResidueRemoval,
 };
 pub use resume_record::passphrase_start::{
-    KeyPassphraseCleanup, KeyPassphraseExchange, KeyPassphrasePreparedIntent,
-    KeyPassphraseStartIntent, PreparedKeyPassphraseRecord, PreparedKeyPassphraseStart,
+    KeyPassphraseCleanup, KeyPassphraseCompletedIntent, KeyPassphraseExchange,
+    KeyPassphrasePreparedIntent, KeyPassphraseStartIntent, PreparedKeyPassphraseCompletion,
+    PreparedKeyPassphraseRecord, PreparedKeyPassphraseStart,
 };
 pub use resume_record::release::{KeyResumeRelease, PreparedFirstPassphraseChange};
 pub use resume_record::{
