@@ -424,17 +424,7 @@ impl KeyDirectory {
         prepared: &KeyPassphrasePreparedIntent,
         completed: &KeyPassphraseCompletedIntent,
     ) -> Result<KeyStateDiagnostic> {
-        check_prepared_intent(start, prepared)?;
-        if completed.before != prepared.after
-            || completed.after.initial != completed.before.initial
-            || completed.before.generation.checked_add(1) != Some(completed.after.generation)
-            || completed.after.state
-                != (KeyHistoryState::PassphraseChangeCompleted {
-                    completed_operation_id: completed.operation_id,
-                })
-        {
-            return invalid();
-        }
+        check_completed_intent(start, prepared, completed)?;
         self.recover_passphrase_snapshot(
             current_name,
             old_passphrase,
@@ -465,6 +455,56 @@ impl KeyDirectory {
         prepared: Option<(&KeyPassphrasePreparedIntent, &str)>,
         completed: Option<&KeyPassphraseCompletedIntent>,
     ) -> Result<KeyStateDiagnostic> {
+        self.with_passphrase_snapshot(
+            current_name,
+            old_passphrase,
+            backups,
+            current_backup,
+            backup_name,
+            proofs,
+            expected,
+            resume,
+            start,
+            prepared,
+            completed,
+            false,
+            |context, temporary, temp, exchange, intent| {
+                recover_snapshot(
+                    context,
+                    temporary,
+                    temp,
+                    exchange,
+                    intent,
+                    &mut |_| Ok(()),
+                    false,
+                )
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn with_passphrase_snapshot<T>(
+        &mut self,
+        current_name: &str,
+        old_passphrase: &str,
+        backups: &mut [KeyDirectory],
+        current_backup: usize,
+        backup_name: &str,
+        proofs: &[KeyResumePreservation<'_>],
+        expected: &KeyResumeExpected,
+        resume: &KeyResumeIntent,
+        start: &KeyPassphraseStartIntent,
+        prepared: Option<(&KeyPassphrasePreparedIntent, &str)>,
+        completed: Option<&KeyPassphraseCompletedIntent>,
+        release: bool,
+        apply: impl FnOnce(
+            PreparedKeyResume<'_>,
+            Option<&HeldFile>,
+            &str,
+            bool,
+            &KeyResumeIntent,
+        ) -> Result<T>,
+    ) -> Result<T> {
         check_start_intent(resume, start)?;
         let start_intent = KeyResumeIntent {
             before: start.before,
@@ -488,7 +528,7 @@ impl KeyDirectory {
         let key_name = prepared.map(|_| staged_name(&start.operation_id));
         inventory_with_key(
             self,
-            Some(&temp),
+            (!release).then_some(temp.as_str()),
             if completed.is_none() {
                 key_name.as_deref()
             } else {
@@ -496,10 +536,15 @@ impl KeyDirectory {
             },
         )?;
         let fixed = HeldFile::open(self, initial_state::STATE, initial_state::STATE_LIMIT)?;
-        let temporary = match HeldFile::open(self, &temp, initial_state::STATE_LIMIT) {
-            Ok(file) => Some(file),
-            Err(KeyFileError::Missing) => None,
-            Err(e) => return Err(e),
+        let temporary = if release {
+            absent(self, &temp)?;
+            None
+        } else {
+            match HeldFile::open(self, &temp, initial_state::STATE_LIMIT) {
+                Ok(file) => Some(file),
+                Err(KeyFileError::Missing) => None,
+                Err(e) => return Err(e),
+            }
         };
         let marker = source_marker(self, resume)?;
         let decode = |file: &HeldFile| decode_snapshot(&file.bytes, &marker, resume);
@@ -596,7 +641,7 @@ impl KeyDirectory {
                 old_bytes,
                 new_bytes: ready,
                 intent: resume,
-                allow_absent_guard: false,
+                allow_absent_guard: release,
                 expected_guard: Some(guard),
             },
             binding,
@@ -608,17 +653,31 @@ impl KeyDirectory {
         }
         context.staged_key = staged_key;
         context.absent_names.extend(absent_key);
-        recover_snapshot(
-            context,
-            temporary.as_ref(),
-            &temp,
-            needs_exchange,
-            &intent,
-            &mut |_| Ok(()),
-            false,
-        )
+        apply(context, temporary.as_ref(), &temp, needs_exchange, &intent)
     }
 }
+
+fn check_completed_intent(
+    start: &KeyPassphraseStartIntent,
+    prepared: &KeyPassphrasePreparedIntent,
+    completed: &KeyPassphraseCompletedIntent,
+) -> Result<()> {
+    check_prepared_intent(start, prepared)?;
+    if completed.before != prepared.after
+        || completed.after.initial != completed.before.initial
+        || completed.before.generation.checked_add(1) != Some(completed.after.generation)
+        || completed.after.state
+            != (KeyHistoryState::PassphraseChangeCompleted {
+                completed_operation_id: completed.operation_id,
+            })
+    {
+        return invalid();
+    }
+    Ok(())
+}
+
+#[path = "keyfile_passphrase_release.rs"]
+mod passphrase_release;
 
 fn check_start_intent(resume: &KeyResumeIntent, start: &KeyPassphraseStartIntent) -> Result<()> {
     if start.before != resume.after
