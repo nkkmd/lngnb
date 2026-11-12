@@ -186,6 +186,7 @@ pub struct PreparedKeyResume<'a> {
     state: HeldFile,
     new_bytes: Vec<u8>,
     staged_key: Option<(String, HeldFile)>,
+    removed_key: Option<super::completion::removal::RemovedTarget>,
     intent: KeyResumeIntent,
 }
 impl PreparedKeyResume<'_> {
@@ -234,6 +235,9 @@ impl PreparedKeyResume<'_> {
         }
         self.marker
             .check(self.source, recovery_hold::MARKER, true)?;
+        if let Some(removed) = &self.removed_key {
+            removed.check()?;
+        }
         for n in &self.absent_names {
             absent(self.source, n)?;
         }
@@ -838,6 +842,7 @@ impl KeyDirectory {
             state,
             new_bytes,
             staged_key: None,
+            removed_key: None,
             intent,
         };
         Ok(prepared)

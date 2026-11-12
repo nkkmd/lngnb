@@ -1563,10 +1563,10 @@ fn passphrase_key_exchange_retries_without_reversing_and_retains_both_keys() {
             context.expected.current.ctime_nanoseconds = nanoseconds.parse().unwrap();
             context.expected.ciphertext_sha256 =
                 Sha256::digest(stdfs::read(&temporary).unwrap()).into();
-            assert_eq!(
-                context
+            if std::env::var_os("LNGNB_PUBLIC_COMPLETE_PASSPHRASE").is_some() {
+                let completion = context
                     .source
-                    .cleanup_key_passphrase_with(
+                    .prepare_key_passphrase_completion(
                         "publisher",
                         &context.pass,
                         NEW_PASS,
@@ -1578,11 +1578,38 @@ fn passphrase_key_exchange_retries_without_reversing_and_retains_both_keys() {
                         &resume,
                         &start,
                         &prepared,
-                        &mut hook,
                     )
-                    .unwrap(),
-                KeyPassphraseCleanup::RemovedRetainedOldCiphertext
-            );
+                    .unwrap();
+                let intent = completion.intent();
+                println!(
+                    "INTENT {} {}",
+                    data_encoding::HEXLOWER.encode(&intent.operation_id),
+                    data_encoding::HEXLOWER.encode(&intent.after.snapshot_hash)
+                );
+                std::io::stdout().flush().unwrap();
+                assert_eq!(completion.record_with(&mut hook).unwrap(), intent.after);
+            } else {
+                assert_eq!(
+                    context
+                        .source
+                        .cleanup_key_passphrase_with(
+                            "publisher",
+                            &context.pass,
+                            NEW_PASS,
+                            &mut context.backups,
+                            0,
+                            "saved",
+                            &proofs,
+                            &context.expected,
+                            &resume,
+                            &start,
+                            &prepared,
+                            &mut hook,
+                        )
+                        .unwrap(),
+                    KeyPassphraseCleanup::RemovedRetainedOldCiphertext
+                );
+            }
         } else {
             assert_eq!(
                 context
@@ -1925,5 +1952,254 @@ fn passphrase_old_ciphertext_cleanup_rechecks_absence_and_keeps_guard() {
                 .is_err()
         );
         assert_eq!(stdfs::read(&temporary).unwrap(), old);
+    }
+}
+
+impl Fixture {
+    fn prepare_passphrase_completion(
+        &mut self,
+        resume: &KeyResumeIntent,
+        start: &KeyPassphraseStartIntent,
+        prepared: &KeyPassphrasePreparedIntent,
+        new_passphrase: &str,
+    ) -> Result<PreparedKeyPassphraseCompletion<'_>> {
+        let proofs: Vec<_> = self
+            .ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| KeyResumePreservation {
+                completed_operation_id: *id,
+                directory_index: self.indices[i],
+                name: &self.names[i],
+                passphrase: &self.pass,
+            })
+            .collect();
+        self.source
+            .as_mut()
+            .unwrap()
+            .prepare_key_passphrase_completion(
+                "publisher",
+                &self.pass,
+                new_passphrase,
+                &mut self.backups,
+                0,
+                "saved",
+                &proofs,
+                &self.expected,
+                resume,
+                start,
+                prepared,
+            )
+    }
+
+    fn recover_passphrase_completed(
+        &mut self,
+        resume: &KeyResumeIntent,
+        start: &KeyPassphraseStartIntent,
+        prepared: &KeyPassphrasePreparedIntent,
+        completed: &KeyPassphraseCompletedIntent,
+        new_passphrase: &str,
+    ) -> Result<KeyStateDiagnostic> {
+        let proofs: Vec<_> = self
+            .ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| KeyResumePreservation {
+                completed_operation_id: *id,
+                directory_index: self.indices[i],
+                name: &self.names[i],
+                passphrase: &self.pass,
+            })
+            .collect();
+        self.source
+            .as_mut()
+            .unwrap()
+            .recover_key_passphrase_completed(
+                "publisher",
+                &self.pass,
+                new_passphrase,
+                &mut self.backups,
+                0,
+                "saved",
+                &proofs,
+                &self.expected,
+                resume,
+                start,
+                prepared,
+                completed,
+            )
+    }
+}
+
+#[test]
+fn passphrase_completion_preserves_disposition_and_recovers_complete_candidates() {
+    const NEW_PASS: &str = "new public passphrase";
+    for (point, initially_absent, kill) in [
+        (None, false, None),
+        (Some(S::Prepared), false, None),
+        (Some(S::Exchanged), true, None),
+        (Some(S::OldSnapshotRemoved), true, None),
+        (Some(S::Created), false, None),
+        (Some(S::Created), false, Some("Created")),
+        (Some(S::Prepared), false, Some("Prepared")),
+        (Some(S::Exchanged), false, Some("Exchanged")),
+        (
+            Some(S::OldSnapshotRemoved),
+            false,
+            Some("OldSnapshotRemoved"),
+        ),
+        (None, false, Some("OutputFailed")),
+    ] {
+        let mut f = Fixture::new(false, 0);
+        let resume = f.interrupt(S::OldSnapshotRemoved);
+        f.release(&resume, &mut |_| Ok(())).unwrap();
+        let path = f.a.0.clone();
+        let mut begin = f
+            .prepare_passphrase_change(&resume, NEW_PASS)
+            .unwrap()
+            .prepare_start()
+            .unwrap();
+        let start = begin.intent();
+        begin.record().unwrap();
+        let record = begin.prepare_ciphertext(NEW_PASS).unwrap();
+        let prepared = record.intent();
+        record.record().unwrap();
+        assert!(
+            f.prepare_passphrase_completion(&resume, &start, &prepared, NEW_PASS)
+                .is_err()
+        );
+        f.exchange_passphrase(&resume, &start, &prepared, NEW_PASS, &mut |_| Ok(()))
+            .unwrap();
+        let normal = path.join("publisher");
+        let new = stdfs::read(&normal).unwrap();
+        let guard = stdfs::read(path.join(recovery_hold::GUARD)).unwrap();
+        if initially_absent {
+            f.cleanup_passphrase(&resume, &start, &prepared, NEW_PASS, &mut |_| Ok(()))
+                .unwrap();
+        }
+        let intent = if let Some(stage) = kill {
+            f.source.take();
+            f.backups.clear();
+            let mut child = child_command(
+                &f,
+                "keyfile::files::tests::resume_record_tests::recovery_tests::passphrase_key_exchange_retries_without_reversing_and_retains_both_keys",
+            )
+            .env("LNGNB_PUBLIC_RESUME_OLD", data_encoding::HEXLOWER.encode(&f.old))
+            .env("LNGNB_PUBLIC_RESUME_POINT", stage)
+            .env("LNGNB_PUBLIC_COMPLETE_PASSPHRASE", "1")
+            .env("LNGNB_PUBLIC_CLEANUP_OLD_CTIME", format!("{}:{}", f.expected.current.ctime_seconds, f.expected.current.ctime_nanoseconds))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn().unwrap();
+            let output = std::io::BufReader::new(child.stdout.take().unwrap());
+            let mut intent = None;
+            let ready = output.lines().take(10).any(|line| {
+                let line = line.unwrap();
+                if let Some(fields) = line.strip_prefix("INTENT ") {
+                    let (id, hash) = fields.split_once(' ').unwrap();
+                    let decode = |hex: &str| {
+                        data_encoding::HEXLOWER
+                            .decode(hex.as_bytes())
+                            .unwrap()
+                            .try_into()
+                            .unwrap()
+                    };
+                    let operation_id = decode(id);
+                    intent = Some(KeyPassphraseCompletedIntent {
+                        before: prepared.after,
+                        after: KeyStateDiagnostic {
+                            initial: prepared.after.initial,
+                            generation: prepared.after.generation + 1,
+                            snapshot_hash: decode(hash),
+                            state: KeyHistoryState::PassphraseChangeCompleted {
+                                completed_operation_id: operation_id,
+                            },
+                        },
+                        operation_id,
+                    });
+                }
+                line == "READY"
+            });
+            if ready {
+                child.kill().unwrap();
+            }
+            let result = child.wait_with_output().unwrap();
+            assert!(
+                ready && !result.status.success(),
+                "{stage}: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            intent.unwrap()
+        } else {
+            let completion = f
+                .prepare_passphrase_completion(&resume, &start, &prepared, NEW_PASS)
+                .unwrap();
+            let intent = completion.intent();
+            let result = completion.record_with(&mut |stage| {
+                if point == Some(stage) {
+                    Err(KeyFileError::Io)
+                } else {
+                    Ok(())
+                }
+            });
+            if point.is_none() {
+                assert_eq!(result.unwrap(), intent.after);
+            } else {
+                assert!(result.is_err());
+            }
+            intent
+        };
+        f.reopen();
+        let mut wrong = intent;
+        wrong.after.snapshot_hash[0] ^= 1;
+        assert!(
+            f.recover_passphrase_completed(&resume, &start, &prepared, &wrong, NEW_PASS)
+                .is_err()
+        );
+        assert!(
+            f.recover_passphrase_completed(
+                &resume,
+                &start,
+                &prepared,
+                &intent,
+                "wrong public passphrase"
+            )
+            .is_err()
+        );
+        let recovered =
+            f.recover_passphrase_completed(&resume, &start, &prepared, &intent, NEW_PASS);
+        if point == Some(S::Created) {
+            assert!(recovered.is_err());
+        } else {
+            assert_eq!(recovered.unwrap(), intent.after);
+            let snapshot =
+                cbor::decode(&stdfs::read(path.join(initial_state::STATE)).unwrap()).unwrap();
+            let disposition = if initially_absent {
+                "confirmed_old_ciphertext_absent"
+            } else {
+                "removed_retained_old_ciphertext"
+            };
+            assert_eq!(
+                crate::keyfile::get(events(&snapshot).last().unwrap(), "disposition").unwrap(),
+                &Value::Text(disposition.to_owned()),
+            );
+            assert_eq!(
+                f.recover_passphrase_completed(&resume, &start, &prepared, &intent, NEW_PASS)
+                    .unwrap(),
+                intent.after
+            );
+            let old_name = path.join(format!(
+                ".lngnb-key-passphrase-{}",
+                data_encoding::HEXLOWER.encode(&start.operation_id)
+            ));
+            stdfs::write(&old_name, &new).unwrap();
+            assert!(
+                f.recover_passphrase_completed(&resume, &start, &prepared, &intent, NEW_PASS)
+                    .is_err()
+            );
+            assert_eq!(stdfs::read(old_name).unwrap(), new);
+        }
+        assert_eq!(stdfs::read(normal).unwrap(), new);
+        assert_eq!(stdfs::read(path.join(recovery_hold::GUARD)).unwrap(), guard);
     }
 }

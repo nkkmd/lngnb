@@ -211,10 +211,10 @@ mod files;
 pub use files::{
     KeyCleanupCompletion, KeyCleanupDisposition, KeyCleanupExpected, KeyCleanupStart, KeyDirectory,
     KeyDirectoryIdentity, KeyFileError, KeyFileIdentity, KeyHistoryState, KeyInitialState,
-    KeyPassphraseCleanup, KeyPassphraseExchange, KeyPassphrasePreparedIntent,
-    KeyPassphraseStartIntent, KeyRecoveryEntry, KeyRecoveryHold, KeyRecoveryInventory,
-    KeyResumeExpected, KeyResumeIntent, KeyResumePreservation, KeyResumeRelease,
-    KeyStateDiagnostic, PreparedAbsentCleanup, PreparedFirstPassphraseChange, PreparedKeyCleanup,
-    PreparedKeyPassphraseRecord, PreparedKeyPassphraseStart, PreparedKeyResume,
-    PreparedResidueRemoval,
+    KeyPassphraseCleanup, KeyPassphraseCompletedIntent, KeyPassphraseExchange,
+    KeyPassphrasePreparedIntent, KeyPassphraseStartIntent, KeyRecoveryEntry, KeyRecoveryHold,
+    KeyRecoveryInventory, KeyResumeExpected, KeyResumeIntent, KeyResumePreservation,
+    KeyResumeRelease, KeyStateDiagnostic, PreparedAbsentCleanup, PreparedFirstPassphraseChange,
+    PreparedKeyCleanup, PreparedKeyPassphraseCompletion, PreparedKeyPassphraseRecord,
+    PreparedKeyPassphraseStart, PreparedKeyResume, PreparedResidueRemoval,
 };
