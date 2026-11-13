@@ -14,7 +14,9 @@ mod journal;
 pub(super) use journal::first_change_fits;
 #[path = "keyfile_resume_codec.rs"]
 mod resume;
-pub(super) use resume::guard_identity as recorded_guard_identity;
+pub(super) use resume::{
+    file_identity as recorded_file_identity, guard_identity as recorded_guard_identity,
+};
 const COMMON: [&str; 6] = [
     "sequence",
     "operation_id",

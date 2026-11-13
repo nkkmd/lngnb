@@ -75,7 +75,10 @@ pub(super) fn validate(event: &Value, source: &[u8], completions: &[[u8; 32]]) -
 }
 
 pub(in super::super) fn guard_identity(event: &Value) -> Result<KeyFileIdentity> {
-    let v = field(event, "guard_identity")?;
+    file_identity(field(event, "guard_identity")?)
+}
+
+pub(in super::super) fn file_identity(v: &Value) -> Result<KeyFileIdentity> {
     Ok(KeyFileIdentity {
         dev: u64::from_be_bytes(bytes(field(v, "dev")?)?),
         ino: u64::from_be_bytes(bytes(field(v, "ino")?)?),

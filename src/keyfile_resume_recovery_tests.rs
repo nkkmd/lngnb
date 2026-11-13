@@ -2440,3 +2440,6 @@ fn passphrase_release_requires_fixed_completion_and_rechecks_guard_absence() {
         assert_eq!(stdfs::read(normal).unwrap(), ciphertext);
     }
 }
+
+#[path = "keyfile_passphrase_update_tests.rs"]
+mod passphrase_update;
