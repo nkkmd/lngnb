@@ -79,12 +79,17 @@ fn first_passphrase_update_flushes_before_every_append() {
         let result = f.change_first(&resume, &mut output);
         assert_eq!(output.stage, fail);
         f.reopen();
-        let state = f
-            .source
-            .as_mut()
-            .unwrap()
-            .key_state_history(&resume.after.initial.area_id)
-            .unwrap();
+        let marker = stdfs::read(f.a.0.join(recovery_hold::MARKER)).unwrap();
+        let mut source_marker = marker[..73].to_vec();
+        source_marker[19] = b'1';
+        let snapshot = stdfs::read(f.a.0.join(initial_state::STATE)).unwrap();
+        let state = state_history::decode_history(
+            &snapshot,
+            &source_marker,
+            resume.after.initial.area_id,
+            resume.after.initial.snapshot_hash,
+        )
+        .unwrap();
         assert_eq!(state.generation, resume.after.generation + fail as u64);
         assert_eq!(guard.exists(), fail < 3);
         if fail == 3 {
