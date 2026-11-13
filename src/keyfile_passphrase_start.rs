@@ -804,3 +804,6 @@ impl<'a> PreparedKeyPassphraseCompletion<'a> {
         self.0.record_snapshot_with(hook, false)
     }
 }
+
+#[path = "keyfile_passphrase_update.rs"]
+mod update;
