@@ -35,7 +35,7 @@ impl KeyDirectory {
         let started = start.intent();
         receipt(
             receipts,
-            "started",
+            "key_passphrase_change_started",
             started.before,
             started.after,
             started.operation_id,
@@ -46,7 +46,7 @@ impl KeyDirectory {
         let prepared = preparation.intent();
         receipt(
             receipts,
-            "prepared",
+            "key_passphrase_change_prepared",
             prepared.before,
             prepared.after,
             prepared.operation_id,
@@ -82,7 +82,7 @@ impl KeyDirectory {
         let completed = completion.intent();
         receipt(
             receipts,
-            "completed",
+            "key_passphrase_change_completed",
             completed.before,
             completed.after,
             completed.operation_id,
@@ -205,7 +205,7 @@ fn receipt(
     // 三段階に共通する初回rootと、段階ごとの前後の控え。
     io(writeln!(
         output,
-        "key_passphrase_change_{stage} area_id={} root={} initial_operation_id={} initial_generation={} before_generation={} before_hash={} after_generation={} after_hash={} operation_id={}",
+        "{stage} area_id={} root={} initial_operation_id={} initial_generation={} before_generation={} before_hash={} after_generation={} after_hash={} operation_id={}",
         data_encoding::HEXLOWER.encode(&before.initial.area_id),
         data_encoding::HEXLOWER.encode(&before.initial.snapshot_hash),
         data_encoding::HEXLOWER.encode(&before.initial.operation_id),
@@ -217,6 +217,60 @@ fn receipt(
         data_encoding::HEXLOWER.encode(&operation),
     ))?;
     io(output.flush())
+}
+
+impl KeyResumeIntent {
+    /// 明示復旧に再入力できる再開控えを書き、flushする。
+    pub fn write_receipt(&self, output: &mut impl Write) -> Result<()> {
+        receipt(
+            output,
+            "key_changes_resumed",
+            self.before,
+            self.after,
+            self.operation_id,
+        )
+    }
+
+    /// 再開控えを読み戻す。保存確認や変更資格は付与しない。
+    pub fn parse_receipt(line: &str) -> Result<Self> {
+        let mut fields = receipt_fields(line, "key_changes_resumed")?;
+        let initial = KeyInitialState {
+            area_id: receipt_id(fields("area_id=")?)?,
+            snapshot_hash: receipt_id(fields("root=")?)?,
+            operation_id: receipt_id(fields("initial_operation_id=")?)?,
+            generation: receipt_generation(fields("initial_generation=")?)?,
+        };
+        let generation = receipt_generation(fields("before_generation=")?)?;
+        if initial.generation != 1 || generation == 0 || generation >= 1024 {
+            return invalid();
+        }
+        let before = KeyStateDiagnostic {
+            initial,
+            generation,
+            snapshot_hash: receipt_id(fields("before_hash=")?)?,
+            state: KeyHistoryState::Held,
+        };
+        let (after, operation_id) = parse_receipt(line, "key_changes_resumed", before, |id| {
+            KeyHistoryState::Ready {
+                resumed_operation_id: id,
+            }
+        })?;
+        Ok(Self {
+            before,
+            after,
+            operation_id,
+        })
+    }
+}
+
+fn receipt_generation(field: &str) -> Result<u64> {
+    let generation: u64 = field
+        .parse()
+        .map_err(|_| KeyFileError::RecoveryStateInvalid)?;
+    if field != generation.to_string() {
+        return invalid();
+    }
+    Ok(generation)
 }
 
 impl KeyPassphraseStartIntent {
@@ -288,19 +342,7 @@ fn parse_receipt(
     before: KeyStateDiagnostic,
     state: impl FnOnce([u8; 32]) -> KeyHistoryState,
 ) -> Result<(KeyStateDiagnostic, [u8; 32])> {
-    if line.len() > 1024 {
-        return invalid();
-    }
-    let mut fields = line.strip_suffix('\n').unwrap_or(line).split(' ');
-    if fields.next() != Some(stage) {
-        return invalid();
-    }
-    let mut field = |prefix| {
-        fields
-            .next()
-            .and_then(|field| field.strip_prefix(prefix))
-            .ok_or(KeyFileError::RecoveryStateInvalid)
-    };
+    let mut field = receipt_fields(line, stage)?;
     let area = receipt_id(field("area_id=")?)?;
     let root = receipt_id(field("root=")?)?;
     let initial_operation = receipt_id(field("initial_operation_id=")?)?;
@@ -314,7 +356,7 @@ fn parse_receipt(
         .generation
         .checked_add(1)
         .ok_or(KeyFileError::RecoveryStateInvalid)?;
-    if fields.next().is_some()
+    if field("").is_ok()
         || area != before.initial.area_id
         || root != before.initial.snapshot_hash
         || initial_operation != before.initial.operation_id
@@ -334,6 +376,22 @@ fn parse_receipt(
         },
         operation_id,
     ))
+}
+
+fn receipt_fields<'a>(line: &'a str, stage: &str) -> Result<impl FnMut(&str) -> Result<&'a str>> {
+    if line.len() > 1024 {
+        return invalid();
+    }
+    let mut fields = line.strip_suffix('\n').unwrap_or(line).split(' ');
+    if fields.next() != Some(stage) {
+        return invalid();
+    }
+    Ok(move |prefix: &str| {
+        fields
+            .next()
+            .and_then(|field| field.strip_prefix(prefix))
+            .ok_or(KeyFileError::RecoveryStateInvalid)
+    })
 }
 
 fn receipt_id(field: &str) -> Result<[u8; 32]> {
@@ -378,6 +436,19 @@ mod tests {
             },
             operation_id: [0x66; 32],
         };
+        let mut resume_bytes = Vec::new();
+        resume.write_receipt(&mut resume_bytes).unwrap();
+        let resume_line = std::str::from_utf8(&resume_bytes).unwrap();
+        assert_eq!(KeyResumeIntent::parse_receipt(resume_line).unwrap(), resume);
+        for bad in [
+            resume_line.replace("initial_generation=1", "initial_generation=2"),
+            resume_line.replace("before_generation=3", "before_generation=03"),
+            resume_line.replace("after_generation=4", "after_generation=1025"),
+            format!("{} extra=1", resume_line.trim_end()),
+        ] {
+            assert!(KeyResumeIntent::parse_receipt(&bad).is_err());
+        }
+
         let mut bytes = Vec::new();
         let started = KeyStateDiagnostic {
             generation: 5,
@@ -403,9 +474,30 @@ mod tests {
             },
             ..held
         };
-        receipt(&mut bytes, "started", resume.after, started, [0x88; 32]).unwrap();
-        receipt(&mut bytes, "prepared", started, prepared, [0xaa; 32]).unwrap();
-        receipt(&mut bytes, "completed", prepared, completed, [0xcc; 32]).unwrap();
+        receipt(
+            &mut bytes,
+            "key_passphrase_change_started",
+            resume.after,
+            started,
+            [0x88; 32],
+        )
+        .unwrap();
+        receipt(
+            &mut bytes,
+            "key_passphrase_change_prepared",
+            started,
+            prepared,
+            [0xaa; 32],
+        )
+        .unwrap();
+        receipt(
+            &mut bytes,
+            "key_passphrase_change_completed",
+            prepared,
+            completed,
+            [0xcc; 32],
+        )
+        .unwrap();
         let text = std::str::from_utf8(&bytes).unwrap();
         let lines: Vec<_> = text.lines().collect();
         let start = KeyPassphraseStartIntent::parse_receipt(lines[0], &resume).unwrap();
