@@ -90,6 +90,29 @@ fn first_passphrase_update_flushes_before_every_append() {
             resume.after.initial.snapshot_hash,
         )
         .unwrap();
+        let source = f.source.as_ref().unwrap();
+        assert_eq!(
+            source
+                .key_passphrase_recovery_expected("publisher", "saved", &resume)
+                .unwrap(),
+            f.expected
+        );
+        let mut wrong = resume;
+        wrong.after.snapshot_hash[0] ^= 1;
+        assert!(
+            source
+                .key_passphrase_recovery_expected("publisher", "saved", &wrong)
+                .is_err()
+        );
+        assert!(
+            source
+                .key_passphrase_recovery_expected("publisher", "other", &resume)
+                .is_err()
+        );
+        assert_eq!(
+            stdfs::read(f.a.0.join(initial_state::STATE)).unwrap(),
+            snapshot
+        );
         assert_eq!(state.generation, resume.after.generation + fail as u64);
         assert_eq!(guard.exists(), fail < 3);
         if fail == 3 {
