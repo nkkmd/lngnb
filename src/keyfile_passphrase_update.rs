@@ -113,12 +113,51 @@ impl KeyDirectory {
     ) -> Result<KeyResumeExpected> {
         let marker = source_marker(self, resume)?;
         let fixed = HeldFile::open(self, initial_state::STATE, initial_state::STATE_LIMIT)?;
-        if decode_snapshot(&fixed.bytes, &marker, resume)? != resume.after {
+        Self::expected_from_ready(&fixed.bytes, &marker, current_name, backup_name, resume)
+    }
+
+    /// 固定履歴の再開prefixから、明示復旧に渡す照合値を取得する。
+    /// 保存・認証・復旧資格の確認は、対応する明示復旧APIで行う。
+    pub fn key_passphrase_recovery_expected(
+        &self,
+        current_name: &str,
+        backup_name: &str,
+        resume: &KeyResumeIntent,
+    ) -> Result<KeyResumeExpected> {
+        let marker = source_marker(self, resume)?;
+        let fixed = HeldFile::open(self, initial_state::STATE, initial_state::STATE_LIMIT)?;
+        let diagnostic = decode_snapshot(&fixed.bytes, &marker, resume)?;
+        let generation = usize::try_from(resume.after.generation)
+            .map_err(|_| KeyFileError::RecoveryStateInvalid)?;
+        let mut snapshot =
+            cbor::decode(&fixed.bytes).map_err(|_| KeyFileError::RecoveryStateInvalid)?;
+        let Value::Map(fields) = &mut snapshot else {
+            return invalid();
+        };
+        let Some((_, Value::Array(events))) = fields.iter_mut().find(|(k, _)| k == "events") else {
+            return invalid();
+        };
+        if generation > events.len() || diagnostic.generation - resume.after.generation > 3 {
             return invalid();
         }
-        verify_prefix(&fixed.bytes, &marker, resume)?;
-        let snapshot =
-            cbor::decode(&fixed.bytes).map_err(|_| KeyFileError::RecoveryStateInvalid)?;
+        // prefixの再構成は照合専用。固定履歴や一時名へ書き戻さない。
+        events.truncate(generation);
+        let ready = encoded(&snapshot)?;
+        Self::expected_from_ready(&ready, &marker, current_name, backup_name, resume)
+    }
+
+    fn expected_from_ready(
+        ready: &[u8],
+        marker: &[u8],
+        current_name: &str,
+        backup_name: &str,
+        resume: &KeyResumeIntent,
+    ) -> Result<KeyResumeExpected> {
+        if decode_snapshot(ready, marker, resume)? != resume.after {
+            return invalid();
+        }
+        verify_prefix(ready, marker, resume)?;
+        let snapshot = cbor::decode(ready).map_err(|_| KeyFileError::RecoveryStateInvalid)?;
         let event = array(field(&snapshot, "events")?)?
             .last()
             .ok_or(KeyFileError::RecoveryStateInvalid)?;
