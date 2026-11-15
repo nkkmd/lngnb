@@ -104,6 +104,48 @@ fn passphrase_journal_fixed_prefixes_match_independent_python() {
 }
 
 #[test]
+fn current_decoder_rejects_independent_rotation_prefixes() {
+    let python = std::env::var_os("LNGNB_REFERENCE_PYTHON").expect("reference python");
+    let output = Command::new(python)
+        .args(["tests/key_resume_reference.py", "--rotation-journal"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let fixture: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let first = data_encoding::HEXLOWER
+        .decode(fixture["first"].as_str().unwrap().as_bytes())
+        .unwrap();
+    let source = source();
+    let decode_prefix = |raw: &[u8]| decode_history(raw, &source, [0x42; 32], root());
+    assert_eq!(
+        decode_prefix(&first).unwrap().state,
+        KeyHistoryState::PassphraseChangeCompleted {
+            completed_operation_id: id(5),
+        }
+    );
+    let rotations = fixture["rotations"].as_array().unwrap();
+    let hashes = [
+        "2b3c038e5d35d4410d363ba468c199aaf132ef1a53bf164f9e0c298fda184351",
+        "77d8cdbc1cbb38f9b4e7124579bf09cb61477460d5228eb47b173cd251fdbb01",
+        "79bbc8cd2a325e39bf5ddf61feb36a01aa899519ef0da4b63fb51aedf063e71a",
+        "8f00502074f3d235146017b91c2cebb5dd86e63870062bd5ddfd939c1c120b6b",
+        "5eb9ec74e929ba1ae8f8143b798643b73b97d46adc44b07268cb7361e03f98cd",
+        "e59b2e97432d3527493e901186b9fdef6c5952318c5ba0a1db8b35b0ee0f058c",
+    ];
+    assert_eq!(rotations.len(), hashes.len());
+    for (prefix, hash) in rotations.iter().zip(hashes) {
+        let raw = data_encoding::HEXLOWER
+            .decode(prefix.as_str().unwrap().as_bytes())
+            .unwrap();
+        assert_eq!(data_encoding::HEXLOWER.encode(&Sha256::digest(&raw)), hash);
+        assert!(matches!(
+            decode_prefix(&raw),
+            Err(KeyFileError::RecoveryStateInvalid)
+        ));
+    }
+}
+
+#[test]
 fn passphrase_journal_rejects_invalid_schema_and_transitions() {
     let [start, prepare, complete] = snapshots(2, REMOVED);
     for (valid, index, changes) in [
