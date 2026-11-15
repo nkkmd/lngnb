@@ -1,5 +1,7 @@
 //! R34/A11: 実行ファイル専用の鍵操作。DB/HTTP/IPCには接続しない。
 use super::AppError;
+#[path = "key_cli_passphrase.rs"]
+mod passphrase;
 use lngnb::{
     id::{Id, Kind, key_id},
     keyfile::{KeyDirectory, KeyFileError, KeyRecoveryInventory},
@@ -8,7 +10,7 @@ use lngnb::{
 use std::{ffi::OsString, fmt, io::Write, path::PathBuf};
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum Action {
+enum Action {
     Create,
     Check,
     Change,
@@ -16,6 +18,7 @@ pub enum Action {
     CheckResidue,
     PreserveResidue,
     RestoreResidue,
+    HistoryPassphrase(Box<passphrase::Request>),
 }
 #[derive(Debug, PartialEq, Eq)]
 pub struct Command {
@@ -41,6 +44,9 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
     let [action, rest @ ..] = args else {
         return Err(usage());
     };
+    if action == "history-passphrase" {
+        return passphrase::parse(rest);
+    }
     let action = match action.to_str() {
         Some("create") => Action::Create,
         Some("check") => Action::Check,
@@ -164,6 +170,8 @@ pub enum Error {
     Restore(KeyFileError),
     RestorationOutput,
     Output { changed: bool },
+    HistoryPassphrase(KeyFileError),
+    HistoryOutput,
 }
 impl From<SecretInputError> for Error {
     fn from(e: SecretInputError) -> Self {
@@ -229,6 +237,8 @@ impl fmt::Display for Error {
             }
             Self::RestorationOutput => f.write_str("復元先への暗号文保存は完了しましたが、結果出力に失敗しました。全残存物と復元先を保持し、再実行せず復元先を key check で確認してください。過去の更新確定・残存物の整理許可ではなく、変更停止も解除しません。"),
             Self::PreservationOutput => f.write_str("保全先への暗号文保存は完了しましたが、結果出力に失敗しました。保全元・保全先を保持し、再実行せず保全先を key check で確認してください。過去の更新確定や残存物の削除許可ではありません。"),
+            Self::HistoryPassphrase(e) => write!(f, "{e}。現在名・保全先・全残存物と控えを保持してください。対象段階の明示復旧で確認してください。"),
+            Self::HistoryOutput => f.write_str("操作結果の出力に失敗しました。控えを保持し、対象段階の明示復旧で確認してください。"),
             Self::Output { changed: true } => f.write_str("鍵ファイル操作は完了しましたが、結果の出力に失敗しました。再実行せず key check で現在名を確認してください。"),
             Self::Output { changed: false } => f.write_str("案内または確認結果の出力に失敗しました。"),
         }
@@ -240,6 +250,14 @@ pub fn run(command: Command, output: &mut impl Write) -> Result<(), Error> {
     // parse以外の操作より先に明示導入。ライブラリAPIへ暗黙導入しない。
     let signals = TerminalSignals::install()?;
     let mut directory = KeyDirectory::open(&command.directory)?;
+    if let Action::HistoryPassphrase(request) = command.action {
+        return request.run(
+            &mut directory,
+            command.name.as_deref().unwrap_or(""),
+            signals,
+            output,
+        );
+    }
     if command.action == Action::RecoveryStatus {
         return report_inventory(&directory.recovery_inventory()?, output);
     }
@@ -307,6 +325,7 @@ pub fn run(command: Command, output: &mut impl Write) -> Result<(), Error> {
                 .restore_recovery_file(name, p.as_str(), target, &public)
                 .map_err(Error::Restore)?
         }
+        Action::HistoryPassphrase(_) => unreachable!("history operation has a separate entry"),
         Action::RecoveryStatus => unreachable!("inventory returns before terminal input"),
         Action::PreserveResidue => unreachable!("preservation uses both directory locks above"),
     };
@@ -328,6 +347,7 @@ fn report(action: &Action, public: &[u8; 32], output: &mut impl Write) -> Result
         Action::RestoreResidue => {
             "指定した残存暗号文を期待する鍵IDと照合し、明示した空いている復元先名へ同じbytesを保存しました。全残存物を保持し、変更停止も解除していません。過去の更新確定・元名の推測・新旧判定・残存物の整理許可ではありません"
         }
+        Action::HistoryPassphrase(_) => unreachable!("history operation has a separate entry"),
         Action::RecoveryStatus => unreachable!("inventory has a separate report"),
         Action::PreserveResidue => {
             "指定した残存暗号文を認証し、明示した保全先の新しい名前へ同じbytesを保存しました。保全元の現在名・残存物は書換え・削除していません。過去の更新確定・新旧判定・残存物の整理許可ではありません"

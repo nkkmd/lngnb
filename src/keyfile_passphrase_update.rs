@@ -80,13 +80,7 @@ impl KeyDirectory {
             &prepared,
         )?;
         let completed = completion.intent();
-        receipt(
-            receipts,
-            "key_passphrase_change_completed",
-            completed.before,
-            completed.after,
-            completed.operation_id,
-        )?;
+        completed.write_receipt(receipts)?;
         completion.record()?;
 
         self.recover_key_passphrase_release(
@@ -312,6 +306,17 @@ impl KeyPassphrasePreparedIntent {
 }
 
 impl KeyPassphraseCompletedIntent {
+    /// 明示完了操作で、追記前に完了控えを出力する。
+    pub fn write_receipt(&self, output: &mut impl Write) -> Result<()> {
+        receipt(
+            output,
+            "key_passphrase_change_completed",
+            self.before,
+            self.after,
+            self.operation_id,
+        )
+    }
+
     /// 追記前に出力した一行を準備控えと照合する。復旧資格は付与しない。
     pub fn parse_receipt(
         line: &str,
