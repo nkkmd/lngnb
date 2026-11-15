@@ -39,7 +39,7 @@ def decode_key(path, password):
     ident = b"ky1_" + base64.b32encode(hashlib.sha256(b"lngnb:key:ed25519:1\x00" + public).digest()).lower().rstrip(b"=")
     return seed, obj, ident
 
-def invoke(directory, action, payloads, expected=0, cancel=None, closed_output=False, residue=None, backup=None, restoration=None):
+def invoke(directory, action, payloads, expected=0, cancel=None, closed_output=False, residue=None, backup=None, restoration=None, extra=(), history_stage=None):
     master, slave = pty.openpty()
     before = termios.tcgetattr(slave)
     before[3] |= termios.ECHO | termios.ECHONL | termios.ICANON | termios.ISIG
@@ -54,7 +54,8 @@ def invoke(directory, action, payloads, expected=0, cancel=None, closed_output=F
         selection += ["--backup-dir", str(backup[0]), "--backup-name", backup[1]]
     if restoration is not None:
         selection += ["--restore-name", restoration[0], "--expect-key-id", restoration[1]]
-    child = subprocess.Popen([BINARY, "key", action, "--key-dir", str(directory)] + selection,
+    child = subprocess.Popen([BINARY, "key", action] + ([history_stage] if history_stage else [])
+                             + ["--key-dir", str(directory)] + selection + list(extra),
                              stdin=subprocess.DEVNULL, stdout=sink, stderr=subprocess.PIPE,
                              pass_fds=(slave,), preexec_fn=setup)
     captured = bytearray()
@@ -73,9 +74,9 @@ def invoke(directory, action, payloads, expected=0, cancel=None, closed_output=F
             prompt(len(payloads) + 1)
             os.write(master, b"public cancelled CLI input")
             os.kill(child.pid, cancel)
-        out, err = child.communicate(timeout=30)
+        out, err = child.communicate(timeout=120 if history_stage else 30)
         out = out or b""
-        assert child.returncode == expected, "CLI exit mismatch: " + str(child.returncode)
+        assert child.returncode == expected, "CLI exit mismatch: " + str(child.returncode) + ": " + err.decode(errors="replace")
         assert termios.tcgetattr(slave) == before, "CLI did not restore terminal"
         while select.select([master], [], [], 0)[0]:
             captured.extend(os.read(master, 4096))
@@ -93,6 +94,48 @@ def invoke(directory, action, payloads, expected=0, cancel=None, closed_output=F
         os.close(slave)
         if closed_output:
             sink.close()
+
+def history_cases(root):
+    for scenario in ("normal", "cancel", "output"):
+        directory = root / scenario
+        backup = root / (scenario + "-backup")
+        receipt = (root / (scenario + "-receipt")).read_text().strip()
+        path = directory / "publisher"
+        guard = directory / ".lngnb-key-hold"
+        original = path.read_bytes()
+        before = {p.name: p.read_bytes() for p in directory.iterdir()}
+        args = ["--resume", receipt]
+        def history(stage, passwords, **kwargs):
+            return invoke(directory, "history-passphrase", passwords, backup=(backup, "saved"),
+                          extra=args, history_stage=stage, **kwargs)
+        if scenario == "cancel":
+            history("update", [OLD], expected=130, cancel=signal.SIGTERM)
+            assert {p.name: p.read_bytes() for p in directory.iterdir()} == before
+        if scenario == "output":
+            history("update", [OLD, NEW, NEW], expected=1, closed_output=True)
+            assert path.read_bytes() == original
+            assert set(p.name for p in directory.iterdir()) - before.keys() == {guard.name}
+            assert {name: (directory / name).read_bytes() for name in before} == before
+            history("update", [OLD, NEW, NEW], expected=1)
+            assert guard.exists() and path.read_bytes() == original
+        else:
+            out, _ = history("update", [OLD, NEW, NEW])
+            started, prepared, completed, result = out.decode().splitlines()
+            assert result == "key_passphrase_change_guard_removed"
+            assert not guard.exists()
+            assert decode_key(path, NEW)[0] == decode_key(backup / "saved", OLD)[0]
+            changed = path.read_bytes()
+            args.extend(["--start", started, "--prepared", prepared, "--completed", completed])
+            history("release", [OLD, NEW], expected=1, closed_output=True)
+            out, _ = history("release", [OLD, NEW])
+            assert out == b"key_passphrase_change_guard_absence_confirmed\n"
+            assert not guard.exists() and path.read_bytes() == changed
+        assert (backup / "saved").read_bytes() == original
+
+if len(sys.argv) == 3:
+    history_cases(Path(sys.argv[2]))
+    print("HISTORY_KEY_CLI_CASES_OK")
+    sys.exit(0)
 
 with tempfile.TemporaryDirectory(prefix="lngnb-cli-public-test-") as root:
     directory = Path(root) / "keys"
