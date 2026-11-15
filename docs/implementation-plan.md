@@ -2453,6 +2453,26 @@ lib7件を追加。状態と全prefix/root・旧actorUID非遡及、各map全キ
 
 連続更新は、保全の明示作成、厳密な履歴形式、短命資格と中断復旧の実装・検証が揃うまで拒否する。
 
+#### 二回目以降の履歴と復旧の設計案
+
+初回の三kindと既存履歴の解釈を維持する。二回目以降には `key_passphrase_rotation_started`、`key_passphrase_rotation_prepared`、`key_passphrase_rotation_completed` を割り当てる。外側のsnapshotとmarkerの版・初回root・既存prefixを保持し、旧デコーダーは最初の新kindで拒否する。新デコーダーは初回完了または直前の連続更新完了からのみ新開始を認め、新開始→新準備→新完了の順で一回を構成する。初回と連続更新の開始・準備・完了を同じ回で混在させない。論理完了とguardの保存確認は別に扱う。
+
+| 新kind | 共通欄に加える厳密なキーと束縛 |
+|---|---|
+| `key_passphrase_rotation_started` | 初回開始と同じ `previous_snapshot_sha256`、`name`、`old_identity`、`old_ciphertext_sha256`、`new_ciphertext_sha256`、`new_ciphertext_length`、`public_key`、`guard_identity` に、`previous_completed_operation_id` と `preserved` を加える。参照は直前完了の操作ID、旧identityは直前完了のinstalled identityと全項目一致、旧hash・名前・公開鍵は直前回の開始に束縛する。新旧hashは異なる。 |
+| `key_passphrase_rotation_prepared` | `previous_snapshot_sha256`、`started_operation_id`、`new_identity`。直前の新開始と新暗号文長に束縛し、新一時鍵のidentityを記録する。 |
+| `key_passphrase_rotation_completed` | `previous_snapshot_sha256`、`started_operation_id`、`prepared_operation_id`、`installed_identity`、`disposition`。直前の新準備とその新開始を参照する。準備済み新鍵と交換後identityの関係、旧暗号文の整理結果は初回と同じ制約を用いる。 |
+
+各回の `preserved` は `directory`、`name`、`identity` の三キーだけを持つ。既存の再開eventと同じ各欄の型・所有者・mode・nlink条件を適用し、directoryのdevとfileのdev、旧暗号文長と保全file長を一致させる。元領域と異なるdirectory identityを要求し、保全fileは現在鍵・guardと異なるinodeとする。保全の暗号文hashと公開鍵は同じ開始eventの旧hash・公開鍵を用いる。全世代の保全を保持するため、既記録の保全先と同じdirectory identity・名前の組、または同じfileのdev・inoの組は新たな保全として認めない。復旧対象を同じ公開鍵だけで照合しない。共通欄、識別子の幅、actor、正規CBOR、全prefix hash、操作IDの重複拒否は現行契約を用いる。履歴上限は1 MiB・1024件とし、開始前に三件分を最悪値で予約する。途中prefixの検査も残り各件の予約を確かめる。
+
+保全の明示作成は直前完了控え・通常名・空き保全名を入力とし、元領域の状態・対象・両directoryを保持して照合する。コピー先は非上書きで保存し、完全一致、認証、両fileと両directoryの今回の保存確認を行う。保存成否が不明な候補は保持して明示確認に委ねる。保全作成の結果から更新を自動で開始しない。更新では直前完了控えと現在の別領域保全を再指定し、現在鍵と保全の完全bytesを比較する。控えもコピー作成結果も認証の代替にしない。
+
+中断復旧の入力には、直前完了控え、対象回の段階控え、その回の保全先、および初回再開・全整理・それ以前の全連続更新に対応する保全先を含める。各保全先を記録と一対一に照合し、保持fd、安全なdirectory、完全暗号文hash、対応する秘密による認証、期待公開鍵と今回のfile/directory fsyncを確認する。現在鍵と保全がともに現存する配置では完全bytesも比較する。元の旧鍵がすでに整理された配置では、記録済み旧hashと保全を照合する。秘密は対話端末で取得し、履歴や控えへ入れない。
+
+各追記は初回と同じく明示控えの出力・flush後に行う。復旧は当該回の固定名と記録された一時名にある完全な候補だけを扱い、先行回の控えや候補を採用しない。開始・準備・交換・整理／完了追記・解除は別境界とし、完了が固定されかつ一時名が正確不在のときだけ、記録guardの解除または正確不在の今回保存確認に進む。guardなしの固定完了から過去の保存成功や次回の開始資格を推定しない。欠損候補・不完全候補・不正配置は保全停止とする。
+
+実装順は厳密codecと独立固定例、明示保全作成、短命資格と各段階の復旧、CLIの順とする。初回履歴の回帰、旧デコーダーの拒否、新旧kindの混在、前回参照・保全identityの不一致、全保全参照の欠落、容量境界と各中断配置を確認してから連続更新を有効にする。
+
 #### 接続前の受入条件
 
 - 初回の資格取得・破棄・一回限りの消費、誤控え、別領域・別inode、同一公開鍵で暗号文不一致、全保全の参照漏れ、未知予約名、容量不足を確認する。
