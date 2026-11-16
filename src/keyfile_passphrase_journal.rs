@@ -4,6 +4,9 @@ use super::*;
 const BEGIN: &str = "key_passphrase_change_started";
 const PREPARE: &str = "key_passphrase_change_prepared";
 const FINISH: &str = "key_passphrase_change_completed";
+const ROTATE_BEGIN: &str = "key_passphrase_rotation_started";
+const ROTATE_PREPARE: &str = "key_passphrase_rotation_prepared";
+const ROTATE_FINISH: &str = "key_passphrase_rotation_completed";
 const REMOVED: &str = "removed_retained_old_ciphertext";
 const ABSENT_OLD: &str = "confirmed_old_ciphertext_absent";
 
@@ -19,12 +22,24 @@ pub(super) fn additional_keys(kind: &str) -> Option<&'static [&'static str]> {
             "public_key",
             "guard_identity",
         ]),
-        PREPARE => Some(&[
+        ROTATE_BEGIN => Some(&[
+            "previous_snapshot_sha256",
+            "name",
+            "old_identity",
+            "old_ciphertext_sha256",
+            "new_ciphertext_sha256",
+            "new_ciphertext_length",
+            "public_key",
+            "guard_identity",
+            "previous_completed_operation_id",
+            "preserved",
+        ]),
+        PREPARE | ROTATE_PREPARE => Some(&[
             "previous_snapshot_sha256",
             "started_operation_id",
             "new_identity",
         ]),
-        FINISH => Some(&[
+        FINISH | ROTATE_FINISH => Some(&[
             "previous_snapshot_sha256",
             "started_operation_id",
             "prepared_operation_id",
@@ -55,16 +70,82 @@ fn validate_begin(event: &Value, resumed: &Value, source: &[u8], owner: [u8; 4])
             return invalid();
         }
     }
+    validate_begin_fields(event, source, owner)
+}
+
+fn validate_begin_fields(event: &Value, source: &[u8], owner: [u8; 4]) -> Result<()> {
     let guard = field(event, "guard_identity")?;
     source_identity(guard, source, owner)?;
     let new_length = integer(field(event, "new_ciphertext_length")?)?;
     if !(1..=MAX_KEYFILE_BYTES as i64).contains(&new_length)
         || u64::from_be_bytes(bytes(field(guard, "length")?)?) != 49
-        || field(guard, "ino")? == field(field(current, "identity")?, "ino")?
+        || field(guard, "ino")? == field(field(event, "old_identity")?, "ino")?
         || bytes::<32>(field(event, "new_ciphertext_sha256")?)?
             == bytes::<32>(field(event, "old_ciphertext_sha256")?)?
     {
         return invalid();
+    }
+    Ok(())
+}
+
+fn same_inode(a: &Value, b: &Value) -> Result<bool> {
+    Ok(field(a, "dev")? == field(b, "dev")? && field(a, "ino")? == field(b, "ino")?)
+}
+
+fn validate_rotation_begin(
+    event: &Value,
+    prior: &[Value],
+    source: &[u8],
+    owner: [u8; 4],
+) -> Result<()> {
+    let [.., started, _, completed] = prior else {
+        return invalid();
+    };
+    for (actual, record, expected) in [
+        ("previous_completed_operation_id", completed, "operation_id"),
+        ("old_identity", completed, "installed_identity"),
+        ("old_ciphertext_sha256", started, "new_ciphertext_sha256"),
+        ("name", started, "name"),
+        ("public_key", started, "public_key"),
+    ] {
+        if field(event, actual)? != field(record, expected)? {
+            return invalid();
+        }
+    }
+    validate_begin_fields(event, source, owner)?;
+    let preserved = field(event, "preserved")?;
+    keys(preserved, &["directory", "name", "identity"])?;
+    let preserved_name = field(preserved, "name")?;
+    name(text(preserved_name)?).map_err(|_| KeyFileError::RecoveryStateInvalid)?;
+    let dir = field(preserved, "directory")?;
+    keys(dir, &["dev", "ino", "uid"])?;
+    let dev = bytes::<8>(field(dir, "dev")?)?;
+    let ino = bytes::<8>(field(dir, "ino")?)?;
+    let file = field(preserved, "identity")?;
+    identity(file, owner)?;
+    let old = field(event, "old_identity")?;
+    if bytes::<4>(field(dir, "uid")?)? != owner
+        || (dev == source[53..61] && ino == source[61..69])
+        || bytes::<8>(field(file, "dev")?)? != dev
+        || field(file, "length")? != field(old, "length")?
+        || same_inode(file, old)?
+        || same_inode(file, field(event, "guard_identity")?)?
+    {
+        return invalid();
+    }
+    for previous in prior {
+        if matches!(
+            text(field(previous, "kind")?)?,
+            STARTED | RESUMED | ROTATE_BEGIN
+        ) {
+            let saved = field(previous, "preserved")?;
+            if same_inode(file, field(saved, "identity")?)?
+                || (same_inode(dir, field(saved, "directory")?)?
+                    && preserved_name == field(saved, "name")?)
+            {
+                return invalid();
+            }
+        }
     }
     Ok(())
 }
@@ -125,7 +206,7 @@ fn maximum_event_bytes(kind: &str, sequence: usize, identity: Value) -> Result<u
         ("previous_snapshot_sha256", hash()),
         ("started_operation_id", hash()),
     ];
-    if kind == PREPARE {
+    if matches!(kind, PREPARE | ROTATE_PREPARE) {
         fields.push(("new_identity", identity));
     } else {
         fields.extend([
@@ -215,6 +296,17 @@ pub(super) fn reserved_fits(
     needs_prepare: bool,
     limit: usize,
 ) -> Result<bool> {
+    journal_tail_fits(count, prefix_bytes, identity, needs_prepare, false, limit)
+}
+
+fn journal_tail_fits(
+    count: usize,
+    prefix_bytes: usize,
+    identity: &Value,
+    needs_prepare: bool,
+    rotation: bool,
+    limit: usize,
+) -> Result<bool> {
     let final_count = count + if needs_prepare { 2 } else { 1 };
     if final_count > 1024 {
         return Ok(false);
@@ -233,11 +325,19 @@ pub(super) fn reserved_fits(
         }
     }
     let prep_bytes = if needs_prepare {
-        maximum_event_bytes(PREPARE, count + 1, widest.clone())?
+        maximum_event_bytes(
+            if rotation { ROTATE_PREPARE } else { PREPARE },
+            count + 1,
+            widest.clone(),
+        )?
     } else {
         0
     };
-    let finish_bytes = maximum_event_bytes(FINISH, final_count, widest)?;
+    let finish_bytes = maximum_event_bytes(
+        if rotation { ROTATE_FINISH } else { FINISH },
+        final_count,
+        widest,
+    )?;
     Ok(
         prefix_bytes + prep_bytes + finish_bytes + array_head(final_count) - array_head(count)
             <= limit,
@@ -316,6 +416,44 @@ pub(super) fn validate(
         (FINISH, PREPARE) => {
             validate_finish(event, previous, source, owner)?;
             Ok(KeyHistoryState::PassphraseChangeCompleted {
+                completed_operation_id: operation_id,
+            })
+        }
+        (ROTATE_BEGIN, FINISH | ROTATE_FINISH) => {
+            validate_rotation_begin(event, &events[..events.len() - 1], source, owner)?;
+            if !journal_tail_fits(
+                events.len(),
+                prefix_bytes,
+                field(event, "old_identity")?,
+                true,
+                true,
+                limit,
+            )? {
+                return invalid();
+            }
+            Ok(KeyHistoryState::PassphraseRotationStarted {
+                started_operation_id: operation_id,
+            })
+        }
+        (ROTATE_PREPARE, ROTATE_BEGIN) => {
+            validate_prepare(event, previous, source, owner)?;
+            if !journal_tail_fits(
+                events.len(),
+                prefix_bytes,
+                field(event, "new_identity")?,
+                false,
+                true,
+                limit,
+            )? {
+                return invalid();
+            }
+            Ok(KeyHistoryState::PassphraseRotationPrepared {
+                prepared_operation_id: operation_id,
+            })
+        }
+        (ROTATE_FINISH, ROTATE_PREPARE) => {
+            validate_finish(event, previous, source, owner)?;
+            Ok(KeyHistoryState::PassphraseRotationCompleted {
                 completed_operation_id: operation_id,
             })
         }

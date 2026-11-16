@@ -46,6 +46,15 @@ pub enum KeyHistoryState {
     PassphraseChangeCompleted {
         completed_operation_id: [u8; 32],
     },
+    PassphraseRotationStarted {
+        started_operation_id: [u8; 32],
+    },
+    PassphraseRotationPrepared {
+        prepared_operation_id: [u8; 32],
+    },
+    PassphraseRotationCompleted {
+        completed_operation_id: [u8; 32],
+    },
 }
 
 /// 現在の有界読取りの整合だけ。認証・過去のfsync・保全確定の証明ではない。
@@ -383,6 +392,9 @@ impl KeyDirectory {
             KeyHistoryState::PassphraseChangeStarted { .. }
                 | KeyHistoryState::PassphraseChangePrepared { .. }
                 | KeyHistoryState::PassphraseChangeCompleted { .. }
+                | KeyHistoryState::PassphraseRotationStarted { .. }
+                | KeyHistoryState::PassphraseRotationPrepared { .. }
+                | KeyHistoryState::PassphraseRotationCompleted { .. }
         ) {
             return invalid();
         }

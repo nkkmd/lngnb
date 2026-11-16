@@ -104,7 +104,7 @@ fn passphrase_journal_fixed_prefixes_match_independent_python() {
 }
 
 #[test]
-fn current_decoder_rejects_independent_rotation_prefixes() {
+fn passphrase_journal_accepts_independent_rotation_prefixes() {
     let python = std::env::var_os("LNGNB_REFERENCE_PYTHON").expect("reference python");
     let output = Command::new(python)
         .args(["tests/key_resume_reference.py", "--rotation-journal"])
@@ -133,15 +133,60 @@ fn current_decoder_rejects_independent_rotation_prefixes() {
         "e59b2e97432d3527493e901186b9fdef6c5952318c5ba0a1db8b35b0ee0f058c",
     ];
     assert_eq!(rotations.len(), hashes.len());
-    for (prefix, hash) in rotations.iter().zip(hashes) {
+    for (i, (prefix, hash)) in rotations.iter().zip(hashes).enumerate() {
         let raw = data_encoding::HEXLOWER
             .decode(prefix.as_str().unwrap().as_bytes())
             .unwrap();
         assert_eq!(data_encoding::HEXLOWER.encode(&Sha256::digest(&raw)), hash);
-        assert!(matches!(
-            decode_prefix(&raw),
-            Err(KeyFileError::RecoveryStateInvalid)
-        ));
+        let operation_id = id(i + 6);
+        let state = match i % 3 {
+            0 => KeyHistoryState::PassphraseRotationStarted {
+                started_operation_id: operation_id,
+            },
+            1 => KeyHistoryState::PassphraseRotationPrepared {
+                prepared_operation_id: operation_id,
+            },
+            _ => KeyHistoryState::PassphraseRotationCompleted {
+                completed_operation_id: operation_id,
+            },
+        };
+        assert_eq!(decode_prefix(&raw).unwrap().state, state);
+
+        let mut malformed = cbor::decode(&raw).unwrap();
+        let Value::Array(mut events) = field(&malformed, "events").unwrap().clone() else {
+            panic!()
+        };
+        let event = events.last_mut().unwrap();
+        match i % 3 {
+            0 => set(event, "previous_completed_operation_id", b(id(1))),
+            1 => set(event, "kind", t(PREPARE)),
+            _ => set(event, "prepared_operation_id", b(id(1))),
+        }
+        set(&mut malformed, "events", Value::Array(events));
+        assert!(decode_prefix(&encoded(&malformed).unwrap()).is_err());
+    }
+
+    let raw = data_encoding::HEXLOWER
+        .decode(rotations[3].as_str().unwrap().as_bytes())
+        .unwrap();
+    let snapshot = cbor::decode(&raw).unwrap();
+    let Value::Array(events) = field(&snapshot, "events").unwrap() else {
+        panic!()
+    };
+    let previous = field(&events[5], "preserved").unwrap();
+    let current = field(events.last().unwrap(), "preserved").unwrap();
+    for (key, value) in [
+        ("name", field(previous, "name").unwrap().clone()),
+        ("identity", field(previous, "identity").unwrap().clone()),
+        ("name", t("../invalid")),
+    ] {
+        let mut invalid_copy = current.clone();
+        set(&mut invalid_copy, key, value);
+        let mut events = events.clone();
+        set(events.last_mut().unwrap(), "preserved", invalid_copy);
+        let mut malformed = snapshot.clone();
+        set(&mut malformed, "events", Value::Array(events));
+        assert!(decode_prefix(&encoded(&malformed).unwrap()).is_err());
     }
 }
 
