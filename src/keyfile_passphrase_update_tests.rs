@@ -259,6 +259,21 @@ fn rotation_preservation_uses_the_fixed_completed_ciphertext_without_overwriting
     };
     assert!(verify(source, &mut f.backups, &proofs[..1]).is_err());
     verify(source, &mut f.backups, &proofs).unwrap();
+    let check_capacity = |source: &mut KeyDirectory, backups: &mut [KeyDirectory], length| {
+        source.verify_passphrase_rotation_capacity(
+            &completed,
+            "publisher",
+            "different public passphrase",
+            backups,
+            0,
+            "next-copy",
+            &proofs,
+            length,
+        )
+    };
+    assert!(check_capacity(source, &mut f.backups, 0).is_err());
+    assert!(check_capacity(source, &mut f.backups, MAX_KEYFILE_BYTES + 1).is_err());
+    check_capacity(source, &mut f.backups, current.len()).unwrap();
     assert_eq!(stdfs::read(path).unwrap(), current);
     assert_eq!(
         stdfs::read(f.a.0.join(initial_state::STATE)).unwrap(),

@@ -269,7 +269,7 @@ pub(in super::super) fn first_change_fits(
 }
 
 // 開始記録の既知の名前・保全先・暗号文長を含め、未確定の時刻は最大幅で予約する。
-pub(super) fn start_reservation_fits(
+pub(in super::super) fn start_reservation_fits(
     count: usize,
     prefix_bytes: usize,
     begin: &Value,
