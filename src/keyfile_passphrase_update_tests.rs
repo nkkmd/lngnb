@@ -230,6 +230,35 @@ fn rotation_preservation_uses_the_fixed_completed_ciphertext_without_overwriting
         ),
         Err(KeyFileError::Exists),
     );
+    let proofs = [
+        KeyResumePreservation {
+            completed_operation_id: f.ids[0],
+            directory_index: f.indices[0],
+            name: &f.names[0],
+            passphrase: &f.pass,
+        },
+        KeyResumePreservation {
+            completed_operation_id: resume.operation_id,
+            directory_index: 0,
+            name: "saved",
+            passphrase: &f.pass,
+        },
+    ];
+    let verify = |source: &mut KeyDirectory,
+                  backups: &mut [KeyDirectory],
+                  proofs: &[KeyResumePreservation<'_>]| {
+        source.verify_all_passphrase_rotation_preservations(
+            &completed,
+            "publisher",
+            "different public passphrase",
+            backups,
+            0,
+            "next-copy",
+            proofs,
+        )
+    };
+    assert!(verify(source, &mut f.backups, &proofs[..1]).is_err());
+    verify(source, &mut f.backups, &proofs).unwrap();
     assert_eq!(stdfs::read(path).unwrap(), current);
     assert_eq!(
         stdfs::read(f.a.0.join(initial_state::STATE)).unwrap(),

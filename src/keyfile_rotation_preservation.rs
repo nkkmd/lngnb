@@ -115,6 +115,70 @@ impl FixedRotationKey {
         Ok(())
     }
 
+    fn open_history_preservations(
+        &self,
+        backups: &[KeyDirectory],
+        proofs: &[KeyResumePreservation<'_>],
+        used: &mut [bool],
+    ) -> Result<Vec<Preservation>> {
+        let events = array(field(&self.history, "events")?)?;
+        let mut proofs = proofs.iter();
+        let mut held = Vec::new();
+        for (index, event) in events.iter().enumerate().skip(1) {
+            let (record, target, hash_key) = match string(field(event, "kind")?)? {
+                "residue_cleanup_completed" => {
+                    let started = &events[index - 1];
+                    (started, field(started, "target")?, "ciphertext_sha256")
+                }
+                "key_changes_resumed" => (event, field(event, "current")?, "ciphertext_sha256"),
+                "key_passphrase_rotation_completed" => {
+                    let started = &events[index - 2];
+                    (started, started, "old_ciphertext_sha256")
+                }
+                _ => continue,
+            };
+            let proof = proofs.next().ok_or(KeyFileError::RecoveryStateInvalid)?;
+            if proof.completed_operation_id != id(field(event, "operation_id")?)? {
+                return invalid();
+            }
+            let directory = backups
+                .get(proof.directory_index)
+                .ok_or(KeyFileError::RecoveryStateInvalid)?;
+            let saved = field(record, "preserved")?;
+            name(proof.name)?;
+            if proof.name != string(field(saved, "name")?)?
+                || !equal(
+                    field(saved, "directory")?,
+                    &KeyDirectoryIdentity::from_metadata(&io(directory.dir.metadata())?).value(),
+                )?
+            {
+                return invalid();
+            }
+            used[proof.directory_index] = true;
+            let kept = HeldFile::open(directory, proof.name, MAX_KEYFILE_BYTES)?;
+            if KeyFileIdentity::from_metadata(&kept.metadata)
+                != state_history::recorded_file_identity(field(saved, "identity")?)?
+                || <[u8; 32]>::from(Sha256::digest(&kept.bytes)) != id(field(target, hash_key)?)?
+            {
+                return Err(KeyFileError::RecoveryChanged);
+            }
+            if unlock(&kept.bytes, proof.passphrase)?.public_key()
+                != id(field(target, "public_key")?)?
+            {
+                return Err(KeyFileError::UnexpectedPublicKey);
+            }
+            held.push(Preservation {
+                directory: proof.directory_index,
+                name: proof.name.into(),
+                held: kept,
+            });
+        }
+        if proofs.next().is_some() || used.iter().any(|used| !used) {
+            return invalid();
+        }
+        Ok(held)
+    }
+
     fn sync(&self, source: &KeyDirectory, current_name: &str) -> Result<()> {
         self.key.sync()?;
         self.marker.sync()?;
@@ -221,6 +285,68 @@ impl KeyDirectory {
         io(backup.dir.sync_all())?;
         backup.pending()?;
         kept.check(backup, backup_name, true)?;
+        fixed.recheck(self, current_name)?;
+        Ok(fixed.public)
+    }
+
+    /// 今回の完全一致コピーと、履歴に記録した全保全を同じ排他下で保存確認する。
+    /// proofsは履歴順に整理完了、明示再開、連続更新完了の各操作IDを指定する。
+    /// 成功は今回の照合のみ。履歴書込みや更新開始は行わない。
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_all_passphrase_rotation_preservations(
+        &mut self,
+        expected: &KeyStateDiagnostic,
+        current_name: &str,
+        passphrase: &str,
+        backups: &mut [KeyDirectory],
+        current_backup: usize,
+        backup_name: &str,
+        proofs: &[KeyResumePreservation<'_>],
+    ) -> Result<[u8; 32]> {
+        if proofs.len() >= 1024 || backups.len() > proofs.len() + 1 {
+            return invalid();
+        }
+        name(current_name)?;
+        name(backup_name)?;
+        let backup = backups
+            .get(current_backup)
+            .ok_or(KeyFileError::RecoveryStateInvalid)?;
+        let source_id = KeyDirectoryIdentity::from_metadata(&io(self.dir.metadata())?);
+        let backup_id = KeyDirectoryIdentity::from_metadata(&io(backup.dir.metadata())?);
+        if source_id.dev == backup_id.dev && source_id.ino == backup_id.ino {
+            return Err(KeyFileError::UnsafePath);
+        }
+        for directory in backups.iter() {
+            directory.pending()?;
+        }
+        let fixed = FixedRotationKey::open(self, expected, current_name, passphrase)?;
+        let current = HeldFile::open(backup, backup_name, MAX_KEYFILE_BYTES)?;
+        let candidate = KeyFileIdentity::from_metadata(&current.metadata);
+        fixed.reject_recorded_backup(backup_id, backup_name, Some(candidate))?;
+        if current.bytes != fixed.key.bytes
+            || (candidate.dev == fixed.key.metadata.dev()
+                && candidate.ino == fixed.key.metadata.ino())
+        {
+            return Err(KeyFileError::PreservationMismatch);
+        }
+        let mut used = vec![false; backups.len()];
+        used[current_backup] = true;
+        let past = fixed.open_history_preservations(backups, proofs, &mut used)?;
+        fixed.sync(self, current_name)?;
+        current.sync()?;
+        for saved in &past {
+            saved.held.sync()?;
+        }
+        for directory in backups.iter() {
+            io(directory.dir.sync_all())?;
+            directory.pending()?;
+        }
+        for saved in &past {
+            saved
+                .held
+                .check(&backups[saved.directory], &saved.name, true)?;
+        }
+        current.check(backup, backup_name, true)?;
         fixed.recheck(self, current_name)?;
         Ok(fixed.public)
     }
