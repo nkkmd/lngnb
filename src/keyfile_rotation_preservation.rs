@@ -188,6 +188,34 @@ impl FixedRotationKey {
     }
 }
 
+// 照合した領域と現物fdを、同じ排他の下で保持する。
+struct CheckedRotationPreservations<'a> {
+    source: &'a KeyDirectory,
+    backups: &'a [KeyDirectory],
+    current_name: &'a str,
+    fixed: FixedRotationKey,
+    preservations: Vec<Preservation>,
+}
+
+impl CheckedRotationPreservations<'_> {
+    fn sync_and_recheck(&self) -> Result<()> {
+        self.fixed.sync(self.source, self.current_name)?;
+        for saved in &self.preservations {
+            saved.held.sync()?;
+        }
+        for directory in self.backups {
+            io(directory.dir.sync_all())?;
+            directory.pending()?;
+        }
+        for saved in &self.preservations {
+            saved
+                .held
+                .check(&self.backups[saved.directory], &saved.name, true)?;
+        }
+        self.fixed.recheck(self.source, self.current_name)
+    }
+}
+
 impl KeyDirectory {
     /// 固定完了に対応する通常名の暗号文を、別領域の空き名へ非上書きで保存する。
     /// 履歴・元鍵・guardは変更しない。返却値は認証した公開鍵のみ。
@@ -303,7 +331,7 @@ impl KeyDirectory {
         backup_name: &str,
         proofs: &[KeyResumePreservation<'_>],
     ) -> Result<[u8; 32]> {
-        self.check_rotation_preservations(
+        self.hold_rotation_preservations(
             expected,
             current_name,
             passphrase,
@@ -313,6 +341,7 @@ impl KeyDirectory {
             proofs,
             None,
         )
+        .map(|checked| checked.fixed.public)
     }
 
     /// 同じ排他と現物fdで全保全を照合し、指定した新暗号文長で履歴三件分の容量を確認する。
@@ -332,7 +361,7 @@ impl KeyDirectory {
         if !(1..=MAX_KEYFILE_BYTES).contains(&new_ciphertext_length) {
             return invalid();
         }
-        self.check_rotation_preservations(
+        self.hold_rotation_preservations(
             expected,
             current_name,
             passphrase,
@@ -342,20 +371,21 @@ impl KeyDirectory {
             proofs,
             Some(new_ciphertext_length),
         )
+        .map(|checked| checked.fixed.public)
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn check_rotation_preservations(
-        &mut self,
+    fn hold_rotation_preservations<'a>(
+        &'a self,
         expected: &KeyStateDiagnostic,
-        current_name: &str,
+        current_name: &'a str,
         passphrase: &str,
-        backups: &mut [KeyDirectory],
+        backups: &'a [KeyDirectory],
         current_backup: usize,
         backup_name: &str,
         proofs: &[KeyResumePreservation<'_>],
         new_ciphertext_length: Option<usize>,
-    ) -> Result<[u8; 32]> {
+    ) -> Result<CheckedRotationPreservations<'a>> {
         if proofs.len() >= 1024 || backups.len() > proofs.len() + 1 {
             return invalid();
         }
@@ -430,22 +460,21 @@ impl KeyDirectory {
                 return invalid();
             }
         }
-        fixed.sync(self, current_name)?;
-        current.sync()?;
-        for saved in &past {
-            saved.held.sync()?;
-        }
-        for directory in backups.iter() {
-            io(directory.dir.sync_all())?;
-            directory.pending()?;
-        }
-        for saved in &past {
-            saved
-                .held
-                .check(&backups[saved.directory], &saved.name, true)?;
-        }
-        current.check(backup, backup_name, true)?;
-        fixed.recheck(self, current_name)?;
-        Ok(fixed.public)
+        let mut preservations = Vec::with_capacity(past.len() + 1);
+        preservations.push(Preservation {
+            directory: current_backup,
+            name: backup_name.into(),
+            held: current,
+        });
+        preservations.extend(past);
+        let checked = CheckedRotationPreservations {
+            source: self,
+            backups,
+            current_name,
+            fixed,
+            preservations,
+        };
+        checked.sync_and_recheck()?;
+        Ok(checked)
     }
 }
