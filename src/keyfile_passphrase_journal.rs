@@ -244,18 +244,6 @@ pub(in super::super) fn first_change_fits(
         return Ok(false);
     }
     let hash = || Value::Bytes(vec![0; 32]);
-    let mut guard = current_identity.clone();
-    let Value::Map(fields) = &mut guard else {
-        return invalid();
-    };
-    // guardの可変整数を最大符号化長にする。length等のbyte stringは固定幅。
-    for (key, value) in fields {
-        match key.as_str() {
-            "mtime_seconds" | "ctime_seconds" => *value = Value::Int(i64::MAX),
-            "mtime_nanoseconds" | "ctime_nanoseconds" => *value = Value::Int(999_999_999),
-            _ => (),
-        }
-    }
     let begin = Value::Map(
         [
             ("sequence", Value::Int((count + 1) as i64)),
@@ -271,22 +259,63 @@ pub(in super::super) fn first_change_fits(
             ("new_ciphertext_sha256", hash()),
             ("new_ciphertext_length", Value::Int(new_length as i64)),
             ("public_key", hash()),
-            ("guard_identity", guard),
+            ("guard_identity", current_identity.clone()),
         ]
         .into_iter()
         .map(|(key, value)| (key.into(), value))
         .collect(),
     );
+    start_reservation_fits(count, prefix_bytes, &begin, limit)
+}
+
+// 開始記録の既知の名前・保全先・暗号文長を含め、未確定の時刻は最大幅で予約する。
+pub(super) fn start_reservation_fits(
+    count: usize,
+    prefix_bytes: usize,
+    begin: &Value,
+    limit: usize,
+) -> Result<bool> {
+    if count > 1021 || prefix_bytes > limit {
+        return Ok(false);
+    }
+    let mut widest = begin.clone();
+    let Value::Map(fields) = &mut widest else {
+        return invalid();
+    };
+    for (key, value) in fields {
+        match key.as_str() {
+            "recorded_unix_seconds" => *value = Value::Int(i64::MAX),
+            "guard_identity" => {
+                let Value::Map(guard) = value else {
+                    return invalid();
+                };
+                for (key, value) in guard {
+                    match key.as_str() {
+                        "mtime_seconds" | "ctime_seconds" => *value = Value::Int(i64::MAX),
+                        "mtime_nanoseconds" | "ctime_nanoseconds" => {
+                            *value = Value::Int(999_999_999)
+                        }
+                        _ => (),
+                    }
+                }
+            }
+            _ => (),
+        }
+    }
     let Some(started_size) = prefix_bytes
-        .checked_add(encoded(&begin)?.len())
+        .checked_add(encoded(&widest)?.len())
         .and_then(|size| size.checked_add(array_head(count + 1) - array_head(count)))
     else {
         return Ok(false);
     };
-    if started_size > limit {
-        return Ok(false);
-    }
-    reserved_fits(count + 1, started_size, current_identity, true, limit)
+    journal_tail_fits(
+        count + 1,
+        started_size,
+        field(begin, "old_identity")?,
+        true,
+        text(field(begin, "kind")?)? == ROTATE_BEGIN,
+        limit,
+    )
 }
 
 pub(super) fn reserved_fits(
@@ -420,14 +449,10 @@ pub(super) fn validate(
         }
         (ROTATE_BEGIN, FINISH | ROTATE_FINISH) => {
             validate_rotation_begin(event, &events[..events.len() - 1], source, owner)?;
-            if !journal_tail_fits(
-                events.len(),
-                prefix_bytes,
-                field(event, "old_identity")?,
-                true,
-                true,
-                limit,
-            )? {
+            let count = events.len() - 1;
+            let previous_size =
+                prefix_bytes - encoded(event)?.len() - (array_head(count + 1) - array_head(count));
+            if !start_reservation_fits(count, previous_size, event, limit)? {
                 return invalid();
             }
             Ok(KeyHistoryState::PassphraseRotationStarted {

@@ -331,7 +331,29 @@ fn rotation_journal_reserves_exact_tail_at_capacity_boundaries() {
         let mut snapshot = ready(base);
         let start_id = b(id(base + 1));
         let prepared_id = b(id(base + 2));
-        append(&mut snapshot, "key_passphrase_rotation_started", vec![]);
+        let prefix_size = encoded(&snapshot).unwrap().len();
+        append(
+            &mut snapshot,
+            "key_passphrase_rotation_started",
+            vec![
+                ("old_identity", identity.clone()),
+                ("guard_identity", identity.clone()),
+                ("previous_completed_operation_id", b(id(base))),
+                (
+                    "preserved",
+                    m(vec![
+                        ("name", t(&"p".repeat(128))),
+                        ("identity", identity.clone()),
+                    ]),
+                ),
+            ],
+        );
+        set(
+            event_mut(&mut snapshot, base),
+            "recorded_unix_seconds",
+            Value::Int(i64::MAX),
+        );
+        let widest_start = event_mut(&mut snapshot, base).clone();
         let started_size = encoded(&snapshot).unwrap().len();
         append(
             &mut snapshot,
@@ -363,6 +385,26 @@ fn rotation_journal_reserves_exact_tail_at_capacity_boundaries() {
             Value::Int(i64::MAX),
         );
         let limit = encoded(&snapshot).unwrap().len();
+        let mut start = widest_start;
+        set(&mut start, "recorded_unix_seconds", Value::Int(0));
+        let mut guard = identity.clone();
+        for key in [
+            "mtime_seconds",
+            "ctime_seconds",
+            "mtime_nanoseconds",
+            "ctime_nanoseconds",
+        ] {
+            set(&mut guard, key, Value::Int(0));
+        }
+        set(&mut start, "guard_identity", guard);
+        let reserve = |count, size, limit| {
+            journal::start_reservation_fits(count, size, &start, limit).unwrap()
+        };
+        assert!(reserve(base, prefix_size, limit));
+        assert!(!reserve(base, prefix_size, limit - 1));
+        assert!(!reserve(1022, prefix_size, limit));
+        assert!(!reserve(base, usize::MAX, usize::MAX));
+
         for (count, size, needs_prepare) in [
             (base + 1, started_size, true),
             (base + 2, prepared_size, false),
