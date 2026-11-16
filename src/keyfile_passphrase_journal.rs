@@ -299,7 +299,7 @@ pub(super) fn reserved_fits(
     journal_tail_fits(count, prefix_bytes, identity, needs_prepare, false, limit)
 }
 
-fn journal_tail_fits(
+pub(super) fn journal_tail_fits(
     count: usize,
     prefix_bytes: usize,
     identity: &Value,
@@ -307,10 +307,11 @@ fn journal_tail_fits(
     rotation: bool,
     limit: usize,
 ) -> Result<bool> {
-    let final_count = count + if needs_prepare { 2 } else { 1 };
-    if final_count > 1024 {
+    let remaining = if needs_prepare { 2 } else { 1 };
+    if count > 1024 - remaining || prefix_bytes > limit {
         return Ok(false);
     }
+    let final_count = count + remaining;
     let mut widest = identity.clone();
     let Value::Map(fields) = &mut widest else {
         return invalid();
@@ -338,10 +339,8 @@ fn journal_tail_fits(
         final_count,
         widest,
     )?;
-    Ok(
-        prefix_bytes + prep_bytes + finish_bytes + array_head(final_count) - array_head(count)
-            <= limit,
-    )
+    let tail_bytes = prep_bytes + finish_bytes + array_head(final_count) - array_head(count);
+    Ok(tail_bytes <= limit - prefix_bytes)
 }
 
 pub(super) fn validate(

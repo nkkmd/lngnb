@@ -319,6 +319,68 @@ fn passphrase_journal_reserves_exact_maximum_bytes_across_array_headers() {
 }
 
 #[test]
+fn rotation_journal_reserves_exact_tail_at_capacity_boundaries() {
+    let mut identity = file(1, 42, 512, 3u32.to_be_bytes());
+    for key in ["mtime_seconds", "ctime_seconds"] {
+        set(&mut identity, key, Value::Int(i64::MAX));
+    }
+    for key in ["mtime_nanoseconds", "ctime_nanoseconds"] {
+        set(&mut identity, key, Value::Int(999_999_999));
+    }
+    for base in [22, 254, 1021] {
+        let mut snapshot = ready(base);
+        let start_id = b(id(base + 1));
+        let prepared_id = b(id(base + 2));
+        append(&mut snapshot, "key_passphrase_rotation_started", vec![]);
+        let started_size = encoded(&snapshot).unwrap().len();
+        append(
+            &mut snapshot,
+            "key_passphrase_rotation_prepared",
+            vec![
+                ("started_operation_id", start_id.clone()),
+                ("new_identity", identity.clone()),
+            ],
+        );
+        set(
+            event_mut(&mut snapshot, base + 1),
+            "recorded_unix_seconds",
+            Value::Int(i64::MAX),
+        );
+        let prepared_size = encoded(&snapshot).unwrap().len();
+        append(
+            &mut snapshot,
+            "key_passphrase_rotation_completed",
+            vec![
+                ("started_operation_id", start_id),
+                ("prepared_operation_id", prepared_id),
+                ("installed_identity", identity.clone()),
+                ("disposition", t(REMOVED)),
+            ],
+        );
+        set(
+            event_mut(&mut snapshot, base + 2),
+            "recorded_unix_seconds",
+            Value::Int(i64::MAX),
+        );
+        let limit = encoded(&snapshot).unwrap().len();
+        for (count, size, needs_prepare) in [
+            (base + 1, started_size, true),
+            (base + 2, prepared_size, false),
+        ] {
+            let fits = |count, size, limit| {
+                journal::journal_tail_fits(count, size, &identity, needs_prepare, true, limit)
+                    .unwrap()
+            };
+            assert!(fits(count, size, limit));
+            assert!(!fits(count, size, limit - 1));
+            assert!(!fits(count, usize::MAX, usize::MAX));
+            assert!(!fits(count, usize::MAX, 0));
+            assert!(!fits(count + 1024, size, limit));
+        }
+    }
+}
+
+#[test]
 fn passphrase_journal_rejects_raw_duplicate_event_keys() {
     for (index, mut snapshot) in snapshots(2, ABSENT).into_iter().enumerate() {
         let event = event_mut(&mut snapshot, index + 2);
