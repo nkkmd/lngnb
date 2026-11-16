@@ -155,3 +155,64 @@ fn first_passphrase_update_flushes_before_every_append() {
         }
     }
 }
+
+#[test]
+fn rotation_preservation_uses_the_fixed_completed_ciphertext_without_overwriting() {
+    let mut f = Fixture::new(true, 1);
+    let resume = f.interrupt(S::OldSnapshotRemoved);
+    f.release(&resume, &mut |_| Ok(())).unwrap();
+    let KeyResumeRelease::RemovedRecordedGuard(completed) =
+        f.change_first(&resume, &mut Vec::new()).unwrap()
+    else {
+        panic!("expected first update to remove its guard")
+    };
+    let path = f.a.0.join("publisher");
+    let current = stdfs::read(&path).unwrap();
+    let history = stdfs::read(f.a.0.join(initial_state::STATE)).unwrap();
+    let preserved = f.areas[0].0.join("next-copy");
+    let source = f.source.as_mut().unwrap();
+    let backup = &mut f.backups[0];
+    let preserve =
+        |source: &mut KeyDirectory, backup: &mut KeyDirectory, expected, pass, target| {
+            source.preserve_key_for_passphrase_rotation(expected, "publisher", pass, backup, target)
+        };
+    let mut stale = completed;
+    stale.snapshot_hash[0] ^= 1;
+    assert!(
+        preserve(
+            source,
+            backup,
+            &stale,
+            "different public passphrase",
+            "next-copy"
+        )
+        .is_err()
+    );
+    assert!(preserve(source, backup, &completed, &f.pass, "next-copy").is_err());
+    assert!(!preserved.exists());
+    preserve(
+        source,
+        backup,
+        &completed,
+        "different public passphrase",
+        "next-copy",
+    )
+    .unwrap();
+    assert_eq!(stdfs::read(&preserved).unwrap(), current);
+    assert_eq!(
+        preserve(
+            source,
+            backup,
+            &completed,
+            "different public passphrase",
+            "next-copy"
+        ),
+        Err(KeyFileError::Exists),
+    );
+    assert_eq!(stdfs::read(path).unwrap(), current);
+    assert_eq!(
+        stdfs::read(f.a.0.join(initial_state::STATE)).unwrap(),
+        history
+    );
+    assert!(!f.a.0.join(recovery_hold::GUARD).exists());
+}
