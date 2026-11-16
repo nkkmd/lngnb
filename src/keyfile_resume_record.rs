@@ -851,3 +851,6 @@ impl KeyDirectory {
 
 #[path = "keyfile_passphrase_start.rs"]
 pub(super) mod passphrase_start;
+
+#[path = "keyfile_rotation_preservation.rs"]
+mod rotation_preservation;
