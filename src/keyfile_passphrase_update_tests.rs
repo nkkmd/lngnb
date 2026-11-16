@@ -199,6 +199,27 @@ fn rotation_preservation_uses_the_fixed_completed_ciphertext_without_overwriting
     )
     .unwrap();
     assert_eq!(stdfs::read(&preserved).unwrap(), current);
+    assert!(
+        source
+            .verify_key_preserved_for_passphrase_rotation(
+                &completed,
+                "publisher",
+                "different public passphrase",
+                backup,
+                "saved",
+            )
+            .is_err()
+    );
+    source
+        .verify_key_preserved_for_passphrase_rotation(
+            &completed,
+            "publisher",
+            "different public passphrase",
+            backup,
+            "next-copy",
+        )
+        .unwrap();
+
     assert_eq!(
         preserve(
             source,
