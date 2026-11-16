@@ -11,7 +11,7 @@ const ABSENT: &str = "confirmed_absent_on_recovery";
 const RESUMED: &str = "key_changes_resumed";
 #[path = "keyfile_passphrase_journal.rs"]
 mod journal;
-pub(super) use journal::first_change_fits;
+pub(super) use journal::{first_change_fits, start_reservation_fits};
 #[path = "keyfile_resume_codec.rs"]
 mod resume;
 pub(super) use resume::{

@@ -303,6 +303,59 @@ impl KeyDirectory {
         backup_name: &str,
         proofs: &[KeyResumePreservation<'_>],
     ) -> Result<[u8; 32]> {
+        self.check_rotation_preservations(
+            expected,
+            current_name,
+            passphrase,
+            backups,
+            current_backup,
+            backup_name,
+            proofs,
+            None,
+        )
+    }
+
+    /// 同じ排他と現物fdで全保全を照合し、指定した新暗号文長で履歴三件分の容量を確認する。
+    /// この確認はguardや履歴を作らず、後の書込みを許可する控えを発行しない。
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_passphrase_rotation_capacity(
+        &mut self,
+        expected: &KeyStateDiagnostic,
+        current_name: &str,
+        passphrase: &str,
+        backups: &mut [KeyDirectory],
+        current_backup: usize,
+        backup_name: &str,
+        proofs: &[KeyResumePreservation<'_>],
+        new_ciphertext_length: usize,
+    ) -> Result<[u8; 32]> {
+        if !(1..=MAX_KEYFILE_BYTES).contains(&new_ciphertext_length) {
+            return invalid();
+        }
+        self.check_rotation_preservations(
+            expected,
+            current_name,
+            passphrase,
+            backups,
+            current_backup,
+            backup_name,
+            proofs,
+            Some(new_ciphertext_length),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn check_rotation_preservations(
+        &mut self,
+        expected: &KeyStateDiagnostic,
+        current_name: &str,
+        passphrase: &str,
+        backups: &mut [KeyDirectory],
+        current_backup: usize,
+        backup_name: &str,
+        proofs: &[KeyResumePreservation<'_>],
+        new_ciphertext_length: Option<usize>,
+    ) -> Result<[u8; 32]> {
         if proofs.len() >= 1024 || backups.len() > proofs.len() + 1 {
             return invalid();
         }
@@ -332,6 +385,51 @@ impl KeyDirectory {
         let mut used = vec![false; backups.len()];
         used[current_backup] = true;
         let past = fixed.open_history_preservations(backups, proofs, &mut used)?;
+        if let Some(new_length) = new_ciphertext_length {
+            let events = array(field(&fixed.history, "events")?)?;
+            let completed = events.last().ok_or(KeyFileError::RecoveryStateInvalid)?;
+            let old_identity = KeyFileIdentity::from_metadata(&fixed.key.metadata).value();
+            // IDとhashは固定幅。guardの時刻は予約関数で最大幅に広げる。
+            let start = map(vec![
+                ("sequence", Value::Int((events.len() + 1) as i64)),
+                ("operation_id", bytes([0; 32])),
+                ("kind", text("key_passphrase_rotation_started")),
+                ("actor_uid", bytes(source_id.uid.to_be_bytes())),
+                ("recorded_unix_seconds", Value::Int(0)),
+                ("rules", text("lngnb-key-operations-1")),
+                ("previous_snapshot_sha256", bytes(expected.snapshot_hash)),
+                ("name", text(current_name)),
+                ("old_identity", old_identity.clone()),
+                (
+                    "old_ciphertext_sha256",
+                    bytes(<[u8; 32]>::from(Sha256::digest(&fixed.key.bytes))),
+                ),
+                ("new_ciphertext_sha256", bytes([0; 32])),
+                ("new_ciphertext_length", Value::Int(new_length as i64)),
+                ("public_key", bytes(fixed.public)),
+                ("guard_identity", old_identity),
+                (
+                    "previous_completed_operation_id",
+                    field(completed, "operation_id")?.clone(),
+                ),
+                (
+                    "preserved",
+                    map(vec![
+                        ("directory", backup_id.value()),
+                        ("name", text(backup_name)),
+                        ("identity", candidate.value()),
+                    ]),
+                ),
+            ]);
+            if !state_history::start_reservation_fits(
+                events.len(),
+                fixed.snapshot.bytes.len(),
+                &start,
+                initial_state::STATE_LIMIT,
+            )? {
+                return invalid();
+            }
+        }
         fixed.sync(self, current_name)?;
         current.sync()?;
         for saved in &past {
