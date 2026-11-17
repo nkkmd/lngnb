@@ -361,6 +361,48 @@ impl KeyPassphrasePreparedIntent {
 }
 
 impl KeyPassphraseCompletedIntent {
+    /// 次回更新の照合に使う完了控えを読み戻す。現物は別途照合する。
+    pub fn parse_previous_completion(line: &str) -> Result<KeyStateDiagnostic> {
+        let kind = line
+            .split(' ')
+            .next()
+            .ok_or(KeyFileError::RecoveryStateInvalid)?;
+        let rotation = match kind {
+            "key_passphrase_change_completed" => false,
+            "key_passphrase_rotation_completed" => true,
+            _ => return invalid(),
+        };
+        let mut fields = receipt_fields(line, kind)?;
+        let initial = KeyInitialState {
+            area_id: receipt_id(fields("area_id=")?)?,
+            snapshot_hash: receipt_id(fields("root=")?)?,
+            operation_id: receipt_id(fields("initial_operation_id=")?)?,
+            generation: receipt_generation(fields("initial_generation=")?)?,
+        };
+        let generation = receipt_generation(fields("before_generation=")?)?;
+        if initial.generation != 1 || !(4..=1024).contains(&generation) {
+            return invalid();
+        }
+        let before = KeyStateDiagnostic {
+            initial,
+            generation,
+            snapshot_hash: receipt_id(fields("before_hash=")?)?,
+            state: KeyHistoryState::Held,
+        };
+        let (after, _) = parse_receipt(line, kind, before, |id| {
+            if rotation {
+                KeyHistoryState::PassphraseRotationCompleted {
+                    completed_operation_id: id,
+                }
+            } else {
+                KeyHistoryState::PassphraseChangeCompleted {
+                    completed_operation_id: id,
+                }
+            }
+        })?;
+        Ok(after)
+    }
+
     /// 連続更新の完了控えを準備控えに結び付けて読み戻す。
     pub fn parse_rotation_receipt(
         line: &str,
