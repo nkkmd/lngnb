@@ -19,6 +19,19 @@ fn matches_rotation_key_identity(held: &HeldFile, expected: KeyFileIdentity, mov
     actual == expected
 }
 
+enum RotationOldKey<'a> {
+    Normal,
+    Moved(&'a str),
+    Preserved(&'a KeyDirectory, &'a str),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RotationAction {
+    RecoverHistory,
+    Exchange,
+    Complete,
+}
+
 impl FixedRotationKey {
     fn open(
         source: &KeyDirectory,
@@ -55,7 +68,7 @@ impl FixedRotationKey {
             marker,
             snapshot,
             value,
-            None,
+            RotationOldKey::Normal,
         )?;
         fixed.recheck(source, current_name)?;
         Ok(fixed)
@@ -70,7 +83,7 @@ impl FixedRotationKey {
         marker: HeldFile,
         snapshot: HeldFile,
         value: Value,
-        moved_path: Option<&str>,
+        location: RotationOldKey<'_>,
     ) -> Result<Self> {
         let completed_operation_id = match expected.state {
             KeyHistoryState::PassphraseChangeCompleted {
@@ -90,16 +103,26 @@ impl FixedRotationKey {
         {
             return invalid();
         }
-        let key = HeldFile::open(
-            source,
-            moved_path.unwrap_or(current_name),
-            MAX_KEYFILE_BYTES,
-        )?;
+        let (key, check_identity, moved) = match location {
+            RotationOldKey::Normal => (
+                HeldFile::open(source, current_name, MAX_KEYFILE_BYTES)?,
+                true,
+                false,
+            ),
+            RotationOldKey::Moved(path) => {
+                (HeldFile::open(source, path, MAX_KEYFILE_BYTES)?, true, true)
+            }
+            RotationOldKey::Preserved(directory, path) => (
+                HeldFile::open(directory, path, MAX_KEYFILE_BYTES)?,
+                false,
+                false,
+            ),
+        };
         let current_hash: [u8; 32] = Sha256::digest(&key.bytes).into();
         let public = id(field(started, "public_key")?)?;
         let expected =
             state_history::recorded_file_identity(field(completed, "installed_identity")?)?;
-        if !matches_rotation_key_identity(&key, expected, moved_path.is_some())
+        if (check_identity && !matches_rotation_key_identity(&key, expected, moved))
             || current_hash != id(field(started, "new_ciphertext_sha256")?)?
             || unlock(&key.bytes, passphrase)?.public_key() != public
         {
@@ -768,7 +791,7 @@ impl KeyDirectory {
             proofs,
             start,
             Some((prepared, new_passphrase)),
-            true,
+            RotationAction::Exchange,
             |mut context, _, _, _, _| {
                 let staged = context
                     .staged_key
@@ -786,6 +809,66 @@ impl KeyDirectory {
                     before_exchange,
                     hook,
                 )
+            },
+        )
+    }
+
+    /// 交換済み配置で旧一時鍵を整理し、完了控えをflushしてから完了を記録する。
+    #[allow(clippy::too_many_arguments)]
+    pub fn complete_passphrase_rotation(
+        &mut self,
+        current_name: &str,
+        old_passphrase: &str,
+        new_passphrase: &str,
+        backups: &mut [KeyDirectory],
+        current_backup: usize,
+        backup_name: &str,
+        proofs: &[KeyResumePreservation<'_>],
+        start: &KeyPassphraseStartIntent,
+        prepared: &KeyPassphrasePreparedIntent,
+        receipts: &mut impl std::io::Write,
+    ) -> Result<KeyStateDiagnostic> {
+        self.with_passphrase_rotation_snapshot(
+            current_name,
+            old_passphrase,
+            backups,
+            current_backup,
+            backup_name,
+            proofs,
+            start,
+            Some((prepared, new_passphrase)),
+            RotationAction::Complete,
+            |mut context, _, _, _, _| {
+                use passphrase_start::{KeyPassphraseCleanup, PreparedKeyPassphraseCompletion};
+                let key_name = passphrase_start::staged_name(&start.operation_id);
+                let cleanup = if let Some(staged) = context.staged_key.take() {
+                    context.qualify(Some(&key_name), false, &mut |_| Ok(()), &mut || {
+                        staged.1.check(context.source, &staged.0, true)
+                    })?;
+                    context = passphrase_start::exchange::remove_passphrase_old_key(
+                        context,
+                        staged,
+                        key_name,
+                        &mut |_| Ok(()),
+                    )?;
+                    KeyPassphraseCleanup::RemovedRetainedOldCiphertext
+                } else {
+                    context.qualify(None, false, &mut |_| Ok(()), &mut || {
+                        absent(context.source, &key_name)
+                    })?;
+                    KeyPassphraseCleanup::ConfirmedOldCiphertextAbsent
+                };
+                let completion =
+                    PreparedKeyPassphraseCompletion::new(context, cleanup, start, prepared)?;
+                let intent = completion.intent();
+                passphrase_start::update::receipt(
+                    receipts,
+                    "key_passphrase_rotation_completed",
+                    intent.before,
+                    intent.after,
+                    intent.operation_id,
+                )?;
+                completion.record()
             },
         )
     }
@@ -811,7 +894,7 @@ impl KeyDirectory {
             proofs,
             start,
             prepared,
-            false,
+            RotationAction::RecoverHistory,
             |context, temporary, temp, needs_exchange, intent| {
                 recovery::recover_snapshot(
                     context,
@@ -837,7 +920,7 @@ impl KeyDirectory {
         proofs: &[KeyResumePreservation<'_>],
         start: &KeyPassphraseStartIntent,
         prepared: Option<(&KeyPassphrasePreparedIntent, &str)>,
-        exchange_key: bool,
+        action: RotationAction,
         apply: impl FnOnce(
             PreparedKeyResume<'_>,
             Option<&HeldFile>,
@@ -890,7 +973,7 @@ impl KeyDirectory {
         );
         inventory_with_key(
             self,
-            (!exchange_key).then_some(temp.as_str()),
+            (action == RotationAction::RecoverHistory).then_some(temp.as_str()),
             key_name.as_deref(),
         )?;
         let fixed = HeldFile::open(self, initial_state::STATE, initial_state::STATE_LIMIT)?;
@@ -905,7 +988,9 @@ impl KeyDirectory {
         let decode =
             |file: &HeldFile| recovery::decode_snapshot(&file.bytes, &source_marker, &intent);
         let needs_exchange = decode(&fixed)? == intent.before;
-        if exchange_key && (prepared.is_none() || needs_exchange || temporary.is_some()) {
+        if action != RotationAction::RecoverHistory
+            && (prepared.is_none() || needs_exchange || temporary.is_some())
+        {
             return invalid();
         }
         let (new, old) = if needs_exchange {
@@ -944,7 +1029,7 @@ impl KeyDirectory {
             return invalid();
         }
         let mut moved_path = None;
-        let staged_key = if let (Some(name), Some((_, new_passphrase))) =
+        let mut staged_key = if let (Some(name), Some((_, new_passphrase))) =
             (key_name.as_deref(), prepared)
         {
             let next = cbor::decode(&new.bytes).map_err(|_| KeyFileError::RecoveryStateInvalid)?;
@@ -955,7 +1040,7 @@ impl KeyDirectory {
                 state_history::recorded_file_identity(field(preparation, "new_identity")?)?;
             let mut path = name;
             let mut moved = false;
-            if exchange_key {
+            if action != RotationAction::RecoverHistory {
                 let normal = HeldFile::open(self, current_name, MAX_KEYFILE_BYTES)?;
                 let old_identity =
                     state_history::recorded_file_identity(field(event, "old_identity")?)?;
@@ -963,6 +1048,8 @@ impl KeyDirectory {
                     moved = true;
                     moved_path = Some(name);
                     path = current_name;
+                } else if action == RotationAction::Complete {
+                    return invalid();
                 }
             }
             let held = HeldFile::open(self, path, MAX_KEYFILE_BYTES)?;
@@ -1007,6 +1094,23 @@ impl KeyDirectory {
         }
         let new_bytes = new.bytes.clone();
         let history = cbor::decode(&completed).map_err(|_| KeyFileError::RecoveryStateInvalid)?;
+        let absent_old = if action == RotationAction::Complete {
+            let path = moved_path.ok_or(KeyFileError::RecoveryStateInvalid)?;
+            match absent(self, path) {
+                Ok(()) => true,
+                Err(KeyFileError::RecoveryChanged) => false,
+                Err(error) => return Err(error),
+            }
+        } else {
+            false
+        };
+        let location = if absent_old {
+            RotationOldKey::Preserved(backup, backup_name)
+        } else if let Some(path) = moved_path {
+            RotationOldKey::Moved(path)
+        } else {
+            RotationOldKey::Normal
+        };
         let fixed = FixedRotationKey::from_completed_history(
             self,
             &start_intent.before,
@@ -1015,7 +1119,7 @@ impl KeyDirectory {
             marker,
             fixed,
             history,
-            moved_path,
+            location,
         )?;
         if current.bytes != fixed.key.bytes {
             return Err(KeyFileError::PreservationMismatch);
@@ -1040,15 +1144,31 @@ impl KeyDirectory {
                     .metadata())?))
             })
             .collect::<Result<Vec<_>>>()?;
+        let (current_name, current, absent_names) = if absent_old {
+            let installed = staged_key
+                .take()
+                .ok_or(KeyFileError::RecoveryStateInvalid)?;
+            (
+                installed.0,
+                installed.1,
+                vec![moved_path.ok_or(KeyFileError::RecoveryStateInvalid)?.into()],
+            )
+        } else {
+            (
+                moved_path.unwrap_or(current_name).into(),
+                fixed.key,
+                Vec::new(),
+            )
+        };
         let context = PreparedKeyResume {
             source: self,
             backups,
             source_identity,
             backup_identities,
-            current_name: moved_path.unwrap_or(current_name).into(),
-            current: fixed.key,
+            current_name,
+            current,
             preservations,
-            absent_names: Vec::new(),
+            absent_names,
             marker: fixed.marker,
             guard: Some(guard),
             state: fixed.snapshot,

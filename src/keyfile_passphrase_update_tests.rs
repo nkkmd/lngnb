@@ -463,6 +463,51 @@ fn rotation_start_and_prepare_wait_for_receipt_flush_before_recording() {
                 assert_eq!(stdfs::read(&staged).unwrap(), old_key);
                 assert_eq!(stdfs::read(&history).unwrap(), fixed);
                 assert!(f.a.0.join(recovery_hold::GUARD).exists());
+                let complete = |source: &mut KeyDirectory,
+                                backups: &mut [KeyDirectory],
+                                output: &mut Receipt| {
+                    source.complete_passphrase_rotation(
+                        "publisher",
+                        current_passphrase,
+                        new_passphrase,
+                        backups,
+                        0,
+                        "next-copy",
+                        &proofs,
+                        &start,
+                        &prepared,
+                        output,
+                    )
+                };
+                let mut failed = Receipt {
+                    fail_at: 1,
+                    ..Receipt::default()
+                };
+                assert!(matches!(
+                    complete(source, &mut f.backups, &mut failed),
+                    Err(KeyFileError::Io),
+                ));
+                assert_eq!(stdfs::read(&history).unwrap(), fixed);
+                assert!(!staged.exists());
+                assert!(f.a.0.join(recovery_hold::GUARD).exists());
+                let mut output = Receipt::default();
+                let completed = complete(source, &mut f.backups, &mut output).unwrap();
+                assert!(matches!(
+                    completed.state,
+                    KeyHistoryState::PassphraseRotationCompleted { .. }
+                ));
+                assert!(
+                    output
+                        .bytes
+                        .starts_with(b"key_passphrase_rotation_completed ")
+                );
+                assert_eq!(stdfs::read(&publisher).unwrap(), new_key);
+                assert_eq!(
+                    stdfs::read(f.areas[0].0.join("next-copy")).unwrap(),
+                    old_key
+                );
+                assert!(!staged.exists());
+                assert!(f.a.0.join(recovery_hold::GUARD).exists());
                 continue;
             }
             assert!(f.a.0.join(recovery_hold::GUARD).exists());
