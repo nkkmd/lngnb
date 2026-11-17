@@ -343,7 +343,7 @@ impl KeyDirectory {
             ));
         }
         // 一覧で許す予約名は交換の前後とも開始ID由来の一名だけ。
-        let mut staged = staged.ok_or(KeyFileError::RecoveryStateInvalid)?;
+        let staged = staged.ok_or(KeyFileError::RecoveryStateInvalid)?;
         let check = |context: &PreparedKeyResume<'_>, staged: &(String, HeldFile)| -> Result<()> {
             context.check(Some(&key_name))?;
             context
@@ -392,29 +392,48 @@ impl KeyDirectory {
             })()
             .map_err(|_| KeyFileError::CleanupUncertain);
         }
-        if !before_exchange {
-            return Ok(Outcome::Exchange(KeyPassphraseExchange::ConfirmedExchanged));
-        }
-        hook(ResumeStage::BeforeKeyExchange)?;
-        check(&context, &staged)?;
-        (|| -> Result<_> {
-            os(fs::renameat_with(
-                &context.source.dir,
-                current_name,
-                &context.source.dir,
-                key_name.as_str(),
-                RenameFlags::EXCHANGE,
-            ))?;
-            context.current.metadata = recovery::moved_metadata(&context.current)?;
-            staged.1.metadata = recovery::moved_metadata(&staged.1)?;
-            std::mem::swap(&mut context.current_name, &mut staged.0);
-            hook(ResumeStage::KeyExchanged)?;
-            check(&context, &staged)?;
-            io(context.source.dir.sync_all())?;
-            hook(ResumeStage::KeyExchangeDirectorySynced)?;
-            check(&context, &staged)?;
-            Ok(Outcome::Exchange(KeyPassphraseExchange::Exchanged))
-        })()
-        .map_err(|_| KeyFileError::CommitUncertain)
+        exchange_passphrase_pair(context, staged, &key_name, before_exchange, hook)
+            .map(Outcome::Exchange)
     }
+}
+
+/// 保存済みの二つの暗号文を交換し、交換後の配置を再確認する。
+pub(in super::super) fn exchange_passphrase_pair(
+    mut context: PreparedKeyResume<'_>,
+    mut staged: (String, HeldFile),
+    key_name: &str,
+    before_exchange: bool,
+    hook: &mut impl FnMut(ResumeStage) -> Result<()>,
+) -> Result<KeyPassphraseExchange> {
+    let check = |context: &PreparedKeyResume<'_>, staged: &(String, HeldFile)| -> Result<()> {
+        context.check(Some(key_name))?;
+        context
+            .state
+            .check(context.source, initial_state::STATE, true)?;
+        staged.1.check(context.source, &staged.0, true)
+    };
+    if !before_exchange {
+        return Ok(KeyPassphraseExchange::ConfirmedExchanged);
+    }
+    hook(ResumeStage::BeforeKeyExchange)?;
+    check(&context, &staged)?;
+    (|| -> Result<_> {
+        os(fs::renameat_with(
+            &context.source.dir,
+            context.current_name.as_str(),
+            &context.source.dir,
+            key_name,
+            RenameFlags::EXCHANGE,
+        ))?;
+        context.current.metadata = recovery::moved_metadata(&context.current)?;
+        staged.1.metadata = recovery::moved_metadata(&staged.1)?;
+        std::mem::swap(&mut context.current_name, &mut staged.0);
+        hook(ResumeStage::KeyExchanged)?;
+        check(&context, &staged)?;
+        io(context.source.dir.sync_all())?;
+        hook(ResumeStage::KeyExchangeDirectorySynced)?;
+        check(&context, &staged)?;
+        Ok(KeyPassphraseExchange::Exchanged)
+    })()
+    .map_err(|_| KeyFileError::CommitUncertain)
 }

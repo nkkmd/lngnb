@@ -419,6 +419,51 @@ fn rotation_start_and_prepare_wait_for_receipt_flush_before_recording() {
                     prepared.after
                 );
                 assert!(!f.a.0.join(temporary).exists());
+                let publisher = f.a.0.join("publisher");
+                let new_key = stdfs::read(&staged).unwrap();
+                let exchange = |source: &mut KeyDirectory,
+                                backups: &mut [KeyDirectory],
+                                secret: &str,
+                                mut hook: fn(S) -> Result<()>| {
+                    source.exchange_passphrase_rotation_with(
+                        "publisher",
+                        current_passphrase,
+                        secret,
+                        backups,
+                        0,
+                        "next-copy",
+                        &proofs,
+                        &start,
+                        &prepared,
+                        &mut hook,
+                    )
+                };
+                assert!(exchange(source, &mut f.backups, current_passphrase, |_| Ok(())).is_err());
+                assert_eq!(stdfs::read(&publisher).unwrap(), old_key);
+                assert_eq!(stdfs::read(&staged).unwrap(), new_key);
+                assert!(matches!(
+                    exchange(source, &mut f.backups, new_passphrase, |stage| {
+                        if stage == S::KeyExchanged {
+                            Err(KeyFileError::Io)
+                        } else {
+                            Ok(())
+                        }
+                    }),
+                    Err(KeyFileError::CommitUncertain),
+                ));
+                assert_eq!(stdfs::read(&publisher).unwrap(), new_key);
+                assert_eq!(stdfs::read(&staged).unwrap(), old_key);
+                f.source.take();
+                let source = f.source.insert(KeyDirectory::open(&f.a.0).unwrap());
+                assert_eq!(
+                    exchange(source, &mut f.backups, new_passphrase, |_| Ok(())).unwrap(),
+                    KeyPassphraseExchange::ConfirmedExchanged,
+                );
+                assert_eq!(stdfs::read(&publisher).unwrap(), new_key);
+                assert_eq!(stdfs::read(&staged).unwrap(), old_key);
+                assert_eq!(stdfs::read(&history).unwrap(), fixed);
+                assert!(f.a.0.join(recovery_hold::GUARD).exists());
+                continue;
             }
             assert!(f.a.0.join(recovery_hold::GUARD).exists());
             assert_eq!(stdfs::read(f.a.0.join("publisher")).unwrap(), old_key);

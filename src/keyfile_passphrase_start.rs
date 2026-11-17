@@ -739,7 +739,7 @@ fn check_prepared_intent(
 }
 
 #[path = "keyfile_passphrase_exchange.rs"]
-mod exchange;
+pub(super) mod exchange;
 pub use exchange::{KeyPassphraseCleanup, KeyPassphraseExchange};
 
 /// 完了追記の中断を明示復旧するための控え。

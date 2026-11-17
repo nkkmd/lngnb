@@ -10,6 +10,15 @@ struct FixedRotationKey {
     public: [u8; 32],
 }
 
+fn matches_rotation_key_identity(held: &HeldFile, expected: KeyFileIdentity, moved: bool) -> bool {
+    let mut actual = KeyFileIdentity::from_metadata(&held.metadata);
+    if moved {
+        actual.ctime_seconds = expected.ctime_seconds;
+        actual.ctime_nanoseconds = expected.ctime_nanoseconds;
+    }
+    actual == expected
+}
+
 impl FixedRotationKey {
     fn open(
         source: &KeyDirectory,
@@ -46,6 +55,7 @@ impl FixedRotationKey {
             marker,
             snapshot,
             value,
+            None,
         )?;
         fixed.recheck(source, current_name)?;
         Ok(fixed)
@@ -60,6 +70,7 @@ impl FixedRotationKey {
         marker: HeldFile,
         snapshot: HeldFile,
         value: Value,
+        moved_path: Option<&str>,
     ) -> Result<Self> {
         let completed_operation_id = match expected.state {
             KeyHistoryState::PassphraseChangeCompleted {
@@ -79,11 +90,16 @@ impl FixedRotationKey {
         {
             return invalid();
         }
-        let key = HeldFile::open(source, current_name, MAX_KEYFILE_BYTES)?;
+        let key = HeldFile::open(
+            source,
+            moved_path.unwrap_or(current_name),
+            MAX_KEYFILE_BYTES,
+        )?;
         let current_hash: [u8; 32] = Sha256::digest(&key.bytes).into();
         let public = id(field(started, "public_key")?)?;
-        if state_history::recorded_file_identity(field(completed, "installed_identity")?)?
-            != KeyFileIdentity::from_metadata(&key.metadata)
+        let expected =
+            state_history::recorded_file_identity(field(completed, "installed_identity")?)?;
+        if !matches_rotation_key_identity(&key, expected, moved_path.is_some())
             || current_hash != id(field(started, "new_ciphertext_sha256")?)?
             || unlock(&key.bytes, passphrase)?.public_key() != public
         {
@@ -700,6 +716,80 @@ impl KeyDirectory {
         )
     }
 
+    /// 交換を行うか、交換済みの配置を再照合して保存を確認する。
+    /// 旧暗号文とguardは保持する。
+    #[allow(clippy::too_many_arguments)]
+    pub fn exchange_passphrase_rotation(
+        &mut self,
+        current_name: &str,
+        old_passphrase: &str,
+        new_passphrase: &str,
+        backups: &mut [KeyDirectory],
+        current_backup: usize,
+        backup_name: &str,
+        proofs: &[KeyResumePreservation<'_>],
+        start: &KeyPassphraseStartIntent,
+        prepared: &KeyPassphrasePreparedIntent,
+    ) -> Result<passphrase_start::KeyPassphraseExchange> {
+        self.exchange_passphrase_rotation_with(
+            current_name,
+            old_passphrase,
+            new_passphrase,
+            backups,
+            current_backup,
+            backup_name,
+            proofs,
+            start,
+            prepared,
+            &mut |_| Ok(()),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in super::super::super) fn exchange_passphrase_rotation_with(
+        &mut self,
+        current_name: &str,
+        old_passphrase: &str,
+        new_passphrase: &str,
+        backups: &mut [KeyDirectory],
+        current_backup: usize,
+        backup_name: &str,
+        proofs: &[KeyResumePreservation<'_>],
+        start: &KeyPassphraseStartIntent,
+        prepared: &KeyPassphrasePreparedIntent,
+        hook: &mut impl FnMut(ResumeStage) -> Result<()>,
+    ) -> Result<passphrase_start::KeyPassphraseExchange> {
+        self.with_passphrase_rotation_snapshot(
+            current_name,
+            old_passphrase,
+            backups,
+            current_backup,
+            backup_name,
+            proofs,
+            start,
+            Some((prepared, new_passphrase)),
+            true,
+            |mut context, _, _, _, _| {
+                let staged = context
+                    .staged_key
+                    .take()
+                    .ok_or(KeyFileError::RecoveryStateInvalid)?;
+                let key_name = passphrase_start::staged_name(&start.operation_id);
+                let before_exchange = context.current_name == current_name;
+                context.qualify(Some(&key_name), false, hook, &mut || {
+                    staged.1.check(context.source, &staged.0, true)
+                })?;
+                passphrase_start::exchange::exchange_passphrase_pair(
+                    context,
+                    staged,
+                    &key_name,
+                    before_exchange,
+                    hook,
+                )
+            },
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn recover_passphrase_rotation_snapshot(
         &mut self,
@@ -712,6 +802,50 @@ impl KeyDirectory {
         start: &KeyPassphraseStartIntent,
         prepared: Option<(&KeyPassphrasePreparedIntent, &str)>,
     ) -> Result<KeyStateDiagnostic> {
+        self.with_passphrase_rotation_snapshot(
+            current_name,
+            passphrase,
+            backups,
+            current_backup,
+            backup_name,
+            proofs,
+            start,
+            prepared,
+            false,
+            |context, temporary, temp, needs_exchange, intent| {
+                recovery::recover_snapshot(
+                    context,
+                    temporary,
+                    temp,
+                    needs_exchange,
+                    intent,
+                    &mut |_| Ok(()),
+                    false,
+                )
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn with_passphrase_rotation_snapshot<T>(
+        &mut self,
+        current_name: &str,
+        passphrase: &str,
+        backups: &mut [KeyDirectory],
+        current_backup: usize,
+        backup_name: &str,
+        proofs: &[KeyResumePreservation<'_>],
+        start: &KeyPassphraseStartIntent,
+        prepared: Option<(&KeyPassphrasePreparedIntent, &str)>,
+        exchange_key: bool,
+        apply: impl FnOnce(
+            PreparedKeyResume<'_>,
+            Option<&HeldFile>,
+            &str,
+            bool,
+            &KeyResumeIntent,
+        ) -> Result<T>,
+    ) -> Result<T> {
         if proofs.len() >= 1024 || backups.len() > proofs.len() + 1 {
             return invalid();
         }
@@ -754,7 +888,11 @@ impl KeyDirectory {
             ".lngnb-key-state-update-{}",
             data_encoding::HEXLOWER.encode(&intent.operation_id)
         );
-        inventory_with_key(self, Some(&temp), key_name.as_deref())?;
+        inventory_with_key(
+            self,
+            (!exchange_key).then_some(temp.as_str()),
+            key_name.as_deref(),
+        )?;
         let fixed = HeldFile::open(self, initial_state::STATE, initial_state::STATE_LIMIT)?;
         let temporary = match HeldFile::open(self, &temp, initial_state::STATE_LIMIT) {
             Ok(file) => Some(file),
@@ -767,6 +905,9 @@ impl KeyDirectory {
         let decode =
             |file: &HeldFile| recovery::decode_snapshot(&file.bytes, &source_marker, &intent);
         let needs_exchange = decode(&fixed)? == intent.before;
+        if exchange_key && (prepared.is_none() || needs_exchange || temporary.is_some()) {
+            return invalid();
+        }
         let (new, old) = if needs_exchange {
             (
                 temporary
@@ -799,22 +940,40 @@ impl KeyDirectory {
         let event = array(field(&value, "events")?)?
             .last()
             .ok_or(KeyFileError::RecoveryStateInvalid)?;
-        let staged_key = if let (Some(name), Some((_, new_passphrase))) = (key_name, prepared) {
+        if string(field(event, "name")?)? != current_name {
+            return invalid();
+        }
+        let mut moved_path = None;
+        let staged_key = if let (Some(name), Some((_, new_passphrase))) =
+            (key_name.as_deref(), prepared)
+        {
             let next = cbor::decode(&new.bytes).map_err(|_| KeyFileError::RecoveryStateInvalid)?;
             let preparation = array(field(&next, "events")?)?
                 .last()
                 .ok_or(KeyFileError::RecoveryStateInvalid)?;
-            let held = HeldFile::open(self, &name, MAX_KEYFILE_BYTES)?;
-            if KeyFileIdentity::from_metadata(&held.metadata)
-                != state_history::recorded_file_identity(field(preparation, "new_identity")?)?
-            {
+            let expected =
+                state_history::recorded_file_identity(field(preparation, "new_identity")?)?;
+            let mut path = name;
+            let mut moved = false;
+            if exchange_key {
+                let normal = HeldFile::open(self, current_name, MAX_KEYFILE_BYTES)?;
+                let old_identity =
+                    state_history::recorded_file_identity(field(event, "old_identity")?)?;
+                if !matches_rotation_key_identity(&normal, old_identity, false) {
+                    moved = true;
+                    moved_path = Some(name);
+                    path = current_name;
+                }
+            }
+            let held = HeldFile::open(self, path, MAX_KEYFILE_BYTES)?;
+            if !matches_rotation_key_identity(&held, expected, moved) {
                 return Err(KeyFileError::RecoveryChanged);
             }
             passphrase_start::authenticate_staged(&held.bytes, event, new_passphrase)?;
-            held.check(self, &name, true)?;
+            held.check(self, path, true)?;
             held.sync()?;
-            held.check(self, &name, true)?;
-            Some((name, held))
+            held.check(self, path, true)?;
+            Some((path.to_owned(), held))
         } else {
             None
         };
@@ -856,6 +1015,7 @@ impl KeyDirectory {
             marker,
             fixed,
             history,
+            moved_path,
         )?;
         if current.bytes != fixed.key.bytes {
             return Err(KeyFileError::PreservationMismatch);
@@ -885,7 +1045,7 @@ impl KeyDirectory {
             backups,
             source_identity,
             backup_identities,
-            current_name: current_name.into(),
+            current_name: moved_path.unwrap_or(current_name).into(),
             current: fixed.key,
             preservations,
             absent_names: Vec::new(),
@@ -897,15 +1057,7 @@ impl KeyDirectory {
             removed_key: None,
             intent,
         };
-        recovery::recover_snapshot(
-            context,
-            temporary.as_ref(),
-            &temp,
-            needs_exchange,
-            &intent,
-            &mut |_| Ok(()),
-            false,
-        )
+        apply(context, temporary.as_ref(), &temp, needs_exchange, &intent)
     }
 
     #[allow(clippy::too_many_arguments)]
