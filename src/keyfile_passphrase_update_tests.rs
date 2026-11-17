@@ -508,6 +508,76 @@ fn rotation_start_and_prepare_wait_for_receipt_flush_before_recording() {
                 );
                 assert!(!staged.exists());
                 assert!(f.a.0.join(recovery_hold::GUARD).exists());
+                let receipt = std::str::from_utf8(&output.bytes).unwrap().trim_end();
+                let finish =
+                    KeyPassphraseCompletedIntent::parse_rotation_receipt(receipt, &prepared)
+                        .unwrap();
+                assert_eq!(finish.after, completed);
+                let recover_completion =
+                    |source: &mut KeyDirectory, backups: &mut [KeyDirectory]| {
+                        source.recover_passphrase_rotation_completed(
+                            "publisher",
+                            current_passphrase,
+                            new_passphrase,
+                            backups,
+                            0,
+                            "next-copy",
+                            &proofs,
+                            &start,
+                            &prepared,
+                            &finish,
+                        )
+                    };
+                assert_eq!(
+                    recover_completion(source, &mut f.backups).unwrap(),
+                    completed
+                );
+                let release = |source: &mut KeyDirectory, backups: &mut [KeyDirectory]| {
+                    source.release_passphrase_rotation(
+                        "publisher",
+                        current_passphrase,
+                        new_passphrase,
+                        backups,
+                        0,
+                        "next-copy",
+                        &proofs,
+                        &start,
+                        &prepared,
+                        &finish,
+                    )
+                };
+                let completed_history = stdfs::read(&history).unwrap();
+                stdfs::write(&history, &fixed).unwrap();
+                assert!(recover_completion(source, &mut f.backups).is_err());
+                let temporary = format!(
+                    ".lngnb-key-state-update-{}",
+                    data_encoding::HEXLOWER.encode(&finish.operation_id),
+                );
+                f.a.put(
+                    &temporary,
+                    &completed_history[..completed_history.len() - 1],
+                );
+                assert!(recover_completion(source, &mut f.backups).is_err());
+                assert_eq!(stdfs::read(&history).unwrap(), fixed);
+                stdfs::write(f.a.0.join(&temporary), &completed_history).unwrap();
+                assert!(release(source, &mut f.backups).is_err());
+                assert!(f.a.0.join(recovery_hold::GUARD).exists());
+                assert_eq!(
+                    recover_completion(source, &mut f.backups).unwrap(),
+                    completed
+                );
+                assert_eq!(stdfs::read(&history).unwrap(), completed_history);
+                assert!(!f.a.0.join(temporary).exists());
+                assert!(f.a.0.join(recovery_hold::GUARD).exists());
+                assert_eq!(
+                    release(source, &mut f.backups).unwrap(),
+                    KeyResumeRelease::RemovedRecordedGuard(completed)
+                );
+                assert!(!f.a.0.join(recovery_hold::GUARD).exists());
+                assert_eq!(
+                    release(source, &mut f.backups).unwrap(),
+                    KeyResumeRelease::ConfirmedGuardAbsent(completed)
+                );
                 continue;
             }
             assert!(f.a.0.join(recovery_hold::GUARD).exists());

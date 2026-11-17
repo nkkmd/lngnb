@@ -26,10 +26,12 @@ enum RotationOldKey<'a> {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum RotationAction {
+enum RotationAction<'a> {
     RecoverHistory,
     Exchange,
     Complete,
+    RecoverCompletion(&'a KeyPassphraseCompletedIntent),
+    Release(&'a KeyPassphraseCompletedIntent),
 }
 
 impl FixedRotationKey {
@@ -873,6 +875,76 @@ impl KeyDirectory {
         )
     }
 
+    /// 完全な完了履歴の候補を復旧し、guardを維持する。
+    #[allow(clippy::too_many_arguments)]
+    pub fn recover_passphrase_rotation_completed(
+        &mut self,
+        current_name: &str,
+        old_passphrase: &str,
+        new_passphrase: &str,
+        backups: &mut [KeyDirectory],
+        current_backup: usize,
+        backup_name: &str,
+        proofs: &[KeyResumePreservation<'_>],
+        start: &KeyPassphraseStartIntent,
+        prepared: &KeyPassphrasePreparedIntent,
+        completed: &KeyPassphraseCompletedIntent,
+    ) -> Result<KeyStateDiagnostic> {
+        self.with_passphrase_rotation_snapshot(
+            current_name,
+            old_passphrase,
+            backups,
+            current_backup,
+            backup_name,
+            proofs,
+            start,
+            Some((prepared, new_passphrase)),
+            RotationAction::RecoverCompletion(completed),
+            |context, temporary, temp, needs_exchange, intent| {
+                recovery::recover_snapshot(
+                    context,
+                    temporary,
+                    temp,
+                    needs_exchange,
+                    intent,
+                    &mut |_| Ok(()),
+                    false,
+                )
+            },
+        )
+    }
+
+    /// 固定完了を再認証してguardを解除するか、正確不在を今回確認する。
+    #[allow(clippy::too_many_arguments)]
+    pub fn release_passphrase_rotation(
+        &mut self,
+        current_name: &str,
+        old_passphrase: &str,
+        new_passphrase: &str,
+        backups: &mut [KeyDirectory],
+        current_backup: usize,
+        backup_name: &str,
+        proofs: &[KeyResumePreservation<'_>],
+        start: &KeyPassphraseStartIntent,
+        prepared: &KeyPassphrasePreparedIntent,
+        completed: &KeyPassphraseCompletedIntent,
+    ) -> Result<release::KeyResumeRelease> {
+        self.with_passphrase_rotation_snapshot(
+            current_name,
+            old_passphrase,
+            backups,
+            current_backup,
+            backup_name,
+            proofs,
+            start,
+            Some((prepared, new_passphrase)),
+            RotationAction::Release(completed),
+            |context, _, _, _, intent| {
+                context.release_recorded_guard(intent.after, &mut |_| Ok(()))
+            },
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn recover_passphrase_rotation_snapshot(
         &mut self,
@@ -920,7 +992,7 @@ impl KeyDirectory {
         proofs: &[KeyResumePreservation<'_>],
         start: &KeyPassphraseStartIntent,
         prepared: Option<(&KeyPassphrasePreparedIntent, &str)>,
-        action: RotationAction,
+        action: RotationAction<'_>,
         apply: impl FnOnce(
             PreparedKeyResume<'_>,
             Option<&HeldFile>,
@@ -946,7 +1018,7 @@ impl KeyDirectory {
         {
             return invalid();
         }
-        let (intent, kind, key_name) = if let Some((prepared, _)) = prepared {
+        let (stage_intent, stage_kind, key_name) = if let Some((prepared, _)) = prepared {
             if prepared.before != start.after
                 || prepared.after.state
                     != (KeyHistoryState::PassphraseRotationPrepared {
@@ -967,13 +1039,38 @@ impl KeyDirectory {
         } else {
             (start_intent, "key_passphrase_rotation_started", None)
         };
+        let release = matches!(action, RotationAction::Release(_));
+        let completion = match action {
+            RotationAction::RecoverCompletion(completed) | RotationAction::Release(completed) => {
+                if prepared.is_none()
+                    || completed.before != stage_intent.after
+                    || completed.after.state
+                        != (KeyHistoryState::PassphraseRotationCompleted {
+                            completed_operation_id: completed.operation_id,
+                        })
+                {
+                    return invalid();
+                }
+                Some(KeyResumeIntent {
+                    before: completed.before,
+                    after: completed.after,
+                    operation_id: completed.operation_id,
+                })
+            }
+            _ => None,
+        };
+        let (intent, kind) = completion.map_or((stage_intent, stage_kind), |intent| {
+            (intent, "key_passphrase_rotation_completed")
+        });
+        let recover_history = action == RotationAction::RecoverHistory
+            || matches!(action, RotationAction::RecoverCompletion(_));
         let temp = format!(
             ".lngnb-key-state-update-{}",
             data_encoding::HEXLOWER.encode(&intent.operation_id)
         );
         inventory_with_key(
             self,
-            (action == RotationAction::RecoverHistory).then_some(temp.as_str()),
+            recover_history.then_some(temp.as_str()),
             key_name.as_deref(),
         )?;
         let fixed = HeldFile::open(self, initial_state::STATE, initial_state::STATE_LIMIT)?;
@@ -988,9 +1085,7 @@ impl KeyDirectory {
         let decode =
             |file: &HeldFile| recovery::decode_snapshot(&file.bytes, &source_marker, &intent);
         let needs_exchange = decode(&fixed)? == intent.before;
-        if action != RotationAction::RecoverHistory
-            && (prepared.is_none() || needs_exchange || temporary.is_some())
-        {
+        if !recover_history && (prepared.is_none() || needs_exchange || temporary.is_some()) {
             return invalid();
         }
         let (new, old) = if needs_exchange {
@@ -1010,16 +1105,23 @@ impl KeyDirectory {
         if old.is_some_and(|held| held.bytes != prefix) {
             return invalid();
         }
+        let (stage_bytes, stage_prefix) = if completion.is_some() {
+            let started =
+                recovery::verify_event_prefix(&prefix, &source_marker, &stage_intent, stage_kind)?;
+            (prefix, started)
+        } else {
+            (new.bytes.clone(), prefix)
+        };
         let (started, completed) = if prepared.is_some() {
             let completed = recovery::verify_event_prefix(
-                &prefix,
+                &stage_prefix,
                 &source_marker,
                 &start_intent,
                 "key_passphrase_rotation_started",
             )?;
-            (prefix, completed)
+            (stage_prefix, completed)
         } else {
-            (new.bytes.clone(), prefix)
+            (stage_bytes.clone(), stage_prefix)
         };
         let value = cbor::decode(&started).map_err(|_| KeyFileError::RecoveryStateInvalid)?;
         let event = array(field(&value, "events")?)?
@@ -1032,7 +1134,8 @@ impl KeyDirectory {
         let mut staged_key = if let (Some(name), Some((_, new_passphrase))) =
             (key_name.as_deref(), prepared)
         {
-            let next = cbor::decode(&new.bytes).map_err(|_| KeyFileError::RecoveryStateInvalid)?;
+            let next =
+                cbor::decode(&stage_bytes).map_err(|_| KeyFileError::RecoveryStateInvalid)?;
             let preparation = array(field(&next, "events")?)?
                 .last()
                 .ok_or(KeyFileError::RecoveryStateInvalid)?;
@@ -1048,13 +1151,25 @@ impl KeyDirectory {
                     moved = true;
                     moved_path = Some(name);
                     path = current_name;
-                } else if action == RotationAction::Complete {
+                } else if action == RotationAction::Complete || completion.is_some() {
                     return invalid();
                 }
             }
             let held = HeldFile::open(self, path, MAX_KEYFILE_BYTES)?;
             if !matches_rotation_key_identity(&held, expected, moved) {
                 return Err(KeyFileError::RecoveryChanged);
+            }
+            if completion.is_some() {
+                let value =
+                    cbor::decode(&new.bytes).map_err(|_| KeyFileError::RecoveryStateInvalid)?;
+                let finished = array(field(&value, "events")?)?
+                    .last()
+                    .ok_or(KeyFileError::RecoveryStateInvalid)?;
+                let installed =
+                    state_history::recorded_file_identity(field(finished, "installed_identity")?)?;
+                if !matches_rotation_key_identity(&held, installed, false) {
+                    return Err(KeyFileError::RecoveryChanged);
+                }
             }
             passphrase_start::authenticate_staged(&held.bytes, event, new_passphrase)?;
             held.check(self, path, true)?;
@@ -1064,15 +1179,24 @@ impl KeyDirectory {
         } else {
             None
         };
-        let guard = HeldFile::open(self, recovery_hold::GUARD, MAX_KEYFILE_BYTES)?;
-        let mut guard_bytes = b"lngnb:key-hold:1\0".to_vec();
-        guard_bytes.extend(intent.before.initial.area_id);
-        if KeyFileIdentity::from_metadata(&guard.metadata)
-            != state_history::recorded_guard_identity(event)?
-            || guard.bytes != guard_bytes
-        {
-            return invalid();
-        }
+        let guard = match HeldFile::open(self, recovery_hold::GUARD, MAX_KEYFILE_BYTES) {
+            Ok(guard) => {
+                let mut guard_bytes = b"lngnb:key-hold:1\0".to_vec();
+                guard_bytes.extend(intent.before.initial.area_id);
+                if KeyFileIdentity::from_metadata(&guard.metadata)
+                    != state_history::recorded_guard_identity(event)?
+                    || guard.bytes != guard_bytes
+                {
+                    return invalid();
+                }
+                Some(guard)
+            }
+            Err(KeyFileError::Missing) if release => {
+                absent(self, recovery_hold::GUARD)?;
+                None
+            }
+            Err(error) => return Err(error),
+        };
         let backup = backups
             .get(current_backup)
             .ok_or(KeyFileError::RecoveryStateInvalid)?;
@@ -1094,7 +1218,10 @@ impl KeyDirectory {
         }
         let new_bytes = new.bytes.clone();
         let history = cbor::decode(&completed).map_err(|_| KeyFileError::RecoveryStateInvalid)?;
-        let absent_old = if action == RotationAction::Complete {
+        let absent_old = if completion.is_some() {
+            absent(self, moved_path.ok_or(KeyFileError::RecoveryStateInvalid)?)?;
+            true
+        } else if action == RotationAction::Complete {
             let path = moved_path.ok_or(KeyFileError::RecoveryStateInvalid)?;
             match absent(self, path) {
                 Ok(()) => true,
@@ -1170,7 +1297,7 @@ impl KeyDirectory {
             preservations,
             absent_names,
             marker: fixed.marker,
-            guard: Some(guard),
+            guard,
             state: fixed.snapshot,
             new_bytes,
             staged_key,
