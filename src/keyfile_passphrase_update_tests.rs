@@ -413,11 +413,11 @@ fn rotation_start_waits_for_receipt_flush_before_recording() {
                 ".lngnb-key-state-update-{}",
                 data_encoding::HEXLOWER.encode(&intent.operation_id),
             );
-            f.a.put(initial_state::STATE, &old_history);
+            stdfs::write(&history, &old_history).unwrap();
             f.a.put(&temp, &new_history[..new_history.len() - 1]);
             assert!(recover(source, &mut f.backups).is_err());
             assert_eq!(stdfs::read(&history).unwrap(), old_history);
-            f.a.put(&temp, &new_history);
+            stdfs::write(f.a.0.join(&temp), &new_history).unwrap();
             assert_eq!(recover(source, &mut f.backups).unwrap(), diagnostic);
             assert_eq!(stdfs::read(&history).unwrap(), new_history);
             assert!(!f.a.0.join(&temp).exists());
