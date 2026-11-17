@@ -359,6 +359,23 @@ fn rotation_start_waits_for_receipt_flush_before_recording() {
                 .bytes
                 .starts_with(b"key_passphrase_rotation_started ")
         );
+        let receipt = std::str::from_utf8(&receipt.bytes).unwrap();
+        let intent = KeyPassphraseStartIntent::parse_rotation_receipt(receipt, &completed).unwrap();
+        let mut stale = completed;
+        stale.snapshot_hash[0] ^= 1;
+        assert!(KeyPassphraseStartIntent::parse_rotation_receipt(receipt, &stale).is_err());
+        assert!(KeyPassphraseStartIntent::parse_rotation_receipt(receipt, &resume.after).is_err());
+        assert!(
+            KeyPassphraseStartIntent::parse_rotation_receipt(
+                &receipt.replacen(
+                    "key_passphrase_rotation_started",
+                    "key_passphrase_change_started",
+                    1
+                ),
+                &completed,
+            )
+            .is_err()
+        );
         assert!(f.a.0.join(recovery_hold::GUARD).is_file());
         assert_eq!(stdfs::read(f.a.0.join("publisher")).unwrap(), old_key);
         assert_eq!(
@@ -370,6 +387,7 @@ fn rotation_start_waits_for_receipt_flush_before_recording() {
             assert_eq!(stdfs::read(&history).unwrap(), old_history);
         } else {
             let (diagnostic, ciphertext) = result.unwrap();
+            assert_eq!(intent.after, diagnostic);
             assert!(matches!(
                 diagnostic.state,
                 KeyHistoryState::PassphraseRotationStarted { .. }

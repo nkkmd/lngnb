@@ -284,6 +284,34 @@ impl KeyPassphraseStartIntent {
         check_start_intent(resume, &intent)?;
         Ok(intent)
     }
+
+    /// 連続更新の開始控えを直前完了の照合値に結び付けて読み戻す。
+    /// 現物の認証や復旧資格は別途必要。
+    pub fn parse_rotation_receipt(line: &str, before: &KeyStateDiagnostic) -> Result<Self> {
+        let previous_operation = match before.state {
+            KeyHistoryState::PassphraseChangeCompleted {
+                completed_operation_id,
+            }
+            | KeyHistoryState::PassphraseRotationCompleted {
+                completed_operation_id,
+            } => completed_operation_id,
+            _ => return invalid(),
+        };
+        let (after, operation_id) =
+            parse_receipt(line, "key_passphrase_rotation_started", *before, |id| {
+                KeyHistoryState::PassphraseRotationStarted {
+                    started_operation_id: id,
+                }
+            })?;
+        if operation_id == previous_operation {
+            return invalid();
+        }
+        Ok(Self {
+            before: *before,
+            after,
+            operation_id,
+        })
+    }
 }
 
 impl KeyPassphrasePreparedIntent {
