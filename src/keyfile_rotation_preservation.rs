@@ -465,6 +465,75 @@ impl KeyDirectory {
         proofs: &[KeyResumePreservation<'_>],
         receipts: &mut impl std::io::Write,
     ) -> Result<(KeyStateDiagnostic, Vec<u8>)> {
+        let mut start = self.prepare_passphrase_rotation_start(
+            expected,
+            current_name,
+            passphrase,
+            new_passphrase,
+            backups,
+            current_backup,
+            backup_name,
+            proofs,
+            receipts,
+            false,
+        )?;
+        let diagnostic = start.record()?;
+        Ok((diagnostic, start.into_ciphertext()))
+    }
+
+    /// 開始と準備の履歴を、同じ排他と保全の保持下で個別に保存する。
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_passphrase_rotation_prepared(
+        &mut self,
+        expected: &KeyStateDiagnostic,
+        current_name: &str,
+        passphrase: &str,
+        new_passphrase: &str,
+        backups: &mut [KeyDirectory],
+        current_backup: usize,
+        backup_name: &str,
+        proofs: &[KeyResumePreservation<'_>],
+        receipts: &mut impl std::io::Write,
+    ) -> Result<KeyStateDiagnostic> {
+        let mut start = self.prepare_passphrase_rotation_start(
+            expected,
+            current_name,
+            passphrase,
+            new_passphrase,
+            backups,
+            current_backup,
+            backup_name,
+            proofs,
+            receipts,
+            true,
+        )?;
+        start.record()?;
+        let prepared = start.prepare_ciphertext(new_passphrase)?;
+        let intent = prepared.intent();
+        passphrase_start::update::receipt(
+            receipts,
+            "key_passphrase_rotation_prepared",
+            intent.before,
+            intent.after,
+            intent.operation_id,
+        )?;
+        prepared.record()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_passphrase_rotation_start<'a>(
+        &'a mut self,
+        expected: &KeyStateDiagnostic,
+        current_name: &'a str,
+        passphrase: &str,
+        new_passphrase: &str,
+        backups: &'a mut [KeyDirectory],
+        current_backup: usize,
+        backup_name: &str,
+        proofs: &[KeyResumePreservation<'_>],
+        receipts: &mut impl std::io::Write,
+        reserve_staged_key: bool,
+    ) -> Result<passphrase_start::PreparedKeyPassphraseStart<'a>> {
         let mut checked = self.hold_rotation_preservations(
             expected,
             current_name,
@@ -507,7 +576,8 @@ impl KeyDirectory {
             })
             .collect::<Result<Vec<_>>>()?;
         checked.sync_and_recheck()?;
-        if inventory(checked.source, None)? >= SCAN_LIMIT - 1 {
+        let reserved_entries = 2 + usize::from(reserve_staged_key);
+        if inventory(checked.source, None)? > SCAN_LIMIT - reserved_entries {
             return Err(KeyFileError::ScanLimit);
         }
         let guard = passphrase_start::create_start_guard(
@@ -546,7 +616,7 @@ impl KeyDirectory {
             expected.initial.area_id,
             expected.initial.snapshot_hash,
         )?;
-        let mut prepared = PreparedKeyResume {
+        let prepared = PreparedKeyResume {
             source: checked.source,
             backups: checked.backups,
             source_identity,
@@ -574,8 +644,10 @@ impl KeyDirectory {
             after,
             operation,
         )?;
-        let diagnostic = prepared.record_snapshot_with(&mut |_| Ok(()), false)?;
-        Ok((diagnostic, new_ciphertext))
+        Ok(passphrase_start::PreparedKeyPassphraseStart::new(
+            prepared,
+            new_ciphertext,
+        ))
     }
 
     /// 控えと完全な開始候補が一致する場合に限り、開始履歴の保存を復旧する。
@@ -590,28 +662,99 @@ impl KeyDirectory {
         proofs: &[KeyResumePreservation<'_>],
         start: &KeyPassphraseStartIntent,
     ) -> Result<KeyStateDiagnostic> {
+        self.recover_passphrase_rotation_snapshot(
+            current_name,
+            passphrase,
+            backups,
+            current_backup,
+            backup_name,
+            proofs,
+            start,
+            None,
+        )
+    }
+
+    /// 準備履歴と一時鍵の完全な候補を照合し、準備履歴を復旧する。
+    #[allow(clippy::too_many_arguments)]
+    pub fn recover_passphrase_rotation_prepared(
+        &mut self,
+        current_name: &str,
+        passphrase: &str,
+        backups: &mut [KeyDirectory],
+        current_backup: usize,
+        backup_name: &str,
+        proofs: &[KeyResumePreservation<'_>],
+        start: &KeyPassphraseStartIntent,
+        prepared: &KeyPassphrasePreparedIntent,
+        new_passphrase: &str,
+    ) -> Result<KeyStateDiagnostic> {
+        self.recover_passphrase_rotation_snapshot(
+            current_name,
+            passphrase,
+            backups,
+            current_backup,
+            backup_name,
+            proofs,
+            start,
+            Some((prepared, new_passphrase)),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn recover_passphrase_rotation_snapshot(
+        &mut self,
+        current_name: &str,
+        passphrase: &str,
+        backups: &mut [KeyDirectory],
+        current_backup: usize,
+        backup_name: &str,
+        proofs: &[KeyResumePreservation<'_>],
+        start: &KeyPassphraseStartIntent,
+        prepared: Option<(&KeyPassphrasePreparedIntent, &str)>,
+    ) -> Result<KeyStateDiagnostic> {
         if proofs.len() >= 1024 || backups.len() > proofs.len() + 1 {
             return invalid();
         }
         name(current_name)?;
         name(backup_name)?;
-        let intent = KeyResumeIntent {
+        let start_intent = KeyResumeIntent {
             before: start.before,
             after: start.after,
             operation_id: start.operation_id,
         };
-        if intent.after.state
+        if start_intent.after.state
             != (KeyHistoryState::PassphraseRotationStarted {
-                started_operation_id: intent.operation_id,
+                started_operation_id: start_intent.operation_id,
             })
         {
             return invalid();
         }
+        let (intent, kind, key_name) = if let Some((prepared, _)) = prepared {
+            if prepared.before != start.after
+                || prepared.after.state
+                    != (KeyHistoryState::PassphraseRotationPrepared {
+                        prepared_operation_id: prepared.operation_id,
+                    })
+            {
+                return invalid();
+            }
+            (
+                KeyResumeIntent {
+                    before: prepared.before,
+                    after: prepared.after,
+                    operation_id: prepared.operation_id,
+                },
+                "key_passphrase_rotation_prepared",
+                Some(passphrase_start::staged_name(&start.operation_id)),
+            )
+        } else {
+            (start_intent, "key_passphrase_rotation_started", None)
+        };
         let temp = format!(
             ".lngnb-key-state-update-{}",
             data_encoding::HEXLOWER.encode(&intent.operation_id)
         );
-        inventory(self, Some(&temp))?;
+        inventory_with_key(self, Some(&temp), key_name.as_deref())?;
         let fixed = HeldFile::open(self, initial_state::STATE, initial_state::STATE_LIMIT)?;
         let temporary = match HeldFile::open(self, &temp, initial_state::STATE_LIMIT) {
             Ok(file) => Some(file),
@@ -637,19 +780,44 @@ impl KeyDirectory {
         if decode(new)? != intent.after {
             return invalid();
         }
-        let prefix = recovery::verify_event_prefix(
-            &new.bytes,
-            &source_marker,
-            &intent,
-            "key_passphrase_rotation_started",
-        )?;
+        let prefix = recovery::verify_event_prefix(&new.bytes, &source_marker, &intent, kind)?;
         if old.is_some_and(|held| held.bytes != prefix) {
             return invalid();
         }
-        let value = cbor::decode(&new.bytes).map_err(|_| KeyFileError::RecoveryStateInvalid)?;
+        let (started, completed) = if prepared.is_some() {
+            let completed = recovery::verify_event_prefix(
+                &prefix,
+                &source_marker,
+                &start_intent,
+                "key_passphrase_rotation_started",
+            )?;
+            (prefix, completed)
+        } else {
+            (new.bytes.clone(), prefix)
+        };
+        let value = cbor::decode(&started).map_err(|_| KeyFileError::RecoveryStateInvalid)?;
         let event = array(field(&value, "events")?)?
             .last()
             .ok_or(KeyFileError::RecoveryStateInvalid)?;
+        let staged_key = if let (Some(name), Some((_, new_passphrase))) = (key_name, prepared) {
+            let next = cbor::decode(&new.bytes).map_err(|_| KeyFileError::RecoveryStateInvalid)?;
+            let preparation = array(field(&next, "events")?)?
+                .last()
+                .ok_or(KeyFileError::RecoveryStateInvalid)?;
+            let held = HeldFile::open(self, &name, MAX_KEYFILE_BYTES)?;
+            if KeyFileIdentity::from_metadata(&held.metadata)
+                != state_history::recorded_file_identity(field(preparation, "new_identity")?)?
+            {
+                return Err(KeyFileError::RecoveryChanged);
+            }
+            passphrase_start::authenticate_staged(&held.bytes, event, new_passphrase)?;
+            held.check(self, &name, true)?;
+            held.sync()?;
+            held.check(self, &name, true)?;
+            Some((name, held))
+        } else {
+            None
+        };
         let guard = HeldFile::open(self, recovery_hold::GUARD, MAX_KEYFILE_BYTES)?;
         let mut guard_bytes = b"lngnb:key-hold:1\0".to_vec();
         guard_bytes.extend(intent.before.initial.area_id);
@@ -679,10 +847,10 @@ impl KeyDirectory {
             return invalid();
         }
         let new_bytes = new.bytes.clone();
-        let history = cbor::decode(&prefix).map_err(|_| KeyFileError::RecoveryStateInvalid)?;
+        let history = cbor::decode(&completed).map_err(|_| KeyFileError::RecoveryStateInvalid)?;
         let fixed = FixedRotationKey::from_completed_history(
             self,
-            &intent.before,
+            &start_intent.before,
             current_name,
             passphrase,
             marker,
@@ -725,7 +893,7 @@ impl KeyDirectory {
             guard: Some(guard),
             state: fixed.snapshot,
             new_bytes,
-            staged_key: None,
+            staged_key,
             removed_key: None,
             intent,
         };

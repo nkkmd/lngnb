@@ -187,14 +187,14 @@ impl PreparedKeyPassphraseStart<'_> {
     }
 }
 
-fn staged_name(started_operation_id: &[u8; 32]) -> String {
+pub(super) fn staged_name(started_operation_id: &[u8; 32]) -> String {
     format!(
         ".lngnb-key-passphrase-{}",
         data_encoding::HEXLOWER.encode(started_operation_id)
     )
 }
 
-fn authenticate_staged(bytes: &[u8], event: &Value, passphrase: &str) -> Result<()> {
+pub(super) fn authenticate_staged(bytes: &[u8], event: &Value, passphrase: &str) -> Result<()> {
     if field(event, "new_ciphertext_length")? != &Value::Int(bytes.len() as i64)
         || id(field(event, "new_ciphertext_sha256")?)? != <[u8; 32]>::from(Sha256::digest(bytes))
     {
@@ -240,6 +240,18 @@ impl PreparedKeyPassphraseRecord<'_> {
 }
 
 impl<'a> PreparedKeyPassphraseStart<'a> {
+    pub(super) fn new(context: PreparedKeyResume<'a>, new_ciphertext: Vec<u8>) -> Self {
+        Self {
+            context,
+            new_ciphertext,
+            recorded: false,
+        }
+    }
+
+    pub(super) fn into_ciphertext(self) -> Vec<u8> {
+        self.new_ciphertext
+    }
+
     /// 開始追記に成功した同じ排他の下で新暗号文を一時保存する。
     pub fn prepare_ciphertext(
         self,
@@ -258,6 +270,10 @@ impl<'a> PreparedKeyPassphraseStart<'a> {
         }
         let mut context = self.context;
         let before = context.intent.after;
+        let kind = match before.state {
+            KeyHistoryState::PassphraseRotationStarted { .. } => "key_passphrase_rotation_prepared",
+            _ => PREPARED,
+        };
         let marker = source_marker(context.source, &context.intent)?;
         let name = staged_name(&context.intent.operation_id);
         let mut snapshot =
@@ -330,7 +346,7 @@ impl<'a> PreparedKeyPassphraseStart<'a> {
             events.push(map(vec![
                 ("sequence", Value::Int((before.generation + 1) as i64)),
                 ("operation_id", bytes(operation)),
-                ("kind", text(PREPARED)),
+                ("kind", text(kind)),
                 (
                     "actor_uid",
                     bytes(context.source_identity.uid.to_be_bytes()),

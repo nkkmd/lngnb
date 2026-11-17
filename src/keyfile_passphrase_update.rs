@@ -331,6 +331,33 @@ impl KeyPassphrasePreparedIntent {
         check_prepared_intent(start, &intent)?;
         Ok(intent)
     }
+
+    /// 連続更新の準備控えを、その回の開始控えに結び付けて読み戻す。
+    pub fn parse_rotation_receipt(line: &str, start: &KeyPassphraseStartIntent) -> Result<Self> {
+        if start.after.state
+            != (KeyHistoryState::PassphraseRotationStarted {
+                started_operation_id: start.operation_id,
+            })
+        {
+            return invalid();
+        }
+        let (after, operation_id) = parse_receipt(
+            line,
+            "key_passphrase_rotation_prepared",
+            start.after,
+            |id| KeyHistoryState::PassphraseRotationPrepared {
+                prepared_operation_id: id,
+            },
+        )?;
+        if operation_id == start.operation_id {
+            return invalid();
+        }
+        Ok(Self {
+            before: start.after,
+            after,
+            operation_id,
+        })
+    }
 }
 
 impl KeyPassphraseCompletedIntent {
