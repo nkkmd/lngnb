@@ -25,6 +25,39 @@ pub struct PreparedKeyPassphraseStart<'a> {
     recorded: bool,
 }
 
+pub(super) fn create_start_guard(
+    source: &KeyDirectory,
+    area_id: &[u8; 32],
+    hook: &mut impl FnMut(ResumeStage) -> Result<()>,
+) -> Result<HeldFile> {
+    let mut guard_bytes = b"lngnb:key-hold:1\0".to_vec();
+    guard_bytes.extend(*area_id);
+    let saved = (|| -> Result<HeldFile> {
+        let mut file = File::from(os(fs::openat(
+            &source.dir,
+            recovery_hold::GUARD,
+            OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        ))?);
+        hook(ResumeStage::StartGuardCreated)?;
+        os(fs::fchmod(&file, Mode::RUSR | Mode::WUSR))?;
+        io(file.write_all(&guard_bytes))?;
+        io(file.sync_all())?;
+        let metadata = io(file.metadata())?;
+        let guard = HeldFile {
+            file,
+            metadata,
+            bytes: guard_bytes,
+        };
+        guard.check(source, recovery_hold::GUARD, true)?;
+        io(source.dir.sync_all())?;
+        hook(ResumeStage::StartGuardSynced)?;
+        guard.check(source, recovery_hold::GUARD, true)?;
+        Ok(guard)
+    })();
+    saved.map_err(|_| KeyFileError::RecoveryHoldUncertain)
+}
+
 impl<'a> release::PreparedFirstPassphraseChange<'a> {
     /// guardを保存し、開始snapshotの作成前に控えを返せる状態にする。
     pub fn prepare_start(self) -> Result<PreparedKeyPassphraseStart<'a>> {
@@ -46,32 +79,11 @@ impl<'a> release::PreparedFirstPassphraseChange<'a> {
         let mut context = self.context;
         let before = context.intent.after;
         let marker = source_marker(context.source, &context.intent)?;
-        let mut guard_bytes = b"lngnb:key-hold:1\0".to_vec();
-        guard_bytes.extend(before.initial.area_id);
-        let saved = (|| -> Result<HeldFile> {
-            let mut file = File::from(os(fs::openat(
-                &context.source.dir,
-                recovery_hold::GUARD,
-                OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::RUSR | Mode::WUSR,
-            ))?);
-            hook(ResumeStage::StartGuardCreated)?;
-            os(fs::fchmod(&file, Mode::RUSR | Mode::WUSR))?;
-            io(file.write_all(&guard_bytes))?;
-            io(file.sync_all())?;
-            let metadata = io(file.metadata())?;
-            let guard = HeldFile {
-                file,
-                metadata,
-                bytes: guard_bytes,
-            };
-            guard.check(context.source, recovery_hold::GUARD, true)?;
-            io(context.source.dir.sync_all())?;
-            hook(ResumeStage::StartGuardSynced)?;
-            guard.check(context.source, recovery_hold::GUARD, true)?;
-            Ok(guard)
-        })();
-        context.guard = Some(saved.map_err(|_| KeyFileError::RecoveryHoldUncertain)?);
+        context.guard = Some(create_start_guard(
+            context.source,
+            &before.initial.area_id,
+            hook,
+        )?);
         if context.check(None)? >= SCAN_LIMIT {
             return Err(KeyFileError::ScanLimit);
         }
