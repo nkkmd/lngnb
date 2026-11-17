@@ -196,7 +196,7 @@ impl KeyDirectory {
             &mut |_| Ok(()),
         )? {
             Outcome::Cleanup(result, context) => {
-                PreparedKeyPassphraseCompletion::new(*context, result, resume, start, prepared)
+                PreparedKeyPassphraseCompletion::new(*context, result, start, prepared)
             }
             Outcome::Exchange(_) => invalid(),
         }
@@ -357,40 +357,11 @@ impl KeyDirectory {
             check(&context, &staged)
         })?;
         if action == Action::Cleanup {
-            hook(ResumeStage::BeforeOldKeyUnlink)?;
-            check(&context, &staged)?;
-            context.current.check(context.source, &key_name, true)?;
-            return (|| -> Result<_> {
-                os(fs::unlinkat(
-                    &context.source.dir,
-                    key_name.as_str(),
-                    AtFlags::empty(),
-                ))?;
-                let old = std::mem::replace(&mut context.current, staged.1);
-                context.current_name = staged.0;
-                let removed = RemovedTarget::capture(old)?;
-                hook(ResumeStage::OldKeyUnlinked)?;
-                hook(ResumeStage::BeforeOldKeyDirectorySync)?;
-                let check = || -> Result<()> {
-                    context.check(None)?;
-                    context
-                        .state
-                        .check(context.source, initial_state::STATE, true)?;
-                    removed.check()?;
-                    absent(context.source, &key_name)
-                };
-                check()?;
-                io(context.source.dir.sync_all())?;
-                hook(ResumeStage::OldKeyDirectorySynced)?;
-                check()?;
-                context.absent_names.push(key_name);
-                context.removed_key = Some(removed);
-                Ok(Outcome::Cleanup(
-                    KeyPassphraseCleanup::RemovedRetainedOldCiphertext,
-                    Box::new(context),
-                ))
-            })()
-            .map_err(|_| KeyFileError::CleanupUncertain);
+            let context = remove_passphrase_old_key(context, staged, key_name, hook)?;
+            return Ok(Outcome::Cleanup(
+                KeyPassphraseCleanup::RemovedRetainedOldCiphertext,
+                Box::new(context),
+            ));
         }
         exchange_passphrase_pair(context, staged, &key_name, before_exchange, hook)
             .map(Outcome::Exchange)
@@ -436,4 +407,47 @@ pub(in super::super) fn exchange_passphrase_pair(
         Ok(KeyPassphraseExchange::Exchanged)
     })()
     .map_err(|_| KeyFileError::CommitUncertain)
+}
+
+pub(in super::super) fn remove_passphrase_old_key<'a>(
+    mut context: PreparedKeyResume<'a>,
+    staged: (String, HeldFile),
+    key_name: String,
+    hook: &mut impl FnMut(ResumeStage) -> Result<()>,
+) -> Result<PreparedKeyResume<'a>> {
+    hook(ResumeStage::BeforeOldKeyUnlink)?;
+    context.check(Some(&key_name))?;
+    context
+        .state
+        .check(context.source, initial_state::STATE, true)?;
+    staged.1.check(context.source, &staged.0, true)?;
+    context.current.check(context.source, &key_name, true)?;
+    (|| {
+        os(fs::unlinkat(
+            &context.source.dir,
+            key_name.as_str(),
+            AtFlags::empty(),
+        ))?;
+        let old = std::mem::replace(&mut context.current, staged.1);
+        context.current_name = staged.0;
+        let removed = RemovedTarget::capture(old)?;
+        hook(ResumeStage::OldKeyUnlinked)?;
+        hook(ResumeStage::BeforeOldKeyDirectorySync)?;
+        let check = || -> Result<()> {
+            context.check(None)?;
+            context
+                .state
+                .check(context.source, initial_state::STATE, true)?;
+            removed.check()?;
+            absent(context.source, &key_name)
+        };
+        check()?;
+        io(context.source.dir.sync_all())?;
+        hook(ResumeStage::OldKeyDirectorySynced)?;
+        check()?;
+        context.absent_names.push(key_name);
+        context.removed_key = Some(removed);
+        Ok(context)
+    })()
+    .map_err(|_: KeyFileError| KeyFileError::CleanupUncertain)
 }

@@ -754,15 +754,14 @@ pub struct KeyPassphraseCompletedIntent {
 pub struct PreparedKeyPassphraseCompletion<'a>(PreparedKeyResume<'a>);
 
 impl<'a> PreparedKeyPassphraseCompletion<'a> {
-    fn new(
+    pub(super) fn new(
         mut context: PreparedKeyResume<'a>,
         cleanup: KeyPassphraseCleanup,
-        resume: &KeyResumeIntent,
         start: &KeyPassphraseStartIntent,
         prepared: &KeyPassphrasePreparedIntent,
     ) -> Result<Self> {
         context.check_held()?;
-        let marker = source_marker(context.source, resume)?;
+        let marker = source_marker(context.source, &context.intent)?;
         let mut operation = [0; 32];
         crate::keyfile::random(&mut operation)?;
         let now = SystemTime::now()
@@ -784,10 +783,16 @@ impl<'a> PreparedKeyPassphraseCompletion<'a> {
             KeyPassphraseCleanup::ConfirmedOldCiphertextAbsent => "confirmed_old_ciphertext_absent",
         };
         let before = prepared.after;
+        let kind = match before.state {
+            KeyHistoryState::PassphraseRotationPrepared { .. } => {
+                "key_passphrase_rotation_completed"
+            }
+            _ => COMPLETED,
+        };
         events.push(map(vec![
             ("sequence", Value::Int((before.generation + 1) as i64)),
             ("operation_id", bytes(operation)),
-            ("kind", text(COMPLETED)),
+            ("kind", text(kind)),
             (
                 "actor_uid",
                 bytes(context.source_identity.uid.to_be_bytes()),
@@ -804,7 +809,7 @@ impl<'a> PreparedKeyPassphraseCompletion<'a> {
             ("disposition", text(disposition)),
         ]));
         context.new_bytes = encoded(&snapshot)?;
-        let after = decode_snapshot(&context.new_bytes, &marker, resume)?;
+        let after = decode_snapshot(&context.new_bytes, &marker, &context.intent)?;
         context.intent = KeyResumeIntent {
             before,
             after,
