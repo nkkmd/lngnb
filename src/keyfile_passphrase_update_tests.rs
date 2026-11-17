@@ -283,11 +283,13 @@ fn rotation_preservation_uses_the_fixed_completed_ciphertext_without_overwriting
 }
 
 #[test]
-fn rotation_start_waits_for_receipt_flush_before_recording() {
+fn rotation_start_and_prepare_wait_for_receipt_flush_before_recording() {
     #[derive(Default)]
     struct Receipt {
         bytes: Vec<u8>,
-        fail_flush: bool,
+        fail_at: usize,
+        flushes: usize,
+        history_before_prepared: Option<(std::path::PathBuf, Vec<u8>)>,
     }
     impl std::io::Write for Receipt {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -295,14 +297,19 @@ fn rotation_start_waits_for_receipt_flush_before_recording() {
             Ok(bytes.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
-            if self.fail_flush {
+            self.flushes += 1;
+            if self.flushes == 2 {
+                let (path, contents) = self.history_before_prepared.as_mut().unwrap();
+                *contents = stdfs::read(path)?;
+            }
+            if self.flushes == self.fail_at {
                 return Err(std::io::ErrorKind::BrokenPipe.into());
             }
             Ok(())
         }
     }
 
-    for fail_flush in [true, false] {
+    for (prepare, fail_at) in [(false, 1), (false, 0), (true, 2), (true, 0)] {
         let mut f = Fixture::new(true, 1);
         let resume = f.interrupt(S::OldSnapshotRemoved);
         f.release(&resume, &mut |_| Ok(())).unwrap();
@@ -340,9 +347,83 @@ fn rotation_start_waits_for_receipt_flush_before_recording() {
             },
         ];
         let mut receipt = Receipt {
-            fail_flush,
+            fail_at,
+            history_before_prepared: prepare.then(|| (history.clone(), Vec::new())),
             ..Receipt::default()
         };
+        let new_passphrase = "rotation test passphrase";
+        if prepare {
+            let result = source.record_passphrase_rotation_prepared(
+                &completed,
+                "publisher",
+                current_passphrase,
+                new_passphrase,
+                &mut f.backups,
+                0,
+                "next-copy",
+                &proofs,
+                &mut receipt,
+            );
+            let mut lines = std::str::from_utf8(&receipt.bytes).unwrap().lines();
+            let start =
+                KeyPassphraseStartIntent::parse_rotation_receipt(lines.next().unwrap(), &completed)
+                    .unwrap();
+            let prepared =
+                KeyPassphrasePreparedIntent::parse_rotation_receipt(lines.next().unwrap(), &start)
+                    .unwrap();
+            assert!(lines.next().is_none());
+            let staged = f.a.0.join(format!(
+                ".lngnb-key-passphrase-{}",
+                data_encoding::HEXLOWER.encode(&start.operation_id),
+            ));
+            assert!(staged.is_file());
+            let recover =
+                |source: &mut KeyDirectory, backups: &mut [KeyDirectory], secret: &str| {
+                    source.recover_passphrase_rotation_prepared(
+                        "publisher",
+                        current_passphrase,
+                        backups,
+                        0,
+                        "next-copy",
+                        &proofs,
+                        &start,
+                        &prepared,
+                        secret,
+                    )
+                };
+            let fixed = stdfs::read(&history).unwrap();
+            assert!(recover(source, &mut f.backups, current_passphrase).is_err());
+            assert_eq!(stdfs::read(&history).unwrap(), fixed);
+            if fail_at == 2 {
+                assert!(matches!(result, Err(KeyFileError::Io)));
+                assert_eq!(
+                    <[u8; 32]>::from(Sha256::digest(&fixed)),
+                    start.after.snapshot_hash
+                );
+                assert!(recover(source, &mut f.backups, new_passphrase).is_err());
+            } else {
+                assert_eq!(result.unwrap(), prepared.after);
+                assert_eq!(
+                    recover(source, &mut f.backups, new_passphrase).unwrap(),
+                    prepared.after
+                );
+                let (_, prefix) = receipt.history_before_prepared.unwrap();
+                let temporary = format!(
+                    ".lngnb-key-state-update-{}",
+                    data_encoding::HEXLOWER.encode(&prepared.operation_id),
+                );
+                stdfs::write(&history, prefix).unwrap();
+                f.a.put(&temporary, &fixed);
+                assert_eq!(
+                    recover(source, &mut f.backups, new_passphrase).unwrap(),
+                    prepared.after
+                );
+                assert!(!f.a.0.join(temporary).exists());
+            }
+            assert!(f.a.0.join(recovery_hold::GUARD).exists());
+            assert_eq!(stdfs::read(f.a.0.join("publisher")).unwrap(), old_key);
+            continue;
+        }
         let result = source.record_passphrase_rotation_start(
             &completed,
             "publisher",
@@ -393,7 +474,7 @@ fn rotation_start_waits_for_receipt_flush_before_recording() {
                 &intent,
             )
         };
-        if fail_flush {
+        if fail_at == 1 {
             assert!(matches!(result, Err(KeyFileError::Io)));
             assert!(recover(source, &mut f.backups).is_err());
             assert_eq!(stdfs::read(&history).unwrap(), old_history);
