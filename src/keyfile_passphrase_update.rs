@@ -189,7 +189,7 @@ fn fixed_bytes<const N: usize>(value: &Value) -> Result<[u8; N]> {
     }
 }
 
-fn receipt(
+pub(in super::super) fn receipt(
     output: &mut impl Write,
     stage: &str,
     before: KeyStateDiagnostic,

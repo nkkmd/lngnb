@@ -190,20 +190,76 @@ impl FixedRotationKey {
 
 // 照合した領域と現物fdを、同じ排他の下で保持する。
 struct CheckedRotationPreservations<'a> {
-    source: &'a KeyDirectory,
-    backups: &'a [KeyDirectory],
+    source: &'a mut KeyDirectory,
+    backups: &'a mut [KeyDirectory],
     current_name: &'a str,
     fixed: FixedRotationKey,
     preservations: Vec<Preservation>,
 }
 
 impl CheckedRotationPreservations<'_> {
+    fn start_record(&self, expected: &KeyStateDiagnostic, new_length: usize) -> Result<Value> {
+        let fixed = &self.fixed;
+        let current = &self.preservations[0];
+        let current_name = self.current_name;
+        let backup_name = &current.name;
+        let source_id = KeyDirectoryIdentity::from_metadata(&io(self.source.dir.metadata())?);
+        let backup_id = KeyDirectoryIdentity::from_metadata(&io(self.backups[current.directory]
+            .dir
+            .metadata())?);
+        let candidate = KeyFileIdentity::from_metadata(&current.held.metadata);
+        let events = array(field(&fixed.history, "events")?)?;
+        let completed = events.last().ok_or(KeyFileError::RecoveryStateInvalid)?;
+        let old_identity = KeyFileIdentity::from_metadata(&fixed.key.metadata).value();
+        // IDとhashは固定幅。guardの時刻は予約関数で最大幅に広げる。
+        let start = map(vec![
+            ("sequence", Value::Int((events.len() + 1) as i64)),
+            ("operation_id", bytes([0; 32])),
+            ("kind", text("key_passphrase_rotation_started")),
+            ("actor_uid", bytes(source_id.uid.to_be_bytes())),
+            ("recorded_unix_seconds", Value::Int(0)),
+            ("rules", text("lngnb-key-operations-1")),
+            ("previous_snapshot_sha256", bytes(expected.snapshot_hash)),
+            ("name", text(current_name)),
+            ("old_identity", old_identity.clone()),
+            (
+                "old_ciphertext_sha256",
+                bytes(<[u8; 32]>::from(Sha256::digest(&fixed.key.bytes))),
+            ),
+            ("new_ciphertext_sha256", bytes([0; 32])),
+            ("new_ciphertext_length", Value::Int(new_length as i64)),
+            ("public_key", bytes(fixed.public)),
+            ("guard_identity", old_identity),
+            (
+                "previous_completed_operation_id",
+                field(completed, "operation_id")?.clone(),
+            ),
+            (
+                "preserved",
+                map(vec![
+                    ("directory", backup_id.value()),
+                    ("name", text(backup_name)),
+                    ("identity", candidate.value()),
+                ]),
+            ),
+        ]);
+        if !state_history::start_reservation_fits(
+            events.len(),
+            fixed.snapshot.bytes.len(),
+            &start,
+            initial_state::STATE_LIMIT,
+        )? {
+            return invalid();
+        }
+        Ok(start)
+    }
+
     fn sync_and_recheck(&self) -> Result<()> {
         self.fixed.sync(self.source, self.current_name)?;
         for saved in &self.preservations {
             saved.held.sync()?;
         }
-        for directory in self.backups {
+        for directory in self.backups.iter() {
             io(directory.dir.sync_all())?;
             directory.pending()?;
         }
@@ -374,13 +430,140 @@ impl KeyDirectory {
         .map(|checked| checked.fixed.public)
     }
 
+    /// 連続更新の開始記録を保存する。鍵の置換は後続段階が行う。
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_passphrase_rotation_start(
+        &mut self,
+        expected: &KeyStateDiagnostic,
+        current_name: &str,
+        passphrase: &str,
+        new_passphrase: &str,
+        backups: &mut [KeyDirectory],
+        current_backup: usize,
+        backup_name: &str,
+        proofs: &[KeyResumePreservation<'_>],
+        receipts: &mut impl std::io::Write,
+    ) -> Result<(KeyStateDiagnostic, Vec<u8>)> {
+        let mut checked = self.hold_rotation_preservations(
+            expected,
+            current_name,
+            passphrase,
+            backups,
+            current_backup,
+            backup_name,
+            proofs,
+            None,
+        )?;
+        let new_ciphertext =
+            unlock(&checked.fixed.key.bytes, passphrase)?.encrypt(new_passphrase)?;
+        let new_hash: [u8; 32] = Sha256::digest(&new_ciphertext).into();
+        if new_hash == <[u8; 32]>::from(Sha256::digest(&checked.fixed.key.bytes)) {
+            return invalid();
+        }
+        let mut start = checked.start_record(expected, new_ciphertext.len())?;
+        let mut operation = [0; 32];
+        crate::keyfile::random(&mut operation)?;
+        let events = array(field(&checked.fixed.history, "events")?)?;
+        if events
+            .iter()
+            .any(|event| field(event, "operation_id").and_then(id) == Ok(operation))
+        {
+            return invalid();
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| KeyFileError::RecoveryStateInvalid)?;
+        let now = i64::try_from(now.as_secs()).map_err(|_| KeyFileError::RecoveryStateInvalid)?;
+        let source_identity =
+            KeyDirectoryIdentity::from_metadata(&io(checked.source.dir.metadata())?);
+        let backup_identities = checked
+            .backups
+            .iter()
+            .map(|directory| {
+                Ok(KeyDirectoryIdentity::from_metadata(&io(directory
+                    .dir
+                    .metadata())?))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        checked.sync_and_recheck()?;
+        if inventory(checked.source, None)? >= SCAN_LIMIT - 1 {
+            return Err(KeyFileError::ScanLimit);
+        }
+        let guard = passphrase_start::create_start_guard(
+            checked.source,
+            &expected.initial.area_id,
+            &mut |_| Ok(()),
+        )?;
+        let Value::Map(fields) = &mut start else {
+            return invalid();
+        };
+        for (name, value) in fields {
+            match name.as_str() {
+                "operation_id" => *value = bytes(operation),
+                "recorded_unix_seconds" => *value = Value::Int(now),
+                "new_ciphertext_sha256" => *value = bytes(new_hash),
+                "guard_identity" => {
+                    *value = KeyFileIdentity::from_metadata(&guard.metadata).value()
+                }
+                _ => (),
+            }
+        }
+        let Value::Map(fields) = &mut checked.fixed.history else {
+            return invalid();
+        };
+        let Some((_, Value::Array(events))) = fields.iter_mut().find(|(key, _)| key == "events")
+        else {
+            return invalid();
+        };
+        events.push(start);
+        let new_bytes = encoded(&checked.fixed.history)?;
+        let mut marker = checked.fixed.marker.bytes[..73].to_vec();
+        marker[19] = b'1';
+        let after = state_history::decode_history(
+            &new_bytes,
+            &marker,
+            expected.initial.area_id,
+            expected.initial.snapshot_hash,
+        )?;
+        let mut prepared = PreparedKeyResume {
+            source: checked.source,
+            backups: checked.backups,
+            source_identity,
+            backup_identities,
+            current_name: current_name.into(),
+            current: checked.fixed.key,
+            preservations: checked.preservations,
+            absent_names: Vec::new(),
+            marker: checked.fixed.marker,
+            guard: Some(guard),
+            state: checked.fixed.snapshot,
+            new_bytes,
+            staged_key: None,
+            removed_key: None,
+            intent: KeyResumeIntent {
+                before: *expected,
+                after,
+                operation_id: operation,
+            },
+        };
+        passphrase_start::update::receipt(
+            receipts,
+            "key_passphrase_rotation_started",
+            *expected,
+            after,
+            operation,
+        )?;
+        let diagnostic = prepared.record_snapshot_with(&mut |_| Ok(()), false)?;
+        Ok((diagnostic, new_ciphertext))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn hold_rotation_preservations<'a>(
-        &'a self,
+        &'a mut self,
         expected: &KeyStateDiagnostic,
         current_name: &'a str,
         passphrase: &str,
-        backups: &'a [KeyDirectory],
+        backups: &'a mut [KeyDirectory],
         current_backup: usize,
         backup_name: &str,
         proofs: &[KeyResumePreservation<'_>],
@@ -415,51 +598,6 @@ impl KeyDirectory {
         let mut used = vec![false; backups.len()];
         used[current_backup] = true;
         let past = fixed.open_history_preservations(backups, proofs, &mut used)?;
-        if let Some(new_length) = new_ciphertext_length {
-            let events = array(field(&fixed.history, "events")?)?;
-            let completed = events.last().ok_or(KeyFileError::RecoveryStateInvalid)?;
-            let old_identity = KeyFileIdentity::from_metadata(&fixed.key.metadata).value();
-            // IDとhashは固定幅。guardの時刻は予約関数で最大幅に広げる。
-            let start = map(vec![
-                ("sequence", Value::Int((events.len() + 1) as i64)),
-                ("operation_id", bytes([0; 32])),
-                ("kind", text("key_passphrase_rotation_started")),
-                ("actor_uid", bytes(source_id.uid.to_be_bytes())),
-                ("recorded_unix_seconds", Value::Int(0)),
-                ("rules", text("lngnb-key-operations-1")),
-                ("previous_snapshot_sha256", bytes(expected.snapshot_hash)),
-                ("name", text(current_name)),
-                ("old_identity", old_identity.clone()),
-                (
-                    "old_ciphertext_sha256",
-                    bytes(<[u8; 32]>::from(Sha256::digest(&fixed.key.bytes))),
-                ),
-                ("new_ciphertext_sha256", bytes([0; 32])),
-                ("new_ciphertext_length", Value::Int(new_length as i64)),
-                ("public_key", bytes(fixed.public)),
-                ("guard_identity", old_identity),
-                (
-                    "previous_completed_operation_id",
-                    field(completed, "operation_id")?.clone(),
-                ),
-                (
-                    "preserved",
-                    map(vec![
-                        ("directory", backup_id.value()),
-                        ("name", text(backup_name)),
-                        ("identity", candidate.value()),
-                    ]),
-                ),
-            ]);
-            if !state_history::start_reservation_fits(
-                events.len(),
-                fixed.snapshot.bytes.len(),
-                &start,
-                initial_state::STATE_LIMIT,
-            )? {
-                return invalid();
-            }
-        }
         let mut preservations = Vec::with_capacity(past.len() + 1);
         preservations.push(Preservation {
             directory: current_backup,
@@ -474,6 +612,9 @@ impl KeyDirectory {
             fixed,
             preservations,
         };
+        if let Some(new_length) = new_ciphertext_length {
+            checked.start_record(expected, new_length)?;
+        }
         checked.sync_and_recheck()?;
         Ok(checked)
     }

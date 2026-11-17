@@ -818,4 +818,4 @@ impl<'a> PreparedKeyPassphraseCompletion<'a> {
 }
 
 #[path = "keyfile_passphrase_update.rs"]
-mod update;
+pub(super) mod update;
