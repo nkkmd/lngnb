@@ -382,8 +382,20 @@ fn rotation_start_waits_for_receipt_flush_before_recording() {
             stdfs::read(f.areas[0].0.join("next-copy")).unwrap(),
             old_key
         );
+        let recover = |source: &mut KeyDirectory, backups: &mut [KeyDirectory]| {
+            source.recover_passphrase_rotation_start(
+                "publisher",
+                current_passphrase,
+                backups,
+                0,
+                "next-copy",
+                &proofs,
+                &intent,
+            )
+        };
         if fail_flush {
             assert!(matches!(result, Err(KeyFileError::Io)));
+            assert!(recover(source, &mut f.backups).is_err());
             assert_eq!(stdfs::read(&history).unwrap(), old_history);
         } else {
             let (diagnostic, ciphertext) = result.unwrap();
@@ -395,6 +407,22 @@ fn rotation_start_waits_for_receipt_flush_before_recording() {
             assert_eq!(diagnostic.generation, completed.generation + 1);
             assert_ne!(stdfs::read(&history).unwrap(), old_history);
             assert_ne!(ciphertext, old_key);
+            assert_eq!(recover(source, &mut f.backups).unwrap(), diagnostic);
+            let new_history = stdfs::read(&history).unwrap();
+            let temp = format!(
+                ".lngnb-key-state-update-{}",
+                data_encoding::HEXLOWER.encode(&intent.operation_id),
+            );
+            f.a.put(initial_state::STATE, &old_history);
+            f.a.put(&temp, &new_history[..new_history.len() - 1]);
+            assert!(recover(source, &mut f.backups).is_err());
+            assert_eq!(stdfs::read(&history).unwrap(), old_history);
+            f.a.put(&temp, &new_history);
+            assert_eq!(recover(source, &mut f.backups).unwrap(), diagnostic);
+            assert_eq!(stdfs::read(&history).unwrap(), new_history);
+            assert!(!f.a.0.join(&temp).exists());
+            assert!(f.a.0.join(recovery_hold::GUARD).is_file());
+            assert_eq!(stdfs::read(f.a.0.join("publisher")).unwrap(), old_key);
         }
     }
 }

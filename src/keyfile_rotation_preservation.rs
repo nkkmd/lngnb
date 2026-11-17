@@ -19,15 +19,6 @@ impl FixedRotationKey {
     ) -> Result<Self> {
         inventory(source, None)?;
         absent(source, recovery_hold::GUARD)?;
-        let completed_operation_id = match expected.state {
-            KeyHistoryState::PassphraseChangeCompleted {
-                completed_operation_id,
-            }
-            | KeyHistoryState::PassphraseRotationCompleted {
-                completed_operation_id,
-            } => completed_operation_id,
-            _ => return invalid(),
-        };
         let marker = HeldFile::open(source, recovery_hold::MARKER, MAX_KEYFILE_BYTES)?;
         if marker.bytes.len() != 105 || !marker.bytes.starts_with(b"lngnb:key-recovery:2\0") {
             return invalid();
@@ -47,6 +38,38 @@ impl FixedRotationKey {
         }
         let value =
             cbor::decode(&snapshot.bytes).map_err(|_| KeyFileError::RecoveryStateInvalid)?;
+        let fixed = Self::from_completed_history(
+            source,
+            expected,
+            current_name,
+            passphrase,
+            marker,
+            snapshot,
+            value,
+        )?;
+        fixed.recheck(source, current_name)?;
+        Ok(fixed)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_completed_history(
+        source: &KeyDirectory,
+        expected: &KeyStateDiagnostic,
+        current_name: &str,
+        passphrase: &str,
+        marker: HeldFile,
+        snapshot: HeldFile,
+        value: Value,
+    ) -> Result<Self> {
+        let completed_operation_id = match expected.state {
+            KeyHistoryState::PassphraseChangeCompleted {
+                completed_operation_id,
+            }
+            | KeyHistoryState::PassphraseRotationCompleted {
+                completed_operation_id,
+            } => completed_operation_id,
+            _ => return invalid(),
+        };
         let events = array(field(&value, "events")?)?;
         let [.., started, _, completed] = events else {
             return invalid();
@@ -67,15 +90,13 @@ impl FixedRotationKey {
             return invalid();
         }
 
-        let fixed = Self {
+        Ok(Self {
             marker,
             snapshot,
             key,
             history: value,
             public,
-        };
-        fixed.recheck(source, current_name)?;
-        Ok(fixed)
+        })
     }
 
     fn recheck(&self, source: &KeyDirectory, current_name: &str) -> Result<()> {
@@ -555,6 +576,168 @@ impl KeyDirectory {
         )?;
         let diagnostic = prepared.record_snapshot_with(&mut |_| Ok(()), false)?;
         Ok((diagnostic, new_ciphertext))
+    }
+
+    /// 控えと完全な開始候補が一致する場合に限り、開始履歴の保存を復旧する。
+    #[allow(clippy::too_many_arguments)]
+    pub fn recover_passphrase_rotation_start(
+        &mut self,
+        current_name: &str,
+        passphrase: &str,
+        backups: &mut [KeyDirectory],
+        current_backup: usize,
+        backup_name: &str,
+        proofs: &[KeyResumePreservation<'_>],
+        start: &KeyPassphraseStartIntent,
+    ) -> Result<KeyStateDiagnostic> {
+        if proofs.len() >= 1024 || backups.len() > proofs.len() + 1 {
+            return invalid();
+        }
+        name(current_name)?;
+        name(backup_name)?;
+        let intent = KeyResumeIntent {
+            before: start.before,
+            after: start.after,
+            operation_id: start.operation_id,
+        };
+        if intent.after.state
+            != (KeyHistoryState::PassphraseRotationStarted {
+                started_operation_id: intent.operation_id,
+            })
+        {
+            return invalid();
+        }
+        let temp = format!(
+            ".lngnb-key-state-update-{}",
+            data_encoding::HEXLOWER.encode(&intent.operation_id)
+        );
+        inventory(self, Some(&temp))?;
+        let fixed = HeldFile::open(self, initial_state::STATE, initial_state::STATE_LIMIT)?;
+        let temporary = match HeldFile::open(self, &temp, initial_state::STATE_LIMIT) {
+            Ok(file) => Some(file),
+            Err(KeyFileError::Missing) => None,
+            Err(error) => return Err(error),
+        };
+        let marker = HeldFile::open(self, recovery_hold::MARKER, MAX_KEYFILE_BYTES)?;
+        let source_marker = recovery::source_marker(self, &intent)?;
+        marker.check(self, recovery_hold::MARKER, true)?;
+        let decode =
+            |file: &HeldFile| recovery::decode_snapshot(&file.bytes, &source_marker, &intent);
+        let needs_exchange = decode(&fixed)? == intent.before;
+        let (new, old) = if needs_exchange {
+            (
+                temporary
+                    .as_ref()
+                    .ok_or(KeyFileError::RecoveryStateInvalid)?,
+                Some(&fixed),
+            )
+        } else {
+            (&fixed, temporary.as_ref())
+        };
+        if decode(new)? != intent.after {
+            return invalid();
+        }
+        let prefix = recovery::verify_event_prefix(
+            &new.bytes,
+            &source_marker,
+            &intent,
+            "key_passphrase_rotation_started",
+        )?;
+        if old.is_some_and(|held| held.bytes != prefix) {
+            return invalid();
+        }
+        let value = cbor::decode(&new.bytes).map_err(|_| KeyFileError::RecoveryStateInvalid)?;
+        let event = array(field(&value, "events")?)?
+            .last()
+            .ok_or(KeyFileError::RecoveryStateInvalid)?;
+        let guard = HeldFile::open(self, recovery_hold::GUARD, MAX_KEYFILE_BYTES)?;
+        let mut guard_bytes = b"lngnb:key-hold:1\0".to_vec();
+        guard_bytes.extend(intent.before.initial.area_id);
+        if KeyFileIdentity::from_metadata(&guard.metadata)
+            != state_history::recorded_guard_identity(event)?
+            || guard.bytes != guard_bytes
+        {
+            return invalid();
+        }
+        let backup = backups
+            .get(current_backup)
+            .ok_or(KeyFileError::RecoveryStateInvalid)?;
+        for directory in backups.iter() {
+            directory.pending()?;
+        }
+        let saved = field(event, "preserved")?;
+        let backup_identity = KeyDirectoryIdentity::from_metadata(&io(backup.dir.metadata())?);
+        if backup_name != string(field(saved, "name")?)?
+            || !equal(field(saved, "directory")?, &backup_identity.value())?
+        {
+            return invalid();
+        }
+        let current = HeldFile::open(backup, backup_name, MAX_KEYFILE_BYTES)?;
+        if KeyFileIdentity::from_metadata(&current.metadata)
+            != state_history::recorded_file_identity(field(saved, "identity")?)?
+        {
+            return invalid();
+        }
+        let new_bytes = new.bytes.clone();
+        let history = cbor::decode(&prefix).map_err(|_| KeyFileError::RecoveryStateInvalid)?;
+        let fixed = FixedRotationKey::from_completed_history(
+            self,
+            &intent.before,
+            current_name,
+            passphrase,
+            marker,
+            fixed,
+            history,
+        )?;
+        if current.bytes != fixed.key.bytes {
+            return Err(KeyFileError::PreservationMismatch);
+        }
+        let mut used = vec![false; backups.len()];
+        used[current_backup] = true;
+        let mut preservations = fixed.open_history_preservations(backups, proofs, &mut used)?;
+        preservations.insert(
+            0,
+            Preservation {
+                directory: current_backup,
+                name: backup_name.into(),
+                held: current,
+            },
+        );
+        let source_identity = KeyDirectoryIdentity::from_metadata(&io(self.dir.metadata())?);
+        let backup_identities = backups
+            .iter()
+            .map(|directory| {
+                Ok(KeyDirectoryIdentity::from_metadata(&io(directory
+                    .dir
+                    .metadata())?))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let context = PreparedKeyResume {
+            source: self,
+            backups,
+            source_identity,
+            backup_identities,
+            current_name: current_name.into(),
+            current: fixed.key,
+            preservations,
+            absent_names: Vec::new(),
+            marker: fixed.marker,
+            guard: Some(guard),
+            state: fixed.snapshot,
+            new_bytes,
+            staged_key: None,
+            removed_key: None,
+            intent,
+        };
+        recovery::recover_snapshot(
+            context,
+            temporary.as_ref(),
+            &temp,
+            needs_exchange,
+            &intent,
+            &mut |_| Ok(()),
+            false,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
