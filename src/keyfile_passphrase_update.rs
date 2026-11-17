@@ -361,6 +361,36 @@ impl KeyPassphrasePreparedIntent {
 }
 
 impl KeyPassphraseCompletedIntent {
+    /// 連続更新の完了控えを準備控えに結び付けて読み戻す。
+    pub fn parse_rotation_receipt(
+        line: &str,
+        prepared: &KeyPassphrasePreparedIntent,
+    ) -> Result<Self> {
+        if prepared.after.state
+            != (KeyHistoryState::PassphraseRotationPrepared {
+                prepared_operation_id: prepared.operation_id,
+            })
+        {
+            return invalid();
+        }
+        let (after, operation_id) = parse_receipt(
+            line,
+            "key_passphrase_rotation_completed",
+            prepared.after,
+            |id| KeyHistoryState::PassphraseRotationCompleted {
+                completed_operation_id: id,
+            },
+        )?;
+        if operation_id == prepared.operation_id {
+            return invalid();
+        }
+        Ok(Self {
+            before: prepared.after,
+            after,
+            operation_id,
+        })
+    }
+
     /// 明示完了操作で、追記前に完了控えを出力する。
     pub fn write_receipt(&self, output: &mut impl Write) -> Result<()> {
         receipt(
