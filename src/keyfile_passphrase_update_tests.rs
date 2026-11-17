@@ -281,3 +281,148 @@ fn rotation_preservation_uses_the_fixed_completed_ciphertext_without_overwriting
     );
     assert!(!f.a.0.join(recovery_hold::GUARD).exists());
 }
+
+#[test]
+fn rotation_start_waits_for_receipt_flush_before_recording() {
+    #[derive(Default)]
+    struct Receipt {
+        bytes: Vec<u8>,
+        fail_flush: bool,
+    }
+    impl std::io::Write for Receipt {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            if self.fail_flush {
+                return Err(std::io::ErrorKind::BrokenPipe.into());
+            }
+            Ok(())
+        }
+    }
+
+    for fail_flush in [true, false] {
+        let mut f = Fixture::new(true, 1);
+        let resume = f.interrupt(S::OldSnapshotRemoved);
+        f.release(&resume, &mut |_| Ok(())).unwrap();
+        let KeyResumeRelease::RemovedRecordedGuard(completed) =
+            f.change_first(&resume, &mut Vec::new()).unwrap()
+        else {
+            panic!("expected first update to remove its guard")
+        };
+        let source = f.source.as_mut().unwrap();
+        let current_passphrase = "different public passphrase";
+        source
+            .preserve_key_for_passphrase_rotation(
+                &completed,
+                "publisher",
+                current_passphrase,
+                &mut f.backups[0],
+                "next-copy",
+            )
+            .unwrap();
+        let history = f.a.0.join(initial_state::STATE);
+        let old_history = stdfs::read(&history).unwrap();
+        let old_key = stdfs::read(f.a.0.join("publisher")).unwrap();
+        let proofs = [
+            KeyResumePreservation {
+                completed_operation_id: f.ids[0],
+                directory_index: f.indices[0],
+                name: &f.names[0],
+                passphrase: &f.pass,
+            },
+            KeyResumePreservation {
+                completed_operation_id: resume.operation_id,
+                directory_index: 0,
+                name: "saved",
+                passphrase: &f.pass,
+            },
+        ];
+        let mut receipt = Receipt {
+            fail_flush,
+            ..Receipt::default()
+        };
+        let result = source.record_passphrase_rotation_start(
+            &completed,
+            "publisher",
+            current_passphrase,
+            "rotation test passphrase",
+            &mut f.backups,
+            0,
+            "next-copy",
+            &proofs,
+            &mut receipt,
+        );
+        assert!(
+            receipt
+                .bytes
+                .starts_with(b"key_passphrase_rotation_started ")
+        );
+        let receipt = std::str::from_utf8(&receipt.bytes).unwrap();
+        let intent = KeyPassphraseStartIntent::parse_rotation_receipt(receipt, &completed).unwrap();
+        let mut stale = completed;
+        stale.snapshot_hash[0] ^= 1;
+        assert!(KeyPassphraseStartIntent::parse_rotation_receipt(receipt, &stale).is_err());
+        assert!(KeyPassphraseStartIntent::parse_rotation_receipt(receipt, &resume.after).is_err());
+        assert!(
+            KeyPassphraseStartIntent::parse_rotation_receipt(
+                &receipt.replacen(
+                    "key_passphrase_rotation_started",
+                    "key_passphrase_change_started",
+                    1
+                ),
+                &completed,
+            )
+            .is_err()
+        );
+        assert!(f.a.0.join(recovery_hold::GUARD).is_file());
+        assert_eq!(stdfs::read(f.a.0.join("publisher")).unwrap(), old_key);
+        assert_eq!(
+            stdfs::read(f.areas[0].0.join("next-copy")).unwrap(),
+            old_key
+        );
+        let recover = |source: &mut KeyDirectory, backups: &mut [KeyDirectory]| {
+            source.recover_passphrase_rotation_start(
+                "publisher",
+                current_passphrase,
+                backups,
+                0,
+                "next-copy",
+                &proofs,
+                &intent,
+            )
+        };
+        if fail_flush {
+            assert!(matches!(result, Err(KeyFileError::Io)));
+            assert!(recover(source, &mut f.backups).is_err());
+            assert_eq!(stdfs::read(&history).unwrap(), old_history);
+        } else {
+            let (diagnostic, ciphertext) = result.unwrap();
+            assert_eq!(intent.after, diagnostic);
+            assert!(matches!(
+                diagnostic.state,
+                KeyHistoryState::PassphraseRotationStarted { .. }
+            ));
+            assert_eq!(diagnostic.generation, completed.generation + 1);
+            assert_ne!(stdfs::read(&history).unwrap(), old_history);
+            assert_ne!(ciphertext, old_key);
+            assert_eq!(recover(source, &mut f.backups).unwrap(), diagnostic);
+            let new_history = stdfs::read(&history).unwrap();
+            let temp = format!(
+                ".lngnb-key-state-update-{}",
+                data_encoding::HEXLOWER.encode(&intent.operation_id),
+            );
+            stdfs::write(&history, &old_history).unwrap();
+            f.a.put(&temp, &new_history[..new_history.len() - 1]);
+            assert!(recover(source, &mut f.backups).is_err());
+            assert_eq!(stdfs::read(&history).unwrap(), old_history);
+            stdfs::write(f.a.0.join(&temp), &new_history).unwrap();
+            assert_eq!(recover(source, &mut f.backups).unwrap(), diagnostic);
+            assert_eq!(stdfs::read(&history).unwrap(), new_history);
+            assert!(!f.a.0.join(&temp).exists());
+            assert!(f.a.0.join(recovery_hold::GUARD).is_file());
+            assert_eq!(stdfs::read(f.a.0.join("publisher")).unwrap(), old_key);
+        }
+    }
+}
