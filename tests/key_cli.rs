@@ -46,7 +46,7 @@ fn history_key_cli_updates_and_recovers_with_a_real_terminal() {
     mkdir(&root.0);
     // 公開試験専用。実運用に流用しない。
     let old = "public CLI old example only";
-    for scenario in ["normal", "cancel", "output"] {
+    for scenario in ["normal", "cancel", "output", "cleanup"] {
         let path = root.0.join(scenario);
         let copy = root.0.join(format!("{scenario}-backup"));
         mkdir(&path);
@@ -60,6 +60,21 @@ fn history_key_cli_updates_and_recovers_with_a_real_terminal() {
             panic!("expected a new recovery hold");
         };
         source.initialize_key_state(&area_id).unwrap();
+        if scenario == "cleanup" {
+            let residue = format!(".lngnb-key-{}", "ab".repeat(32));
+            fs::copy(path.join("publisher"), path.join(residue)).unwrap();
+            let state = source.key_state_history(&area_id).unwrap();
+            fs::write(
+                root.0.join("cleanup-receipt"),
+                format!(
+                    "{} {}",
+                    data_encoding::HEXLOWER.encode(&area_id),
+                    data_encoding::HEXLOWER.encode(&state.snapshot_hash),
+                ),
+            )
+            .unwrap();
+            continue;
+        }
         let identity = |path| KeyFileIdentity::from_metadata(&fs::metadata(path).unwrap());
         let expected = KeyResumeExpected {
             state: source.key_state_history(&area_id).unwrap(),

@@ -342,8 +342,37 @@ impl KeyDirectory {
         }
         Ok(())
     }
-    /// 明示した一対象を認証・現物照合し、今回のfsyncを行って両領域を保持する。
-    /// 返却後intentを控えてからstartを呼べる。準備だけでは履歴/鍵を変更しない。
+    /// 指定したHeld状態を照合し、対象と保全コピーの識別情報を読み取る。
+    pub fn residue_cleanup_selection(
+        &mut self,
+        residue: &str,
+        backup: &KeyDirectory,
+        backup_name: &str,
+        area_id: &[u8; 32],
+        snapshot_hash: &[u8; 32],
+        public_key: [u8; 32],
+    ) -> Result<KeyCleanupExpected> {
+        if !recovery_name(residue) {
+            return Err(KeyFileError::UnsafePath);
+        }
+        name(backup_name)?;
+        let state = self.key_state_history(area_id)?;
+        if state.state != KeyHistoryState::Held || &state.snapshot_hash != snapshot_hash {
+            return invalid();
+        }
+        let target = HeldFile::open(self, residue, MAX_KEYFILE_BYTES)?;
+        let preserved = HeldFile::open(backup, backup_name, MAX_KEYFILE_BYTES)?;
+        Ok(KeyCleanupExpected {
+            state,
+            target: KeyFileIdentity::from_metadata(&target.metadata),
+            preserved_directory: KeyDirectoryIdentity::from_metadata(&io(backup.dir.metadata())?),
+            preserved: KeyFileIdentity::from_metadata(&preserved.metadata),
+            public_key,
+        })
+    }
+
+    /// 現物と保全コピーを認証・照合し、fsyncして両領域を保持する。
+    /// 準備では履歴や鍵を変更しない。intentを控えてからstartを呼べる。
     pub fn prepare_residue_cleanup<'a>(
         &'a mut self,
         residue: &str,

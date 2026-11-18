@@ -167,8 +167,40 @@ def history_cases(root):
             assert not guard.exists() and (backup / "rotation-copy").read_bytes() == changed
         assert (backup / "saved").read_bytes() == original
 
+def cleanup_case(root):
+    directory = root / "cleanup"
+    backup = root / "cleanup-backup"
+    area, snapshot = (root / "cleanup-receipt").read_text().split()
+    residue = ".lngnb-key-" + "ab" * 32
+    original = (directory / residue).read_bytes()
+    key_id = decode_key(directory / residue, OLD)[2].decode()
+    args = ["--expect-area-id", area, "--snapshot-hash", snapshot, "--expect-key-id", key_id]
+    before = {p.name: p.read_bytes() for p in directory.iterdir()}
+
+    def start(**kwargs):
+        return invoke(directory, "cleanup-start", [OLD], residue=residue,
+                      backup=(backup, "saved"), extra=args, **kwargs)
+
+    saved = backup / "saved"
+    saved.write_bytes(original[:-1] + bytes([original[-1] ^ 1]))
+    start(expected=1)
+    saved.write_bytes(original)
+    start(expected=1, closed_output=True)
+    assert {p.name: p.read_bytes() for p in directory.iterdir()} == before
+    out, _ = start()
+    intent, status = out.decode().splitlines()
+    assert intent.startswith("key_cleanup_start_intent area_id=" + area)
+    assert "before_hash=" + snapshot in intent
+    assert status == "key_cleanup_start_saved"
+    start(expected=1)
+    after = {p.name: p.read_bytes() for p in directory.iterdir()}
+    assert after.keys() == before.keys()
+    assert {name for name in before if before[name] != after[name]} == {".lngnb-key-state"}
+    assert saved.read_bytes() == original
+
 if len(sys.argv) == 3:
     history_cases(Path(sys.argv[2]))
+    cleanup_case(Path(sys.argv[2]))
     print("HISTORY_KEY_CLI_CASES_OK")
     sys.exit(0)
 
