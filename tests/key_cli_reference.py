@@ -198,6 +198,28 @@ def cleanup_case(root):
     assert {name for name in before if before[name] != after[name]} == {".lngnb-key-state"}
     assert saved.read_bytes() == original
 
+    def recover(receipt, expected=0):
+        return invoke(directory, "recover-cleanup-start", [OLD], expected=expected,
+                      residue=residue, backup=(backup, "saved"),
+                      extra=["--expect-key-id", key_id, "--start", receipt])
+
+    recover(intent.replace(snapshot, "00" * 32), expected=1)
+    assert {p.name: p.read_bytes() for p in directory.iterdir()} == after
+    state = directory / ".lngnb-key-state"
+    pending = directory / (".lngnb-key-state-update-" + intent.split(" operation_id=")[1])
+    # 完全な旧固定と新候補、および交換直後の配置を再現する。
+    for fixed, temporary in ((before[state.name], after[state.name]),
+                             (after[state.name], before[state.name])):
+        state.write_bytes(fixed)
+        pending.touch(mode=0o600, exist_ok=False)
+        pending.write_bytes(temporary)
+        assert recover(intent)[0] == b"key_cleanup_start_confirmed\n"
+        assert {p.name: p.read_bytes() for p in directory.iterdir()} == after
+    assert recover(intent)[0] == b"key_cleanup_start_confirmed\n"
+    assert {p.name: p.read_bytes() for p in directory.iterdir()} == after
+    assert saved.read_bytes() == original
+
+
 if len(sys.argv) == 3:
     history_cases(Path(sys.argv[2]))
     cleanup_case(Path(sys.argv[2]))

@@ -9,11 +9,57 @@ pub(super) struct Request {
     backup_name: String,
     area_id: [u8; 32],
     snapshot_hash: [u8; 32],
+    recovery: Option<Recovery>,
     expected_key: Id,
 }
 
-pub(super) fn parse(args: &[OsString]) -> Result<Command, AppError> {
-    let usage = || AppError::Usage("key cleanup-start の引数を確認してください");
+#[derive(Debug, PartialEq, Eq)]
+struct Recovery {
+    generation: u64,
+    after_hash: [u8; 32],
+    operation_id: [u8; 32],
+}
+
+fn decode(value: &str) -> Option<[u8; 32]> {
+    let mut id = [0; 32];
+    if value.len() != 64 {
+        return None;
+    }
+    HEXLOWER.decode_mut(value.as_bytes(), &mut id).ok()?;
+    Some(id)
+}
+
+fn receipt(value: &str) -> Option<([u8; 32], [u8; 32], Recovery)> {
+    let mut fields = value.split(' ');
+    if fields.next()? != "key_cleanup_start_intent" {
+        return None;
+    }
+    let area_id = decode(fields.next()?.strip_prefix("area_id=")?)?;
+    let generation_text = fields.next()?.strip_prefix("generation=")?;
+    let generation: u64 = generation_text.parse().ok()?;
+    if generation.to_string() != generation_text || generation.checked_add(1).is_none() {
+        return None;
+    }
+    let before = decode(fields.next()?.strip_prefix("before_hash=")?)?;
+    let after_hash = decode(fields.next()?.strip_prefix("after_hash=")?)?;
+    let operation_id = decode(fields.next()?.strip_prefix("operation_id=")?)?;
+    if fields.next().is_some() {
+        return None;
+    }
+    Some((
+        area_id,
+        before,
+        Recovery {
+            generation,
+            after_hash,
+            operation_id,
+        },
+    ))
+}
+
+pub(super) fn parse(args: &[OsString], recover: bool) -> Result<Command, AppError> {
+    let usage =
+        || AppError::Usage("key cleanup-start / recover-cleanup-start の引数を確認してください");
     let mut values = std::collections::BTreeMap::new();
     for pair in args.chunks(2) {
         let [flag, value] = pair else {
@@ -34,18 +80,19 @@ pub(super) fn parse(args: &[OsString]) -> Result<Command, AppError> {
     let residue = string("--residue")?;
     let backup_name = string("--backup-name")?;
     let expected_key = Id::parse(Kind::Key, string("--expect-key-id")?).map_err(|_| usage())?;
-    let decode = |value: &str| {
-        let mut id = [0; 32];
-        if value.len() != 64 || HEXLOWER.decode_mut(value.as_bytes(), &mut id).is_err() {
-            return Err(usage());
-        }
-        Ok(id)
+    let (area_id, snapshot_hash, recovery) = if recover {
+        let (area_id, snapshot_hash, recovery) = receipt(string("--start")?).ok_or_else(usage)?;
+        (area_id, snapshot_hash, Some(recovery))
+    } else {
+        (
+            decode(string("--expect-area-id")?).ok_or_else(usage)?,
+            decode(string("--snapshot-hash")?).ok_or_else(usage)?,
+            None,
+        )
     };
-    let area_id = decode(string("--expect-area-id")?)?;
-    let snapshot_hash = decode(string("--snapshot-hash")?)?;
     let valid_residue = residue
         .strip_prefix(".lngnb-key-")
-        .is_some_and(|id| decode(id).is_ok());
+        .is_some_and(|id| decode(id).is_some());
     if !valid_residue || !regular_name(backup_name) || !values.is_empty() {
         return Err(usage());
     }
@@ -57,6 +104,7 @@ pub(super) fn parse(args: &[OsString]) -> Result<Command, AppError> {
             area_id,
             snapshot_hash,
             expected_key,
+            recovery,
         })),
         directory,
         name: None,
@@ -83,6 +131,26 @@ impl Request {
             .map_err(fail)?;
         if key_id(&public) != self.expected_key {
             return Err(fail(KeyFileError::UnexpectedPublicKey));
+        }
+        if let Some(recovery) = self.recovery {
+            signals.check_cancelled()?;
+            source
+                .recover_residue_cleanup_from_receipt(
+                    &self.residue,
+                    password.as_str(),
+                    &mut backup,
+                    &self.backup_name,
+                    public,
+                    self.area_id,
+                    recovery.generation,
+                    self.snapshot_hash,
+                    recovery.after_hash,
+                    recovery.operation_id,
+                )
+                .map_err(fail)?;
+            return writeln!(output, "key_cleanup_start_confirmed")
+                .and_then(|()| output.flush())
+                .map_err(|_| Error::HistoryOutput);
         }
         let expected = source
             .residue_cleanup_selection(

@@ -127,6 +127,17 @@ lngnb key cleanup-start --key-dir PATH --residue .lngnb-key-HEX \
 
 期待する領域ID、現在の履歴スナップショットハッシュ、鍵IDを明示します。対話端末で入力したパスフレーズで対象を認証し、別領域の保全コピーが暗号文全体にわたり一致することを確認します。履歴追記前に `key_cleanup_start_intent` の一行を出力します。開始が保存されると `key_cleanup_start_saved` を出力します。後者を確認できなかった場合は、開始控えを保持して履歴と現物を確認してください。対象、保全コピー、現在鍵、変更停止を保持します。
 
+`key recover-cleanup-start` は、開始時の控えと現物を照合し、整理開始記録の保存を確認します。
+
+```text
+lngnb key recover-cleanup-start --key-dir PATH --residue .lngnb-key-HEX \
+  --backup-dir PATH --backup-name NAME --expect-key-id KEY_ID \
+  --start 'key_cleanup_start_intent …'
+```
+
+`--start` には開始時の出力一行をそのまま渡します。対象のパスフレーズと、開始時に指定した対象名・別領域の保全コピー・鍵IDが必要です。完全な新旧履歴が残る場合、または新履歴が固定済みの場合に保存確認を行い、成功時に `key_cleanup_start_confirmed` を出力します。開始前の履歴だけが残っている場合や控えが合わない場合は拒否します。対象の残存暗号文と変更停止を保持します。
+
+
 
 ### 元領域を保持した別領域での操作
 
