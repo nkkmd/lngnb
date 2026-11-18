@@ -108,3 +108,55 @@ fn history_key_cli_updates_and_recovers_with_a_real_terminal() {
     );
     assert_eq!(output.stdout, b"HISTORY_KEY_CLI_CASES_OK\n");
 }
+
+#[test]
+fn initial_key_hold_cli_recovers_only_the_matching_complete_marker() {
+    use std::{fs, os::unix::fs::DirBuilderExt};
+    let mut nonce = [0; 16];
+    getrandom::getrandom(&mut nonce).unwrap();
+    let dir = std::env::temp_dir().join(data_encoding::HEXLOWER.encode(&nonce));
+    fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+    let run = |action, extra: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_lngnb"))
+            .args(["key", action, "--key-dir"])
+            .arg(&dir)
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+    let key = dir.join("publisher");
+    fs::write(&key, b"public test fixture").unwrap();
+    let output = run("initial-hold", &[]);
+    assert!(output.status.success());
+    let output = String::from_utf8(output.stdout).unwrap();
+    let id = output
+        .lines()
+        .next()
+        .unwrap()
+        .strip_prefix("key_initial_hold_intent area_id=")
+        .unwrap();
+    assert_eq!(
+        output.lines().nth(1).unwrap(),
+        format!("key_initial_hold_saved area_id={id}")
+    );
+    let guard = dir.join(".lngnb-key-hold");
+    let marker = dir.join(".lngnb-key-control");
+    fs::remove_file(&guard).unwrap();
+    assert!(
+        !run(
+            "recover-initial-hold",
+            &["--expect-area-id", &"00".repeat(32)]
+        )
+        .status
+        .success()
+    );
+    assert!(!guard.exists());
+    let recover = || run("recover-initial-hold", &["--expect-area-id", id]);
+    assert!(recover().status.success());
+    fs::remove_file(&guard).unwrap();
+    fs::write(&marker, b"incomplete").unwrap();
+    assert!(!recover().status.success());
+    assert!(!guard.exists());
+    assert_eq!(fs::read(key).unwrap(), b"public test fixture");
+    fs::remove_dir_all(dir).unwrap();
+}

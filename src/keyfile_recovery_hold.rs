@@ -192,8 +192,17 @@ impl KeyDirectory {
     /// 既存領域へ初期停止を明示導入。既存二名は不正でも上書き/採用しない。
     /// 成功後も既存pending()は通常変更を拒否する。秘密/鍵fileは扱わない。
     pub fn initialize_recovery_hold(&mut self) -> Result<KeyRecoveryHold> {
+        self.initialize_recovery_hold_with_receipt(|_| Ok(()))
+    }
+
+    /// 作成前に復旧用領域IDを呼出し側へ渡す。
+    pub fn initialize_recovery_hold_with_receipt(
+        &mut self,
+        receipt: impl FnOnce(&[u8; 32]) -> Result<()>,
+    ) -> Result<KeyRecoveryHold> {
         let mut area_id = [0; 32];
         super::super::random(&mut area_id)?;
+        receipt(&area_id)?;
         self.initialize_recovery_hold_with(area_id, &mut |_, _| Ok(()))
     }
 

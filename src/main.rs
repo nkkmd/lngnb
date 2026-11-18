@@ -56,6 +56,8 @@ const HELP: &str = "lngnb — 分散図書館・知識基盤（開発初期段�
   lngnb key change-passphrase --key-dir PATH --name NAME
   lngnb key history-passphrase STAGE --key-dir PATH --name NAME --backup-dir PATH --backup-name NAME --resume RECEIPT [OPTIONS]
   lngnb key history-passphrase-rotation STAGE --key-dir PATH --name NAME --backup-dir PATH --backup-name NAME --previous-completed RECEIPT [OPTIONS]
+  lngnb key initial-hold --key-dir PATH
+  lngnb key recover-initial-hold --key-dir PATH --expect-area-id AREA_ID
   lngnb key recovery-status --key-dir PATH
   lngnb key check-residue --key-dir PATH --residue NAME
   lngnb key preserve-residue --key-dir PATH --residue NAME --backup-dir PATH --backup-name NAME
