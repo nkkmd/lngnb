@@ -36,6 +36,78 @@ pub(super) fn absent(dir: &KeyDirectory, name: &str) -> Result<()> {
 }
 
 impl KeyDirectory {
+    /// 開始控えと固定履歴を照合し、追記だけを明示復旧する。
+    #[allow(clippy::too_many_arguments)]
+    pub fn recover_residue_cleanup_from_receipt(
+        &mut self,
+        residue: &str,
+        passphrase: &str,
+        backup: &mut KeyDirectory,
+        backup_name: &str,
+        public_key: [u8; 32],
+        area_id: [u8; 32],
+        generation: u64,
+        before_hash: [u8; 32],
+        after_hash: [u8; 32],
+        operation_id: [u8; 32],
+    ) -> Result<KeyStateDiagnostic> {
+        if !recovery_name(residue) {
+            return Err(KeyFileError::UnsafePath);
+        }
+        name(backup_name)?;
+        let marker = HeldFile::open(self, recovery_hold::MARKER, MAX_KEYFILE_BYTES)?;
+        if marker.bytes.len() != 105 || !marker.bytes.starts_with(b"lngnb:key-recovery:2\0") {
+            return invalid();
+        }
+        let mut source = marker.bytes[..73].to_vec();
+        source[19] = b'1';
+        if self.marker_area_id(&source)? != area_id {
+            return invalid();
+        }
+        let root = marker.bytes[73..]
+            .try_into()
+            .map_err(|_| KeyFileError::RecoveryStateInvalid)?;
+        let fixed = HeldFile::open(self, initial_state::STATE, initial_state::STATE_LIMIT)?;
+        let initial = state_history::decode_history(&fixed.bytes, &source, area_id, root)?.initial;
+        let before = KeyStateDiagnostic {
+            initial,
+            generation,
+            snapshot_hash: before_hash,
+            state: KeyHistoryState::Held,
+        };
+        let intent = KeyCleanupStart {
+            before,
+            after: KeyStateDiagnostic {
+                initial,
+                generation: generation
+                    .checked_add(1)
+                    .ok_or(KeyFileError::RecoveryStateInvalid)?,
+                snapshot_hash: after_hash,
+                state: KeyHistoryState::Active {
+                    started_operation_id: operation_id,
+                },
+            },
+            operation_id,
+        };
+        let target = HeldFile::open(self, residue, MAX_KEYFILE_BYTES)?;
+        let preserved = HeldFile::open(backup, backup_name, MAX_KEYFILE_BYTES)?;
+        let expected = KeyCleanupExpected {
+            state: before,
+            target: KeyFileIdentity::from_metadata(&target.metadata),
+            preserved_directory: KeyDirectoryIdentity::from_metadata(&io(backup.dir.metadata())?),
+            preserved: KeyFileIdentity::from_metadata(&preserved.metadata),
+            public_key,
+        };
+        self.recover_residue_cleanup_start(
+            residue,
+            passphrase,
+            backup,
+            backup_name,
+            &expected,
+            &intent,
+        )
+    }
+
     /// 控えた開始intentと現在の両現物で追記中断だけを復旧する。
     /// 成功もActive/停止を維持し、対象unlink・通常変更許可は与えない。
     pub fn recover_residue_cleanup_start(
