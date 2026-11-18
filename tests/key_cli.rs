@@ -167,7 +167,7 @@ fn initial_key_hold_cli_checks_hold_and_history_recovery_receipts() {
     assert_eq!(fields[0], "key_initial_history_intent");
     let operation = fields[2].strip_prefix("operation_id=").unwrap();
     let hash = fields[3].strip_prefix("snapshot_hash=").unwrap();
-    let recover_history = |hash| {
+    let recover_history = |hash: &str| {
         run(
             "recover-initial-history",
             &[
