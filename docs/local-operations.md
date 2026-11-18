@@ -141,6 +141,9 @@ lngnb key recover-cleanup-start --key-dir PATH --residue .lngnb-key-HEX \
 
 完了の追記前に `key_cleanup_completion_intent` を出力し、保存後に `key_cleanup_absence_confirmed` を出力します。保存の確認が取れない場合は開始と完了の控えを保持してください。鍵領域の変更停止は継続します。
 
+`key recover-cleanup-completion` は、不在完了の追記が中断した場合に既存の完了記録を確認・復旧します。`cleanup-complete-absent` の `--start` の代わりに `--completion` を指定し、出力された `key_cleanup_completion_intent` の一行全体を渡します。対象の不在と保全コピーを再照合し、完全な完了候補がある場合に保存を確認します。成功時は `key_cleanup_completion_confirmed` を出力し、鍵領域の変更停止を維持します。
+
+
 
 
 
