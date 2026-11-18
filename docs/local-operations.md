@@ -137,6 +137,11 @@ lngnb key recover-cleanup-start --key-dir PATH --residue .lngnb-key-HEX \
 
 `--start` には開始時の出力一行をそのまま渡します。対象のパスフレーズと、開始時に指定した対象名・別領域の保全コピー・鍵IDが必要です。完全な新旧履歴が残る場合、または新履歴が固定済みの場合に保存確認を行い、成功時に `key_cleanup_start_confirmed` を出力します。開始前の履歴だけが残っている場合や控えが合わない場合は拒否します。対象の残存暗号文と変更停止を保持します。
 
+`key cleanup-complete-absent` は、開始記録が保存済みで対象名がすでに不在の場合に完了を記録します。`recover-cleanup-start` と同じ引数を指定し、保全コピーのパスフレーズを対話端末で入力します。対象名が存在する場合は拒否します。
+
+完了の追記前に `key_cleanup_completion_intent` を出力し、保存後に `key_cleanup_absence_confirmed` を出力します。保存の確認が取れない場合は開始と完了の控えを保持してください。鍵領域の変更停止は継続します。
+
+
 
 
 ### 元領域を保持した別領域での操作

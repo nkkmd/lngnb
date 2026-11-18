@@ -220,6 +220,30 @@ def cleanup_case(root):
     assert saved.read_bytes() == original
 
 
+    def complete(receipt, **kwargs):
+        return invoke(directory, "cleanup-complete-absent", [OLD], residue=residue,
+                      backup=(backup, "saved"),
+                      extra=["--expect-key-id", key_id, "--start", receipt], **kwargs)
+
+    complete(intent, expected=1)
+    assert {p.name: p.read_bytes() for p in directory.iterdir()} == after
+    (directory / residue).unlink()
+    absent = {name: data for name, data in after.items() if name != residue}
+    complete(intent.replace(snapshot, "00" * 32), expected=1)
+    complete(intent, expected=1, closed_output=True)
+    assert {p.name: p.read_bytes() for p in directory.iterdir()} == absent
+    out, _ = complete(intent)
+    completion, status = out.decode().splitlines()
+    assert completion.startswith("key_cleanup_completion_intent area_id=" + area)
+    assert completion.endswith("disposition=confirmed_absent_on_recovery")
+    assert status == "key_cleanup_absence_confirmed"
+    complete(intent, expected=1)
+    final = {p.name: p.read_bytes() for p in directory.iterdir()}
+    assert final.keys() == absent.keys()
+    assert {name for name in absent if absent[name] != final[name]} == {state.name}
+    assert saved.read_bytes() == original
+
+
 if len(sys.argv) == 3:
     history_cases(Path(sys.argv[2]))
     cleanup_case(Path(sys.argv[2]))

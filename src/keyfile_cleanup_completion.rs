@@ -417,7 +417,45 @@ fn completion_value(
 }
 
 impl KeyDirectory {
-    /// 対象を削除せず、現在の不在と保全先を再資格化して新規不在完了を準備する。
+    /// 開始控えを固定履歴へ照合し、完了準備に必要な識別情報を読み取る。
+    pub fn absent_cleanup_selection(
+        &mut self,
+        backup: &KeyDirectory,
+        backup_name: &str,
+        area_id: &[u8; 32],
+        start_hashes: (&[u8; 32], &[u8; 32]),
+        started_operation_id: &[u8; 32],
+        public_key: [u8; 32],
+    ) -> Result<KeyCleanupExpected> {
+        name(backup_name)?;
+        let state = self.key_state_history(area_id)?;
+        if &state.snapshot_hash != start_hashes.1 || &active_id(&state)? != started_operation_id {
+            return invalid();
+        }
+        let snapshot = self.state_bytes(initial_state::STATE, initial_state::STATE_LIMIT)?;
+        if <[u8; 32]>::from(Sha256::digest(&snapshot)) != state.snapshot_hash {
+            return invalid();
+        }
+        let mut value = decoded(&snapshot)?;
+        let event = events_mut(&mut value)?
+            .pop()
+            .ok_or(KeyFileError::RecoveryStateInvalid)?;
+        let target =
+            state_history::recorded_file_identity(field(field(&event, "target")?, "identity")?)?;
+        if <[u8; 32]>::from(Sha256::digest(encoded(&value)?)) != *start_hashes.0 {
+            return invalid();
+        }
+        let preserved = HeldFile::open(backup, backup_name, MAX_KEYFILE_BYTES)?;
+        Ok(KeyCleanupExpected {
+            state,
+            target,
+            preserved_directory: KeyDirectoryIdentity::from_metadata(&io(backup.dir.metadata())?),
+            preserved: KeyFileIdentity::from_metadata(&preserved.metadata),
+            public_key,
+        })
+    }
+
+    /// 現在の不在を確認して完了記録を準備する。
     pub fn prepare_absent_residue_completion<'a>(
         &'a mut self,
         residue: &str,
