@@ -4,7 +4,7 @@ use super::AppError;
 mod passphrase;
 use lngnb::{
     id::{Id, Kind, key_id},
-    keyfile::{KeyDirectory, KeyFileError, KeyRecoveryInventory},
+    keyfile::{KeyDirectory, KeyFileError, KeyRecoveryHold, KeyRecoveryInventory},
     secret_terminal::{SecretInputError, SecretTerminal, TerminalSignals},
 };
 use std::{ffi::OsString, fmt, io::Write, path::PathBuf};
@@ -15,6 +15,7 @@ enum Action {
     Check,
     Change,
     RecoveryStatus,
+    InitialHold(Option<[u8; 32]>),
     CheckResidue,
     PreserveResidue,
     RestoreResidue,
@@ -49,6 +50,44 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
     }
     if action == "history-passphrase-rotation" {
         return passphrase::parse(rest, true);
+    }
+    if matches!(
+        action.to_str(),
+        Some("initial-hold" | "recover-initial-hold")
+    ) {
+        let recover = action == "recover-initial-hold";
+        let mut directory = None;
+        let mut area_id = None;
+        for pair in rest.chunks(2) {
+            let [option, value] = pair else {
+                return Err(usage());
+            };
+            if option == "--key-dir" && directory.is_none() && !value.is_empty() {
+                directory = Some(PathBuf::from(value));
+            } else if recover && option == "--expect-area-id" && area_id.is_none() {
+                let mut id = [0; 32];
+                if value.len() != 64
+                    || data_encoding::HEXLOWER
+                        .decode_mut(value.as_encoded_bytes(), &mut id)
+                        .is_err()
+                {
+                    return Err(usage());
+                }
+                area_id = Some(id);
+            } else {
+                return Err(usage());
+            }
+        }
+        if recover && area_id.is_none() {
+            return Err(usage());
+        }
+        return Ok(Command {
+            action: Action::InitialHold(area_id),
+            directory: directory.ok_or_else(usage)?,
+            name: None,
+            backup: None,
+            restoration: None,
+        });
     }
     let action = match action.to_str() {
         Some("create") => Action::Create,
@@ -264,6 +303,32 @@ pub fn run(command: Command, output: &mut impl Write) -> Result<(), Error> {
     if command.action == Action::RecoveryStatus {
         return report_inventory(&directory.recovery_inventory()?, output);
     }
+    if let Action::InitialHold(expected) = command.action {
+        signals.check_cancelled()?;
+        let result = match expected {
+            Some(id) => directory.recover_initial_hold(&id),
+            None => directory.initialize_recovery_hold_with_receipt(|id| {
+                writeln!(
+                    output,
+                    "key_initial_hold_intent area_id={}",
+                    data_encoding::HEXLOWER.encode(id)
+                )
+                .and_then(|()| output.flush())
+                .map_err(|_| KeyFileError::Io)
+            }),
+        }
+        .map_err(Error::HistoryPassphrase)?;
+        let KeyRecoveryHold::Held { area_id } = result else {
+            return Err(Error::HistoryPassphrase(KeyFileError::RecoveryStateInvalid));
+        };
+        return writeln!(
+            output,
+            "key_initial_hold_saved area_id={}",
+            data_encoding::HEXLOWER.encode(&area_id)
+        )
+        .and_then(|()| output.flush())
+        .map_err(|_| Error::HistoryOutput);
+    }
     let name = command.name.as_deref().unwrap_or("");
     if command.action == Action::PreserveResidue {
         let (path, backup_name) = command
@@ -329,6 +394,7 @@ pub fn run(command: Command, output: &mut impl Write) -> Result<(), Error> {
                 .map_err(Error::Restore)?
         }
         Action::HistoryPassphrase(_) => unreachable!("history operation has a separate entry"),
+        Action::InitialHold(_) => unreachable!("initial hold returns before terminal input"),
         Action::RecoveryStatus => unreachable!("inventory returns before terminal input"),
         Action::PreserveResidue => unreachable!("preservation uses both directory locks above"),
     };
@@ -351,6 +417,7 @@ fn report(action: &Action, public: &[u8; 32], output: &mut impl Write) -> Result
             "指定した残存暗号文を期待する鍵IDと照合し、明示した空いている復元先名へ同じbytesを保存しました。全残存物を保持し、変更停止も解除していません。過去の更新確定・元名の推測・新旧判定・残存物の整理許可ではありません"
         }
         Action::HistoryPassphrase(_) => unreachable!("history operation has a separate entry"),
+        Action::InitialHold(_) => unreachable!("initial hold returns before terminal input"),
         Action::RecoveryStatus => unreachable!("inventory has a separate report"),
         Action::PreserveResidue => {
             "指定した残存暗号文を認証し、明示した保全先の新しい名前へ同じbytesを保存しました。保全元の現在名・残存物は書換え・削除していません。過去の更新確定・新旧判定・残存物の整理許可ではありません"
