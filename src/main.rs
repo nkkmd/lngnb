@@ -55,6 +55,7 @@ const HELP: &str = "lngnb — 分散図書館・知識基盤（開発初期段�
   lngnb key check --key-dir PATH --name NAME
   lngnb key change-passphrase --key-dir PATH --name NAME
   lngnb key history-passphrase STAGE --key-dir PATH --name NAME --backup-dir PATH --backup-name NAME --resume RECEIPT [OPTIONS]
+  lngnb key history-passphrase-rotation STAGE --key-dir PATH --name NAME --backup-dir PATH --backup-name NAME --previous-completed RECEIPT [OPTIONS]
   lngnb key recovery-status --key-dir PATH
   lngnb key check-residue --key-dir PATH --residue NAME
   lngnb key preserve-residue --key-dir PATH --residue NAME --backup-dir PATH --backup-name NAME
@@ -65,6 +66,12 @@ NAMEは1〜128 bytesのASCII英数字/._-（dot/dotdot・予約prefixを除く�
 パスフレーズは前面の制御端末から非表示入力します。
 暗号化鍵とパスフレーズを別々に保全してください。紛失は管理トークンで回復できません。
 鍵共用時は漏洩の影響が複数資料に及びます。同一Knowledgeの鍵交代は未対応です。
+history-passphrase-rotation は直前の完了控えと別領域の保全先を指定します。
+preserve で非上書き保全を作成し、verify-preserved で既存保全を再照合できます。
+prepare → exchange → complete → release の順に実行し、出力される控えを保持してください。
+exchange / complete は --start と --prepared、release はさらに --completed を指定します。
+recover-start / recover-prepared / recover-completed は対象段階までの控えを指定します。
+prepare 以降は履歴順に --preservation OPERATION_ID PATH NAME を必要件数指定します。
 recovery-status は残存名と上限付き読取りだけを診断します（端末不要）。
 check-residue は一覧中の生成形式名を明示し、端末入力で認証復号します。
 どちらも書換え・採用・削除、元の対象名・新旧・過去の更新結果の確定は行いません。

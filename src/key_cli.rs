@@ -45,7 +45,10 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
         return Err(usage());
     };
     if action == "history-passphrase" {
-        return passphrase::parse(rest);
+        return passphrase::parse(rest, false);
+    }
+    if action == "history-passphrase-rotation" {
+        return passphrase::parse(rest, true);
     }
     let action = match action.to_str() {
         Some("create") => Action::Create,

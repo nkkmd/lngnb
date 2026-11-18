@@ -22,6 +22,7 @@ import hashlib
 BINARY = sys.argv[1]
 OLD = b"public CLI old example only"
 NEW = "public CLI new e\u0301 é あ example only".encode()
+ROTATED = b"public CLI rotated example only"
 
 def decode_key(path, password):
     raw = path.read_bytes()
@@ -81,7 +82,7 @@ def invoke(directory, action, payloads, expected=0, cancel=None, closed_output=F
         while select.select([master], [], [], 0)[0]:
             captured.extend(os.read(master, 4096))
         assert not select.select([slave], [], [], 0)[0], "CLI left pending input"
-        for secret in (OLD, NEW, b"public cancelled CLI input", b"public wrong example only"):
+        for secret in (OLD, NEW, ROTATED, b"public cancelled CLI input", b"public wrong example only"):
             assert secret not in bytes(captured) + out + err, "CLI exposed public test secret"
         if expected != 0:
             assert not out, "failure emitted success output"
@@ -130,6 +131,40 @@ def history_cases(root):
             out, _ = history("release", [OLD, NEW])
             assert out == b"key_passphrase_change_guard_absence_confirmed\n"
             assert not guard.exists() and path.read_bytes() == changed
+            rotation_args = ["--previous-completed", completed]
+            def rotation(stage, passwords, extras=(), **kwargs):
+                return invoke(directory, "history-passphrase-rotation", passwords,
+                              backup=(backup, "rotation-copy"), extra=rotation_args + list(extras),
+                              history_stage=stage, **kwargs)
+            rotation("preserve", [NEW])
+            assert (backup / "rotation-copy").read_bytes() == changed
+            rotation("preserve", [NEW], expected=1)
+            rotation("verify-preserved", [NEW])
+            rotation("prepare", [NEW, ROTATED, ROTATED], expected=1)
+            assert not guard.exists() and path.read_bytes() == changed
+            resume_id = receipt.split(" operation_id=")[1]
+            rotation_args.extend(["--preservation", resume_id, str(backup), "saved"])
+            out, _ = rotation("prepare", [NEW, ROTATED, ROTATED, OLD])
+            started, prepared, status = out.decode().splitlines()
+            assert status == "key_passphrase_rotation_prepared_guard_retained"
+            assert guard.exists() and path.read_bytes() == changed
+            rotation("recover-start", [], extras=["--start", started, "--prepared", prepared], expected=2)
+            rotation("recover-prepared", [NEW, ROTATED, OLD],
+                     extras=["--start", started, "--prepared", prepared])
+            rotation_args.extend(["--start", started, "--prepared", prepared])
+            rotation("exchange", [NEW, ROTATED, OLD])
+            rotation("exchange", [NEW, ROTATED, OLD])
+            out, _ = rotation("complete", [NEW, ROTATED, OLD])
+            rotated, status = out.decode().splitlines()
+            assert status == "key_passphrase_rotation_completion_confirmed_guard_retained"
+            assert guard.exists() and decode_key(path, ROTATED)[0] == decode_key(backup / "saved", OLD)[0]
+            rotation_args.extend(["--completed", rotated])
+            rotation("recover-completed", [NEW, ROTATED, OLD])
+            out, _ = rotation("release", [NEW, ROTATED, OLD])
+            assert out == b"key_passphrase_rotation_guard_removed\n"
+            out, _ = rotation("release", [NEW, ROTATED, OLD])
+            assert out == b"key_passphrase_rotation_guard_absence_confirmed\n"
+            assert not guard.exists() and (backup / "rotation-copy").read_bytes() == changed
         assert (backup / "saved").read_bytes() == original
 
 if len(sys.argv) == 3:
