@@ -50,8 +50,11 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
     let [action, rest @ ..] = args else {
         return Err(usage());
     };
-    if action == "cleanup-start" || action == "recover-cleanup-start" {
-        return cleanup::parse(rest, action == "recover-cleanup-start");
+    if matches!(
+        action.to_str(),
+        Some("cleanup-start" | "recover-cleanup-start" | "cleanup-complete-absent")
+    ) {
+        return cleanup::parse(rest, action);
     }
     if action == "history-passphrase" {
         return passphrase::parse(rest, false);

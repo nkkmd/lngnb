@@ -1,6 +1,7 @@
 //! 残存暗号文の整理開始を記録するCLI。
 use super::*;
 use data_encoding::HEXLOWER;
+use std::ffi::OsStr;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct Request {
@@ -10,6 +11,7 @@ pub(super) struct Request {
     area_id: [u8; 32],
     snapshot_hash: [u8; 32],
     recovery: Option<Recovery>,
+    complete_absent: bool,
     expected_key: Id,
 }
 
@@ -57,9 +59,8 @@ fn receipt(value: &str) -> Option<([u8; 32], [u8; 32], Recovery)> {
     ))
 }
 
-pub(super) fn parse(args: &[OsString], recover: bool) -> Result<Command, AppError> {
-    let usage =
-        || AppError::Usage("key cleanup-start / recover-cleanup-start の引数を確認してください");
+pub(super) fn parse(args: &[OsString], action: &OsStr) -> Result<Command, AppError> {
+    let usage = || AppError::Usage("key の整理操作の引数を確認してください");
     let mut values = std::collections::BTreeMap::new();
     for pair in args.chunks(2) {
         let [flag, value] = pair else {
@@ -80,7 +81,7 @@ pub(super) fn parse(args: &[OsString], recover: bool) -> Result<Command, AppErro
     let residue = string("--residue")?;
     let backup_name = string("--backup-name")?;
     let expected_key = Id::parse(Kind::Key, string("--expect-key-id")?).map_err(|_| usage())?;
-    let (area_id, snapshot_hash, recovery) = if recover {
+    let (area_id, snapshot_hash, recovery) = if action != "cleanup-start" {
         let (area_id, snapshot_hash, recovery) = receipt(string("--start")?).ok_or_else(usage)?;
         (area_id, snapshot_hash, Some(recovery))
     } else {
@@ -105,6 +106,7 @@ pub(super) fn parse(args: &[OsString], recover: bool) -> Result<Command, AppErro
             snapshot_hash,
             expected_key,
             recovery,
+            complete_absent: action == "cleanup-complete-absent",
         })),
         directory,
         name: None,
@@ -126,6 +128,50 @@ impl Request {
         let password = terminal.recovery_passphrase()?;
         signals.check_cancelled()?;
         drop(terminal);
+        if self.complete_absent {
+            let start = self.recovery.expect("completion requires a start receipt");
+            let public = backup
+                .load(&self.backup_name, password.as_str())
+                .map_err(fail)?
+                .public_key();
+            if key_id(&public) != self.expected_key {
+                return Err(fail(KeyFileError::UnexpectedPublicKey));
+            }
+            let expected = source
+                .absent_cleanup_selection(
+                    &backup,
+                    &self.backup_name,
+                    &self.area_id,
+                    (&self.snapshot_hash, &start.after_hash),
+                    &start.operation_id,
+                    public,
+                )
+                .map_err(fail)?;
+            if start.generation.checked_add(1) != Some(expected.state.generation) {
+                return Err(fail(KeyFileError::RecoveryStateInvalid));
+            }
+            signals.check_cancelled()?;
+            let prepared = source
+                .prepare_absent_residue_completion(
+                    &self.residue,
+                    password.as_str(),
+                    &mut backup,
+                    &self.backup_name,
+                    &expected,
+                )
+                .map_err(fail)?;
+            let intent = prepared.intent();
+            signals.check_cancelled()?;
+            writeln!(output, "key_cleanup_completion_intent area_id={} generation={} before_hash={} after_hash={} started_operation_id={} operation_id={} disposition=confirmed_absent_on_recovery",
+                HEXLOWER.encode(&self.area_id), intent.before.generation,
+                HEXLOWER.encode(&intent.before.snapshot_hash), HEXLOWER.encode(&intent.after.snapshot_hash),
+                HEXLOWER.encode(&intent.started_operation_id), HEXLOWER.encode(&intent.operation_id),
+            ).and_then(|()| output.flush()).map_err(|_| Error::HistoryOutput)?;
+            prepared.record().map_err(fail)?;
+            return writeln!(output, "key_cleanup_absence_confirmed")
+                .and_then(|()| output.flush())
+                .map_err(|_| Error::HistoryOutput);
+        }
         let public = source
             .check_recovery_file(&self.residue, password.as_str())
             .map_err(fail)?;
