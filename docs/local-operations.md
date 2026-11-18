@@ -56,7 +56,29 @@
 | `recover-completed` | `--start --prepared --completed` | 完全な完了追記の復旧とguard保持 |
 | `release` | `--start --prepared --completed` | 記録guardの解除、または正確不在の今回保存確認 |
 
-中断後は現在名・別領域保全・全残存物と取得済みの控えを保持し、該当段階を明示する。完全な候補が得られない配置は保全停止となる。二回目以降の更新は未対応。
+中断後は現在名・別領域保全・全残存物と取得済みの控えを保持し、該当段階を明示する。完全な候補が得られない配置は保全停止となる。二回目以降は次節の連続更新を使う。
+
+### 二回目以降のパスフレーズ更新
+
+`key history-passphrase-rotation` は、各回の直前完了控えと更新直前の暗号文に完全一致する別領域保全を指定する。全段階に `--key-dir PATH --name NAME --backup-dir PATH --backup-name NAME --previous-completed RECEIPT` が必要。直前の初回更新または連続更新で出力した完了控え一行全体を、一つの引数として渡す。
+
+| 段階 | 追加の控え | 処理結果 |
+|---|---|---|
+| `preserve` | なし | 現在鍵を別領域の空き名へ非上書き保全 |
+| `verify-preserved` | なし | 既存コピーと現在鍵の完全一致・認証・保存の再確認 |
+| `prepare` | なし | 開始控え・開始履歴、新一時鍵、準備控え・準備履歴を順に保存しguard保持 |
+| `recover-start` | `--start` | 完全な開始履歴候補の復旧とguard保持 |
+| `recover-prepared` | `--start --prepared` | 完全な準備履歴候補の復旧とguard保持 |
+| `exchange` | `--start --prepared` | 新旧暗号文の交換、または交換済み配置の保存確認 |
+| `complete` | `--start --prepared` | 旧一時鍵の整理、完了控えの出力と完了履歴保存、guard保持 |
+| `recover-completed` | `--start --prepared --completed` | 完全な完了履歴候補の復旧とguard保持 |
+| `release` | `--start --prepared --completed` | 固定完了の再照合後にguard解除、または今回の不在・保存確認 |
+
+`preserve` または `verify-preserved` の後、`prepare → exchange → complete → release` を明示的に実行する。各段階で出力した控えを保持する。各追記は対応する控えの出力・flush後に行う。結果出力に失敗した場合も、現物と控えに応じて該当段階を明示して確認する。
+
+`prepare` 以降は、過去の整理、初回再開、それ以前の全連続更新に対応する保全を履歴順に `--preservation OPERATION_ID PATH NAME` で指定する。今回の保全は `--backup-dir --backup-name` で指定する。`preserve` と `verify-preserved` は `--preservation` を受け取らない。同じ領域には同じパス表記を使う。
+
+秘密入力は旧パスフレーズ、新パスフレーズ、履歴順の各保全のパスフレーズの順。`prepare` では新パスフレーズを二回入力し、`preserve`・`verify-preserved`・`recover-start` では新パスフレーズを入力しない。中断後の完全な候補がない場合は、全現物と控えを保持して停止する。
 
 ### 残存物の読取り診断
 
