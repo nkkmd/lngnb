@@ -110,7 +110,7 @@ fn history_key_cli_updates_and_recovers_with_a_real_terminal() {
 }
 
 #[test]
-fn initial_key_hold_cli_recovers_only_the_matching_complete_marker() {
+fn initial_key_hold_cli_checks_hold_and_history_recovery_receipts() {
     use std::{fs, os::unix::fs::DirBuilderExt};
     let mut nonce = [0; 16];
     getrandom::getrandom(&mut nonce).unwrap();
@@ -154,9 +154,35 @@ fn initial_key_hold_cli_recovers_only_the_matching_complete_marker() {
     let recover = || run("recover-initial-hold", &["--expect-area-id", id]);
     assert!(recover().status.success());
     fs::remove_file(&guard).unwrap();
+    let original_marker = fs::read(&marker).unwrap();
     fs::write(&marker, b"incomplete").unwrap();
     assert!(!recover().status.success());
     assert!(!guard.exists());
+    fs::write(&marker, original_marker).unwrap();
+    assert!(recover().status.success());
+    let history = run("initial-history", &["--expect-area-id", id]);
+    assert!(history.status.success(), "{:?}", history);
+    let history = String::from_utf8(history.stdout).unwrap();
+    let fields: Vec<_> = history.lines().next().unwrap().split_whitespace().collect();
+    assert_eq!(fields[0], "key_initial_history_intent");
+    let operation = fields[2].strip_prefix("operation_id=").unwrap();
+    let hash = fields[3].strip_prefix("snapshot_hash=").unwrap();
+    let recover_history = |hash| {
+        run(
+            "recover-initial-history",
+            &[
+                "--expect-area-id",
+                id,
+                "--operation-id",
+                operation,
+                "--snapshot-hash",
+                hash,
+            ],
+        )
+    };
+    assert!(!recover_history(&"00".repeat(32)).status.success());
+    assert!(recover_history(hash).status.success());
+    assert!(guard.exists());
     assert_eq!(fs::read(key).unwrap(), b"public test fixture");
     fs::remove_dir_all(dir).unwrap();
 }

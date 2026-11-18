@@ -47,6 +47,12 @@
 
 復旧は、指定領域に束縛された完全な停止マーカーと領域IDが一致し、停止印が不在または完全一致する場合に進む。両操作とも制御端末とパスフレーズは不要。識別子不一致や不完全な候補では、現物と控えを保全する。
 
+### 鍵履歴の導入と中断復旧
+
+初期停止の保存後に `key initial-history --key-dir PATH --expect-area-id AREA_ID` を実行する。候補の作成前に出る `key_initial_history_intent` の領域ID・操作ID・履歴ハッシュを控える。`key_initial_history_saved` は初回履歴の保存を示す。
+
+中断時は `key recover-initial-history --key-dir PATH --expect-area-id AREA_ID --operation-id ID --snapshot-hash HASH` に控えの値を指定する。完全な履歴マーカーと候補が一致する配置だけを復旧する。どちらの操作でも変更停止印を保持する。
+
 ### 履歴付き鍵領域の初回パスフレーズ更新
 
 `key history-passphrase` は、再開処理で受け取った控えと、更新直前の暗号文と完全一致する別領域保全を指定して使う。現在鍵の保全と、過去の整理に対応する保全を現在の領域・ファイルと照合する。パスフレーズは非表示の対話端末で入力する。過去の整理に対応する保全は、完了操作ID・領域パス・ファイル名の順で `--preservation ID PATH NAME` を一件ずつ指定し、その順で保全ごとのパスフレーズを入力する。同一領域を指定する場合は同じパス表記を使う。

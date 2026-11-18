@@ -414,9 +414,18 @@ impl KeyDirectory {
 
     /// 完全v1/guardから履歴付き初回Heldへ明示導入。鍵・guardを変更しない。
     pub fn initialize_key_state(&mut self, expected_area_id: &[u8; 32]) -> Result<KeyInitialState> {
+        self.initialize_key_state_with_receipt(expected_area_id, |_| Ok(()))
+    }
+
+    /// 履歴候補の作成前に復旧用の値を呼出し側へ渡す。
+    pub fn initialize_key_state_with_receipt(
+        &mut self,
+        expected_area_id: &[u8; 32],
+        receipt: impl FnOnce(&KeyInitialState) -> Result<()>,
+    ) -> Result<KeyInitialState> {
         let mut operation_id = [0; 32];
         super::super::random(&mut operation_id)?;
-        self.initialize_key_state_with(expected_area_id, operation_id, &mut |_| Ok(()))
+        self.initialize_key_state_inner(expected_area_id, operation_id, receipt, &mut |_| Ok(()))
     }
 
     fn prepare_state_file(
@@ -446,10 +455,21 @@ impl KeyDirectory {
         Ok(file)
     }
 
+    #[cfg(test)]
     pub(super) fn initialize_key_state_with(
         &mut self,
         expected_area_id: &[u8; 32],
         operation_id: [u8; 32],
+        hook: &mut impl FnMut(StateStage) -> Result<()>,
+    ) -> Result<KeyInitialState> {
+        self.initialize_key_state_inner(expected_area_id, operation_id, |_| Ok(()), hook)
+    }
+
+    fn initialize_key_state_inner(
+        &mut self,
+        expected_area_id: &[u8; 32],
+        operation_id: [u8; 32],
+        receipt: impl FnOnce(&KeyInitialState) -> Result<()>,
         hook: &mut impl FnMut(StateStage) -> Result<()>,
     ) -> Result<KeyInitialState> {
         // 準備中は二名増える。上限不足をmarker交換後へ持ち越さない。
@@ -475,6 +495,7 @@ impl KeyDirectory {
         let bytes = cbor::encode(&initial_value(&source, area_id, operation_id))
             .map_err(|_| KeyFileError::RecoveryStateInvalid)?;
         let result = decode_initial(&bytes, &source, area_id)?;
+        receipt(&result)?;
         let mut marker = V2_MAGIC.to_vec();
         marker.extend_from_slice(&source[21..]);
         marker.extend_from_slice(&result.snapshot_hash);
