@@ -1,5 +1,7 @@
 //! R34/A11: 実行ファイル専用の鍵操作。DB/HTTP/IPCには接続しない。
 use super::AppError;
+#[path = "key_cli_cleanup.rs"]
+mod cleanup;
 #[path = "key_cli_passphrase.rs"]
 mod passphrase;
 use lngnb::{
@@ -18,6 +20,7 @@ enum Action {
     InitialHold(Option<[u8; 32]>),
     InitialHistory([u8; 32]),
     RecoverInitialHistory(KeyInitialState),
+    CleanupStart(Box<cleanup::Request>),
     CheckResidue,
     PreserveResidue,
     RestoreResidue,
@@ -47,6 +50,9 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
     let [action, rest @ ..] = args else {
         return Err(usage());
     };
+    if action == "cleanup-start" {
+        return cleanup::parse(rest);
+    }
     if action == "history-passphrase" {
         return passphrase::parse(rest, false);
     }
@@ -324,6 +330,9 @@ pub fn run(command: Command, output: &mut impl Write) -> Result<(), Error> {
             output,
         );
     }
+    if let Action::CleanupStart(request) = command.action {
+        return request.run(&mut directory, signals, output);
+    }
     if command.action == Action::RecoveryStatus {
         return report_inventory(&directory.recovery_inventory()?, output);
     }
@@ -438,7 +447,9 @@ pub fn run(command: Command, output: &mut impl Write) -> Result<(), Error> {
                 .restore_recovery_file(name, p.as_str(), target, &public)
                 .map_err(Error::Restore)?
         }
-        Action::HistoryPassphrase(_) => unreachable!("history operation has a separate entry"),
+        Action::CleanupStart(_) | Action::HistoryPassphrase(_) => {
+            unreachable!("history operation has a separate entry")
+        }
         Action::InitialHistory(_) | Action::RecoverInitialHistory(_) | Action::InitialHold(_) => {
             unreachable!("initial hold returns before terminal input")
         }
@@ -478,7 +489,9 @@ fn report(action: &Action, public: &[u8; 32], output: &mut impl Write) -> Result
         Action::RestoreResidue => {
             "指定した残存暗号文を期待する鍵IDと照合し、明示した空いている復元先名へ同じbytesを保存しました。全残存物を保持し、変更停止も解除していません。過去の更新確定・元名の推測・新旧判定・残存物の整理許可ではありません"
         }
-        Action::HistoryPassphrase(_) => unreachable!("history operation has a separate entry"),
+        Action::CleanupStart(_) | Action::HistoryPassphrase(_) => {
+            unreachable!("history operation has a separate entry")
+        }
         Action::InitialHistory(_) | Action::RecoverInitialHistory(_) | Action::InitialHold(_) => {
             unreachable!("initial hold returns before terminal input")
         }
