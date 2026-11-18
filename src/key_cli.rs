@@ -52,7 +52,12 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
     };
     if matches!(
         action.to_str(),
-        Some("cleanup-start" | "recover-cleanup-start" | "cleanup-complete-absent")
+        Some(
+            "cleanup-start"
+                | "recover-cleanup-start"
+                | "cleanup-complete-absent"
+                | "recover-cleanup-completion"
+        )
     ) {
         return cleanup::parse(rest, action);
     }

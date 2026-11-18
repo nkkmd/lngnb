@@ -244,6 +244,27 @@ def cleanup_case(root):
     assert saved.read_bytes() == original
 
 
+    def recover_completion(receipt, expected=0):
+        return invoke(directory, "recover-cleanup-completion", [OLD], expected=expected,
+                      residue=residue, backup=(backup, "saved"),
+                      extra=["--expect-key-id", key_id, "--completion", receipt])
+
+    recover_completion(completion.replace("before_hash=" + completion.split("before_hash=")[1][:64],
+                                          "before_hash=" + "00" * 32), expected=1)
+    assert {p.name: p.read_bytes() for p in directory.iterdir()} == final
+    pending = directory / (".lngnb-key-state-update-" + completion.split(" operation_id=")[1].split()[0])
+    for fixed, temporary in ((absent[state.name], final[state.name]),
+                             (final[state.name], absent[state.name])):
+        state.write_bytes(fixed)
+        pending.touch(mode=0o600, exist_ok=False)
+        pending.write_bytes(temporary)
+        assert recover_completion(completion)[0] == b"key_cleanup_completion_confirmed\n"
+        assert {p.name: p.read_bytes() for p in directory.iterdir()} == final
+    assert recover_completion(completion)[0] == b"key_cleanup_completion_confirmed\n"
+    assert {p.name: p.read_bytes() for p in directory.iterdir()} == final
+    assert saved.read_bytes() == original
+
+
 if len(sys.argv) == 3:
     history_cases(Path(sys.argv[2]))
     cleanup_case(Path(sys.argv[2]))

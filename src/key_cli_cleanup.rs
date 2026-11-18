@@ -12,6 +12,7 @@ pub(super) struct Request {
     snapshot_hash: [u8; 32],
     recovery: Option<Recovery>,
     complete_absent: bool,
+    completion_start: Option<[u8; 32]>,
     expected_key: Id,
 }
 
@@ -31,7 +32,7 @@ fn decode(value: &str) -> Option<[u8; 32]> {
     Some(id)
 }
 
-fn receipt(value: &str) -> Option<([u8; 32], [u8; 32], Recovery)> {
+fn receipt(value: &str) -> Option<StartReceipt> {
     let mut fields = value.split(' ');
     if fields.next()? != "key_cleanup_start_intent" {
         return None;
@@ -59,6 +60,28 @@ fn receipt(value: &str) -> Option<([u8; 32], [u8; 32], Recovery)> {
     ))
 }
 
+type StartReceipt = ([u8; 32], [u8; 32], Recovery);
+
+fn completion_receipt(value: &str) -> Option<(StartReceipt, [u8; 32])> {
+    let mut fields = value.split(' ');
+    if fields.next()? != "key_cleanup_completion_intent" {
+        return None;
+    }
+    let area = fields.next()?;
+    let generation = fields.next()?;
+    let before = fields.next()?;
+    let after = fields.next()?;
+    let started = decode(fields.next()?.strip_prefix("started_operation_id=")?)?;
+    let operation = fields.next()?;
+    if fields.next()? != "disposition=confirmed_absent_on_recovery" || fields.next().is_some() {
+        return None;
+    }
+    let (area, before, recovery) = receipt(&format!(
+        "key_cleanup_start_intent {area} {generation} {before} {after} {operation}"
+    ))?;
+    Some(((area, before, recovery), started))
+}
+
 pub(super) fn parse(args: &[OsString], action: &OsStr) -> Result<Command, AppError> {
     let usage = || AppError::Usage("key の整理操作の引数を確認してください");
     let mut values = std::collections::BTreeMap::new();
@@ -81,13 +104,20 @@ pub(super) fn parse(args: &[OsString], action: &OsStr) -> Result<Command, AppErr
     let residue = string("--residue")?;
     let backup_name = string("--backup-name")?;
     let expected_key = Id::parse(Kind::Key, string("--expect-key-id")?).map_err(|_| usage())?;
-    let (area_id, snapshot_hash, recovery) = if action != "cleanup-start" {
+    let (area_id, snapshot_hash, recovery, completion_start) = if action
+        == "recover-cleanup-completion"
+    {
+        let ((area, before, recovery), started) =
+            completion_receipt(string("--completion")?).ok_or_else(usage)?;
+        (area, before, Some(recovery), Some(started))
+    } else if action != "cleanup-start" {
         let (area_id, snapshot_hash, recovery) = receipt(string("--start")?).ok_or_else(usage)?;
-        (area_id, snapshot_hash, Some(recovery))
+        (area_id, snapshot_hash, Some(recovery), None)
     } else {
         (
             decode(string("--expect-area-id")?).ok_or_else(usage)?,
             decode(string("--snapshot-hash")?).ok_or_else(usage)?,
+            None,
             None,
         )
     };
@@ -106,6 +136,7 @@ pub(super) fn parse(args: &[OsString], action: &OsStr) -> Result<Command, AppErr
             snapshot_hash,
             expected_key,
             recovery,
+            completion_start,
             complete_absent: action == "cleanup-complete-absent",
         })),
         directory,
@@ -128,7 +159,7 @@ impl Request {
         let password = terminal.recovery_passphrase()?;
         signals.check_cancelled()?;
         drop(terminal);
-        if self.complete_absent {
+        if self.complete_absent || self.completion_start.is_some() {
             let start = self.recovery.expect("completion requires a start receipt");
             let public = backup
                 .load(&self.backup_name, password.as_str())
@@ -136,6 +167,27 @@ impl Request {
                 .public_key();
             if key_id(&public) != self.expected_key {
                 return Err(fail(KeyFileError::UnexpectedPublicKey));
+            }
+            if let Some(started_operation_id) = self.completion_start {
+                signals.check_cancelled()?;
+                source
+                    .recover_cleanup_completion_from_receipt(
+                        &self.residue,
+                        password.as_str(),
+                        &mut backup,
+                        &self.backup_name,
+                        public,
+                        self.area_id,
+                        start.generation,
+                        self.snapshot_hash,
+                        start.after_hash,
+                        started_operation_id,
+                        start.operation_id,
+                    )
+                    .map_err(fail)?;
+                return writeln!(output, "key_cleanup_completion_confirmed")
+                    .and_then(|()| output.flush())
+                    .map_err(|_| Error::HistoryOutput);
             }
             let expected = source
                 .absent_cleanup_selection(

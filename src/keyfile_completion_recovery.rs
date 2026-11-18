@@ -2,6 +2,87 @@
 use super::*;
 
 impl KeyDirectory {
+    /// 完了控えと既存履歴を照合し、完了追記だけを復旧する。
+    #[allow(clippy::too_many_arguments)]
+    pub fn recover_cleanup_completion_from_receipt(
+        &mut self,
+        residue: &str,
+        passphrase: &str,
+        backup: &mut KeyDirectory,
+        backup_name: &str,
+        public_key: [u8; 32],
+        area_id: [u8; 32],
+        generation: u64,
+        before_hash: [u8; 32],
+        after_hash: [u8; 32],
+        started_operation_id: [u8; 32],
+        operation_id: [u8; 32],
+    ) -> Result<KeyStateDiagnostic> {
+        name(backup_name)?;
+        let marker = HeldFile::open(self, recovery_hold::MARKER, MAX_KEYFILE_BYTES)?;
+        if marker.bytes.len() != 105 || !marker.bytes.starts_with(b"lngnb:key-recovery:2\0") {
+            return invalid();
+        }
+        let mut source_marker = marker.bytes[..73].to_vec();
+        source_marker[19] = b'1';
+        if self.marker_area_id(&source_marker)? != area_id {
+            return invalid();
+        }
+        let root = marker.bytes[73..]
+            .try_into()
+            .map_err(|_| KeyFileError::RecoveryStateInvalid)?;
+        let fixed = HeldFile::open(self, initial_state::STATE, initial_state::STATE_LIMIT)?;
+        let state = state_history::decode_history(&fixed.bytes, &source_marker, area_id, root)?;
+        let before = KeyStateDiagnostic {
+            initial: state.initial,
+            generation,
+            snapshot_hash: before_hash,
+            state: KeyHistoryState::Active {
+                started_operation_id,
+            },
+        };
+        let intent = KeyCleanupCompletion {
+            before,
+            after: KeyStateDiagnostic {
+                initial: state.initial,
+                generation: generation
+                    .checked_add(1)
+                    .ok_or(KeyFileError::RecoveryStateInvalid)?,
+                snapshot_hash: after_hash,
+                state: KeyHistoryState::Held,
+            },
+            started_operation_id,
+            operation_id,
+            disposition: KeyCleanupDisposition::ConfirmedAbsentOnRecovery,
+        };
+        let mut snapshot = decoded(&fixed.bytes)?;
+        let events = events_mut(&mut snapshot)?;
+        if state == intent.after {
+            events.pop().ok_or(KeyFileError::RecoveryStateInvalid)?;
+        } else if state != before {
+            return invalid();
+        }
+        let start = events.last().ok_or(KeyFileError::RecoveryStateInvalid)?;
+        let target =
+            state_history::recorded_file_identity(field(field(start, "target")?, "identity")?)?;
+        let preserved = HeldFile::open(backup, backup_name, MAX_KEYFILE_BYTES)?;
+        let expected = KeyCleanupExpected {
+            state: before,
+            target,
+            public_key,
+            preserved_directory: KeyDirectoryIdentity::from_metadata(&io(backup.dir.metadata())?),
+            preserved: KeyFileIdentity::from_metadata(&preserved.metadata),
+        };
+        self.recover_residue_cleanup_completion(
+            residue,
+            passphrase,
+            backup,
+            backup_name,
+            &expected,
+            &intent,
+        )
+    }
+
     /// 明示した一件の完了追記中断を復旧。鍵unlink・停止解除はしない。
     pub fn recover_residue_cleanup_completion(
         &mut self,
