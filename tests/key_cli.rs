@@ -46,7 +46,14 @@ fn history_key_cli_updates_and_recovers_with_a_real_terminal() {
     mkdir(&root.0);
     // 公開試験専用。実運用に流用しない。
     let old = "public CLI old example only";
-    for scenario in ["normal", "cancel", "output", "cleanup", "resume-record"] {
+    for scenario in [
+        "normal",
+        "cancel",
+        "output",
+        "cleanup",
+        "resume-record",
+        "resume-output",
+    ] {
         let path = root.0.join(scenario);
         let copy = root.0.join(format!("{scenario}-backup"));
         mkdir(&path);
@@ -75,10 +82,10 @@ fn history_key_cli_updates_and_recovers_with_a_real_terminal() {
             .unwrap();
             continue;
         }
-        if scenario == "resume-record" {
+        if matches!(scenario, "resume-record" | "resume-output") {
             let state = source.key_state_history(&area_id).unwrap();
             fs::write(
-                root.0.join("resume-record-receipt"),
+                root.0.join(format!("{scenario}-receipt")),
                 format!(
                     "{} {}",
                     data_encoding::HEXLOWER.encode(&area_id),

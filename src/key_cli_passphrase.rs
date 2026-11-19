@@ -9,6 +9,7 @@ use lngnb::keyfile::{
 enum Stage {
     RecordResume,
     RecoverResumeRecord,
+    ReleaseResumeGuard,
     Preserve,
     VerifyPreserved,
     Update,
@@ -127,6 +128,7 @@ pub(super) fn parse(args: &[OsString], rotation: bool) -> Result<Command, AppErr
         Some("verify-preserved") if rotation && preservations.is_empty() => Stage::VerifyPreserved,
         Some("resume-record") if !rotation => Stage::RecordResume,
         Some("recover-resume-record") if !rotation => Stage::RecoverResumeRecord,
+        Some("release-resume-guard") if !rotation => Stage::ReleaseResumeGuard,
         Some("update") if !rotation => Stage::Update,
         Some("prepare") if rotation => Stage::Update,
         Some(
@@ -247,6 +249,7 @@ impl Request {
         let new = match self.stage {
             Stage::RecordResume
             | Stage::RecoverResumeRecord
+            | Stage::ReleaseResumeGuard
             | Stage::Start(_)
             | Stage::Preserve
             | Stage::VerifyPreserved => None,
@@ -331,6 +334,24 @@ impl Request {
                         .map_err(fail)?;
                     "key_resume_record_confirmed_guard_retained"
                 }
+                Stage::ReleaseResumeGuard => match source
+                    .recover_key_resume_release(
+                        name,
+                        old,
+                        &mut backups,
+                        0,
+                        backup,
+                        &proofs,
+                        &expected,
+                        resume,
+                    )
+                    .map_err(fail)?
+                {
+                    KeyResumeRelease::RemovedRecordedGuard(_) => "key_resume_guard_removed",
+                    KeyResumeRelease::ConfirmedGuardAbsent(_) => {
+                        "key_resume_guard_absence_confirmed"
+                    }
+                },
                 Stage::Update => release_status(
                     source
                         .change_first_key_passphrase(
@@ -479,7 +500,7 @@ impl Stage {
     ) -> Result<&'static str, Error> {
         let fail = Error::HistoryPassphrase;
         Ok(match self {
-            Self::RecordResume | Self::RecoverResumeRecord => {
+            Self::RecordResume | Self::RecoverResumeRecord | Self::ReleaseResumeGuard => {
                 unreachable!("resume record is not a rotation stage")
             }
             Self::Preserve => {

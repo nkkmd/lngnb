@@ -291,10 +291,10 @@ def cleanup_case(root):
     assert saved.read_bytes() == original
 
 
-def resume_record_case(root):
-    directory = root / "resume-record"
-    backup = root / "resume-record-backup"
-    area, snapshot = (root / "resume-record-receipt").read_text().split()
+def resume_record_case(root, scenario):
+    directory = root / scenario
+    backup = root / (scenario + "-backup")
+    area, snapshot = (root / (scenario + "-receipt")).read_text().split()
     before = {p.name: p.read_bytes() for p in directory.iterdir()}
     key_id = decode_key(directory / "publisher", OLD)[2].decode()
 
@@ -337,11 +337,41 @@ def resume_record_case(root):
     assert {p.name: p.read_bytes() for p in directory.iterdir()} == after
     assert (backup / "saved").read_bytes() == before["publisher"]
 
+    def release(password=OLD, resume=receipt, copy=backup, **kwargs):
+        return invoke(directory, "history-passphrase", [password] if password else [],
+                      history_stage="release-resume-guard", backup=(copy, "saved"),
+                      extra=["--resume", resume], **kwargs)
+
+    if scenario == "resume-record":
+        wrong_receipt = receipt.replace(f"before_hash={snapshot}", "before_hash=" + "00" * 32)
+        assert wrong_receipt != receipt
+        release(password=None, resume=wrong_receipt, expected=1)
+        release(b"public wrong example only", expected=1)
+        wrong_copy = root / "resume-wrong-copy"
+        wrong_copy.mkdir(mode=0o700)
+        wrong_ciphertext = wrong_copy / "saved"
+        wrong_ciphertext.touch(mode=0o600)
+        wrong_ciphertext.write_bytes(b"public mismatched ciphertext")
+        release(copy=wrong_copy, expected=1)
+        assert wrong_ciphertext.read_bytes() == b"public mismatched ciphertext"
+        assert {p.name: p.read_bytes() for p in directory.iterdir()} == after
+        assert (backup / "saved").read_bytes() == before["publisher"]
+        assert release()[0] == b"key_resume_guard_removed\n"
+    else:
+        # 解除後の応答を失っても、同じ控えで現在の不在を確認できる。
+        release(expected=1, closed_output=True)
+    assert release()[0] == b"key_resume_guard_absence_confirmed\n"
+    assert {p.name: p.read_bytes() for p in directory.iterdir()} == {
+        name: data for name, data in after.items() if name != ".lngnb-key-hold"
+    }
+    assert (backup / "saved").read_bytes() == before["publisher"]
+
 
 if len(sys.argv) == 3:
     history_cases(Path(sys.argv[2]))
     cleanup_case(Path(sys.argv[2]))
-    resume_record_case(Path(sys.argv[2]))
+    resume_record_case(Path(sys.argv[2]), "resume-record")
+    resume_record_case(Path(sys.argv[2]), "resume-output")
     print("HISTORY_KEY_CLI_CASES_OK")
     sys.exit(0)
 
