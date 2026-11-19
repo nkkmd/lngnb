@@ -363,6 +363,20 @@ def resume_record_case(root):
     assert {p.name: p.read_bytes() for p in directory.iterdir()} == released
     assert (backup / "saved").read_bytes() == before["publisher"]
 
+    out, _ = invoke(directory, "history-passphrase", [OLD, NEW, NEW],
+                    history_stage="update", backup=(backup, "saved"),
+                    extra=["--resume", receipt])
+    started, prepared, completed, result = out.decode().splitlines()
+    assert started.startswith("key_passphrase_change_started ")
+    assert prepared.startswith("key_passphrase_change_prepared ")
+    assert completed.startswith("key_passphrase_change_completed ")
+    assert result == "key_passphrase_change_guard_removed"
+    assert not (directory / ".lngnb-key-hold").exists()
+    assert (backup / "saved").read_bytes() == before["publisher"]
+    updated_seed, _, updated_id = decode_key(directory / "publisher", NEW)
+    original_seed, _, original_id = decode_key(backup / "saved", OLD)
+    assert (updated_seed, updated_id) == (original_seed, original_id)
+
 
 if len(sys.argv) == 3:
     history_cases(Path(sys.argv[2]))
