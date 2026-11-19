@@ -56,6 +56,7 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
             "cleanup-start"
                 | "recover-cleanup-start"
                 | "cleanup-complete-absent"
+                | "cleanup-remove"
                 | "recover-cleanup-completion"
         )
     ) {

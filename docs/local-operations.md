@@ -141,7 +141,12 @@ lngnb key recover-cleanup-start --key-dir PATH --residue .lngnb-key-HEX \
 
 完了の追記前に `key_cleanup_completion_intent` を出力し、保存後に `key_cleanup_absence_confirmed` を出力します。保存の確認が取れない場合は開始と完了の控えを保持してください。鍵領域の変更停止は継続します。
 
-`key recover-cleanup-completion` は、不在完了の追記が中断した場合に既存の完了記録を確認・復旧します。`cleanup-complete-absent` の `--start` の代わりに `--completion` を指定し、出力された `key_cleanup_completion_intent` の一行全体を渡します。対象の不在と保全コピーを再照合し、完全な完了候補がある場合に保存を確認します。成功時は `key_cleanup_completion_confirmed` を出力し、鍵領域の変更停止を維持します。
+`key recover-cleanup-completion` は、整理完了の追記が中断した場合に既存の完了記録を確認・復旧します。`cleanup-complete-absent` の `--start` の代わりに `--completion` を指定し、出力された `key_cleanup_completion_intent` の一行全体を渡します。対象の不在と保全コピーを再照合し、完全な完了候補がある場合に保存を確認します。成功時は `key_cleanup_completion_confirmed` を出力し、鍵領域の変更停止を維持します。
+
+`key cleanup-remove` は `cleanup-complete-absent` と同じ引数を取り、開始済みの残存暗号文一件を整理します。対象と別領域の保全コピーを完全一致で照合し、`key_cleanup_removal_requested` の出力後に削除直前の再照合を行います。対象の不在を保存確認した後に完了控えを出力し、完了記録の保存後に `key_cleanup_removal_recorded` を出力します。
+
+中断時は開始控えと、出力済みであれば完了控えを保持します。完全な完了履歴が残る場合は `recover-cleanup-completion` で確認できます。完了候補が作られる前に中断し、対象がすでに不在の場合は `cleanup-complete-absent` が現在の不在を独立に確認します。現在鍵・保全コピー・鍵領域の変更停止を保持します。
+
 
 
 

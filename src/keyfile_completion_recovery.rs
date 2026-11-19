@@ -17,6 +17,7 @@ impl KeyDirectory {
         after_hash: [u8; 32],
         started_operation_id: [u8; 32],
         operation_id: [u8; 32],
+        disposition: KeyCleanupDisposition,
     ) -> Result<KeyStateDiagnostic> {
         name(backup_name)?;
         let marker = HeldFile::open(self, recovery_hold::MARKER, MAX_KEYFILE_BYTES)?;
@@ -53,7 +54,7 @@ impl KeyDirectory {
             },
             started_operation_id,
             operation_id,
-            disposition: KeyCleanupDisposition::ConfirmedAbsentOnRecovery,
+            disposition,
         };
         let mut snapshot = decoded(&fixed.bytes)?;
         let events = events_mut(&mut snapshot)?;

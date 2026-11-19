@@ -418,7 +418,7 @@ fn completion_value(
 
 impl KeyDirectory {
     /// 開始控えを固定履歴へ照合し、完了準備に必要な識別情報を読み取る。
-    pub fn absent_cleanup_selection(
+    pub fn cleanup_completion_selection(
         &mut self,
         backup: &KeyDirectory,
         backup_name: &str,

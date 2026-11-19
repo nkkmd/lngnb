@@ -1,6 +1,7 @@
 //! 残存暗号文の整理開始を記録するCLI。
 use super::*;
 use data_encoding::HEXLOWER;
+use lngnb::keyfile::KeyCleanupDisposition;
 use std::ffi::OsStr;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -12,7 +13,8 @@ pub(super) struct Request {
     snapshot_hash: [u8; 32],
     recovery: Option<Recovery>,
     complete_absent: bool,
-    completion_start: Option<[u8; 32]>,
+    completion_start: Option<([u8; 32], KeyCleanupDisposition)>,
+    remove: bool,
     expected_key: Id,
 }
 
@@ -62,7 +64,9 @@ fn receipt(value: &str) -> Option<StartReceipt> {
 
 type StartReceipt = ([u8; 32], [u8; 32], Recovery);
 
-fn completion_receipt(value: &str) -> Option<(StartReceipt, [u8; 32])> {
+type CompletionReference = ([u8; 32], KeyCleanupDisposition);
+
+fn completion_receipt(value: &str) -> Option<(StartReceipt, CompletionReference)> {
     let mut fields = value.split(' ');
     if fields.next()? != "key_cleanup_completion_intent" {
         return None;
@@ -73,13 +77,20 @@ fn completion_receipt(value: &str) -> Option<(StartReceipt, [u8; 32])> {
     let after = fields.next()?;
     let started = decode(fields.next()?.strip_prefix("started_operation_id=")?)?;
     let operation = fields.next()?;
-    if fields.next()? != "disposition=confirmed_absent_on_recovery" || fields.next().is_some() {
+    let disposition = match fields.next()? {
+        "disposition=confirmed_absent_on_recovery" => {
+            KeyCleanupDisposition::ConfirmedAbsentOnRecovery
+        }
+        "disposition=removed_present" => KeyCleanupDisposition::RemovedPresent,
+        _ => return None,
+    };
+    if fields.next().is_some() {
         return None;
     }
     let (area, before, recovery) = receipt(&format!(
         "key_cleanup_start_intent {area} {generation} {before} {after} {operation}"
     ))?;
-    Some(((area, before, recovery), started))
+    Some(((area, before, recovery), (started, disposition)))
 }
 
 pub(super) fn parse(args: &[OsString], action: &OsStr) -> Result<Command, AppError> {
@@ -137,6 +148,7 @@ pub(super) fn parse(args: &[OsString], action: &OsStr) -> Result<Command, AppErr
             expected_key,
             recovery,
             completion_start,
+            remove: action == "cleanup-remove",
             complete_absent: action == "cleanup-complete-absent",
         })),
         directory,
@@ -159,7 +171,7 @@ impl Request {
         let password = terminal.recovery_passphrase()?;
         signals.check_cancelled()?;
         drop(terminal);
-        if self.complete_absent || self.completion_start.is_some() {
+        if self.remove || self.complete_absent || self.completion_start.is_some() {
             let start = self.recovery.expect("completion requires a start receipt");
             let public = backup
                 .load(&self.backup_name, password.as_str())
@@ -168,7 +180,7 @@ impl Request {
             if key_id(&public) != self.expected_key {
                 return Err(fail(KeyFileError::UnexpectedPublicKey));
             }
-            if let Some(started_operation_id) = self.completion_start {
+            if let Some((started_operation_id, disposition)) = self.completion_start {
                 signals.check_cancelled()?;
                 source
                     .recover_cleanup_completion_from_receipt(
@@ -183,6 +195,7 @@ impl Request {
                         start.after_hash,
                         started_operation_id,
                         start.operation_id,
+                        disposition,
                     )
                     .map_err(fail)?;
                 return writeln!(output, "key_cleanup_completion_confirmed")
@@ -190,7 +203,7 @@ impl Request {
                     .map_err(|_| Error::HistoryOutput);
             }
             let expected = source
-                .absent_cleanup_selection(
+                .cleanup_completion_selection(
                     &backup,
                     &self.backup_name,
                     &self.area_id,
@@ -203,24 +216,51 @@ impl Request {
                 return Err(fail(KeyFileError::RecoveryStateInvalid));
             }
             signals.check_cancelled()?;
-            let prepared = source
-                .prepare_absent_residue_completion(
-                    &self.residue,
-                    password.as_str(),
-                    &mut backup,
-                    &self.backup_name,
-                    &expected,
+            let (prepared, disposition, status) = if self.remove {
+                let removal = source
+                    .prepare_residue_removal(
+                        &self.residue,
+                        password.as_str(),
+                        &mut backup,
+                        &self.backup_name,
+                        &expected,
+                    )
+                    .map_err(fail)?;
+                signals.check_cancelled()?;
+                writeln!(output, "key_cleanup_removal_requested")
+                    .and_then(|()| output.flush())
+                    .map_err(|_| Error::HistoryOutput)?;
+                signals.check_cancelled()?;
+                (
+                    removal.remove().map_err(fail)?,
+                    "removed_present",
+                    "key_cleanup_removal_recorded",
                 )
-                .map_err(fail)?;
+            } else {
+                let prepared = source
+                    .prepare_absent_residue_completion(
+                        &self.residue,
+                        password.as_str(),
+                        &mut backup,
+                        &self.backup_name,
+                        &expected,
+                    )
+                    .map_err(fail)?;
+                signals.check_cancelled()?;
+                (
+                    prepared,
+                    "confirmed_absent_on_recovery",
+                    "key_cleanup_absence_confirmed",
+                )
+            };
             let intent = prepared.intent();
-            signals.check_cancelled()?;
-            writeln!(output, "key_cleanup_completion_intent area_id={} generation={} before_hash={} after_hash={} started_operation_id={} operation_id={} disposition=confirmed_absent_on_recovery",
+            writeln!(output, "key_cleanup_completion_intent area_id={} generation={} before_hash={} after_hash={} started_operation_id={} operation_id={} disposition={disposition}",
                 HEXLOWER.encode(&self.area_id), intent.before.generation,
                 HEXLOWER.encode(&intent.before.snapshot_hash), HEXLOWER.encode(&intent.after.snapshot_hash),
                 HEXLOWER.encode(&intent.started_operation_id), HEXLOWER.encode(&intent.operation_id),
             ).and_then(|()| output.flush()).map_err(|_| Error::HistoryOutput)?;
             prepared.record().map_err(fail)?;
-            return writeln!(output, "key_cleanup_absence_confirmed")
+            return writeln!(output, "{status}")
                 .and_then(|()| output.flush())
                 .map_err(|_| Error::HistoryOutput);
         }
