@@ -23,6 +23,7 @@ BINARY = sys.argv[1]
 OLD = b"public CLI old example only"
 NEW = "public CLI new e\u0301 é あ example only".encode()
 ROTATED = b"public CLI rotated example only"
+ROTATED_AGAIN = b"public CLI rotated again example only"
 
 def decode_key(path, password):
     raw = path.read_bytes()
@@ -82,7 +83,7 @@ def invoke(directory, action, payloads, expected=0, cancel=None, closed_output=F
         while select.select([master], [], [], 0)[0]:
             captured.extend(os.read(master, 4096))
         assert not select.select([slave], [], [], 0)[0], "CLI left pending input"
-        for secret in (OLD, NEW, ROTATED, b"public cancelled CLI input", b"public wrong example only"):
+        for secret in (OLD, NEW, ROTATED, ROTATED_AGAIN, b"public cancelled CLI input", b"public wrong example only"):
             assert secret not in bytes(captured) + out + err, "CLI exposed public test secret"
         if expected != 0:
             assert not out, "failure emitted success output"
@@ -165,7 +166,58 @@ def history_cases(root):
             out, _ = rotation("release", [NEW, ROTATED, OLD])
             assert out == b"key_passphrase_rotation_guard_absence_confirmed\n"
             assert not guard.exists() and (backup / "rotation-copy").read_bytes() == changed
+            if scenario == "normal":
+                repeat_rotation(directory, backup, completed, rotated, resume_id)
         assert (backup / "saved").read_bytes() == original
+
+def repeat_rotation(directory, backup, first_completed, rotated, resume_id):
+    path = directory / "publisher"
+    guard = directory / ".lngnb-key-hold"
+    before = {p.name: p.read_bytes() for p in directory.iterdir()}
+    copies = {p.name: p.read_bytes() for p in backup.iterdir()}
+    previous_id = rotated.rsplit(" operation_id=", 1)[1]
+    first_proof = ["--preservation", resume_id, str(backup), "saved"]
+    previous_proof = ["--preservation", previous_id, str(backup), "rotation-copy"]
+    new_copy = "repeat-rotation-copy"
+
+    def run(stage, passwords, *, previous=rotated, copy=new_copy, extras=(), **kwargs):
+        return invoke(directory, "history-passphrase-rotation", passwords,
+                      backup=(backup, copy), history_stage=stage,
+                      extra=["--previous-completed", previous, *extras], **kwargs)
+
+    run("preserve", [ROTATED], previous=first_completed, expected=1)
+    run("verify-preserved", [ROTATED], copy="rotation-copy", expected=1)
+    assert {p.name: p.read_bytes() for p in backup.iterdir()} == copies
+    run("preserve", [ROTATED])
+    copies[new_copy] = before["publisher"]
+    passwords = [ROTATED, ROTATED_AGAIN, OLD, NEW]
+    run("prepare", [ROTATED, ROTATED_AGAIN, ROTATED_AGAIN, OLD],
+        extras=first_proof, expected=1)
+    assert {p.name: p.read_bytes() for p in directory.iterdir()} == before
+    assert {p.name: p.read_bytes() for p in backup.iterdir()} == copies
+
+    proofs = first_proof + previous_proof
+    out, _ = run("prepare", [ROTATED, ROTATED_AGAIN, ROTATED_AGAIN, OLD, NEW], extras=proofs)
+    started, prepared, status = out.decode().splitlines()
+    assert status == "key_passphrase_rotation_prepared_guard_retained"
+    assert guard.exists() and path.read_bytes() == before["publisher"]
+    receipts = proofs + ["--start", started, "--prepared", prepared]
+    run("recover-prepared", passwords, extras=receipts)
+    run("exchange", passwords, extras=receipts)
+    out, _ = run("complete", passwords, extras=receipts)
+    completed, status = out.decode().splitlines()
+    assert status == "key_passphrase_rotation_completion_confirmed_guard_retained"
+    assert guard.exists()
+    receipts += ["--completed", completed]
+    run("release", passwords, extras=receipts, expected=1, closed_output=True)
+    out, _ = run("release", passwords, extras=receipts)
+    assert out == b"key_passphrase_rotation_guard_absence_confirmed\n"
+    assert not guard.exists()
+    assert {p.name: p.read_bytes() for p in backup.iterdir()} == copies
+    updated_seed, _, updated_id = decode_key(path, ROTATED_AGAIN)
+    original_seed, _, original_id = decode_key(backup / "saved", OLD)
+    assert (updated_seed, updated_id) == (original_seed, original_id)
+
 
 def cleanup_case(root):
     directory = root / "cleanup"
