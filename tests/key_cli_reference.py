@@ -323,6 +323,10 @@ def resume_record_case(root):
 
     recover(b"public wrong example only", expected=1)
     assert {p.name: p.read_bytes() for p in directory.iterdir()} == after
+    def release(passwords=(OLD,), *, receipt_line=receipt, backup_dir=backup, **kwargs):
+        return invoke(directory, "history-passphrase", passwords, history_stage="release-resume",
+                      backup=(backup_dir, "saved"), extra=["--resume", receipt_line], **kwargs)
+
     state = directory / ".lngnb-key-state"
     operation_id = receipt.split(" operation_id=")[1]
     pending = directory / (".lngnb-key-state-update-" + operation_id)
@@ -331,10 +335,32 @@ def resume_record_case(root):
         state.write_bytes(fixed)
         pending.touch(mode=0o600, exist_ok=False)
         pending.write_bytes(candidate)
+        unfinished = {p.name: p.read_bytes() for p in directory.iterdir()}
+        release(expected=1)
+        assert {p.name: p.read_bytes() for p in directory.iterdir()} == unfinished
         assert recover()[0] == b"key_resume_record_confirmed_guard_retained\n"
         assert {p.name: p.read_bytes() for p in directory.iterdir()} == after
     assert recover()[0] == b"key_resume_record_confirmed_guard_retained\n"
     assert {p.name: p.read_bytes() for p in directory.iterdir()} == after
+    assert (backup / "saved").read_bytes() == before["publisher"]
+
+    wrong_receipt = receipt.rsplit(" operation_id=", 1)[0] + " operation_id=" + "00" * 32
+    release((), receipt_line=wrong_receipt, expected=1)
+    release((b"public wrong example only",), expected=1)
+    other = root / "resume-record-unrecorded-backup"
+    other.mkdir(mode=0o700)
+    other_saved = other / "saved"
+    other_saved.touch(mode=0o600)
+    other_saved.write_bytes(before["publisher"])
+    release(backup_dir=other, expected=1)
+    assert {p.name: p.read_bytes() for p in directory.iterdir()} == after
+    assert (backup / "saved").read_bytes() == other_saved.read_bytes() == before["publisher"]
+
+    assert release()[0] == b"key_resume_guard_removed\n"
+    released = {name: data for name, data in after.items() if name != ".lngnb-key-hold"}
+    assert {p.name: p.read_bytes() for p in directory.iterdir()} == released
+    assert release()[0] == b"key_resume_guard_absence_confirmed\n"
+    assert {p.name: p.read_bytes() for p in directory.iterdir()} == released
     assert (backup / "saved").read_bytes() == before["publisher"]
 
 

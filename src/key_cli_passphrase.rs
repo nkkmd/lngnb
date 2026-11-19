@@ -9,6 +9,7 @@ use lngnb::keyfile::{
 enum Stage {
     RecordResume,
     RecoverResumeRecord,
+    ReleaseResume,
     Preserve,
     VerifyPreserved,
     Update,
@@ -127,6 +128,7 @@ pub(super) fn parse(args: &[OsString], rotation: bool) -> Result<Command, AppErr
         Some("verify-preserved") if rotation && preservations.is_empty() => Stage::VerifyPreserved,
         Some("resume-record") if !rotation => Stage::RecordResume,
         Some("recover-resume-record") if !rotation => Stage::RecoverResumeRecord,
+        Some("release-resume") if !rotation => Stage::ReleaseResume,
         Some("update") if !rotation => Stage::Update,
         Some("prepare") if rotation => Stage::Update,
         Some(
@@ -216,7 +218,10 @@ impl Request {
         let first = match &self.anchor {
             Anchor::First(resume) => Some((
                 resume,
-                if self.stage == Stage::RecoverResumeRecord {
+                if matches!(
+                    self.stage,
+                    Stage::RecoverResumeRecord | Stage::ReleaseResume
+                ) {
                     source.key_resume_record_recovery_expected(name, &self.backup_name, resume)
                 } else {
                     source.key_passphrase_recovery_expected(name, &self.backup_name, resume)
@@ -247,6 +252,7 @@ impl Request {
         let new = match self.stage {
             Stage::RecordResume
             | Stage::RecoverResumeRecord
+            | Stage::ReleaseResume
             | Stage::Start(_)
             | Stage::Preserve
             | Stage::VerifyPreserved => None,
@@ -331,6 +337,24 @@ impl Request {
                         .map_err(fail)?;
                     "key_resume_record_confirmed_guard_retained"
                 }
+                Stage::ReleaseResume => match source
+                    .recover_key_resume_release(
+                        name,
+                        old,
+                        &mut backups,
+                        0,
+                        backup,
+                        &proofs,
+                        &expected,
+                        resume,
+                    )
+                    .map_err(fail)?
+                {
+                    KeyResumeRelease::RemovedRecordedGuard(_) => "key_resume_guard_removed",
+                    KeyResumeRelease::ConfirmedGuardAbsent(_) => {
+                        "key_resume_guard_absence_confirmed"
+                    }
+                },
                 Stage::Update => release_status(
                     source
                         .change_first_key_passphrase(
@@ -479,7 +503,7 @@ impl Stage {
     ) -> Result<&'static str, Error> {
         let fail = Error::HistoryPassphrase;
         Ok(match self {
-            Self::RecordResume | Self::RecoverResumeRecord => {
+            Self::RecordResume | Self::RecoverResumeRecord | Self::ReleaseResume => {
                 unreachable!("resume record is not a rotation stage")
             }
             Self::Preserve => {
@@ -639,6 +663,8 @@ mod tests {
         let operation = "07".repeat(32);
         let proof = ["--preservation", &operation, "/copy", "previous"];
         assert!(parse(&args("update", &proof)).is_ok());
+        assert!(parse(&args("release-resume", &proof)).is_ok());
+        assert!(parse(&args("release-resume", &["--start", &receipt])).is_err());
         assert!(parse(&args("update", &[proof, proof].concat())).is_err());
         assert!(parse(&args("update", &["--key-dir", "/other"])).is_err());
         assert!(parse(&args("update", &["--start", &receipt])).is_err());
