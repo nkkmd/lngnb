@@ -140,6 +140,36 @@ impl KeyDirectory {
         Self::expected_from_ready(&ready, &marker, current_name, backup_name, resume)
     }
 
+    /// 再開控えが示す完全な履歴から、追記復旧の照合値を読む。
+    pub fn key_resume_record_recovery_expected(
+        &self,
+        current_name: &str,
+        backup_name: &str,
+        resume: &KeyResumeIntent,
+    ) -> Result<KeyResumeExpected> {
+        let marker = source_marker(self, resume)?;
+        let fixed = HeldFile::open(self, initial_state::STATE, initial_state::STATE_LIMIT)?;
+        let diagnostic = decode_snapshot(&fixed.bytes, &marker, resume)?;
+        if diagnostic == resume.after {
+            return Self::expected_from_ready(
+                &fixed.bytes,
+                &marker,
+                current_name,
+                backup_name,
+                resume,
+            );
+        }
+        if diagnostic != resume.before {
+            return invalid();
+        }
+        let name = format!(
+            ".lngnb-key-state-update-{}",
+            data_encoding::HEXLOWER.encode(&resume.operation_id)
+        );
+        let candidate = HeldFile::open(self, &name, initial_state::STATE_LIMIT)?;
+        Self::expected_from_ready(&candidate.bytes, &marker, current_name, backup_name, resume)
+    }
+
     fn expected_from_ready(
         ready: &[u8],
         marker: &[u8],

@@ -317,6 +317,26 @@ def resume_record_case(root):
     assert {name for name in before if before[name] != after[name]} == {".lngnb-key-state"}
     assert (backup / "saved").read_bytes() == before["publisher"]
 
+    def recover(password=OLD, **kwargs):
+        return invoke(directory, "history-passphrase", [password], history_stage="recover-resume-record",
+                      backup=(backup, "saved"), extra=["--resume", receipt], **kwargs)
+
+    recover(b"public wrong example only", expected=1)
+    assert {p.name: p.read_bytes() for p in directory.iterdir()} == after
+    state = directory / ".lngnb-key-state"
+    operation_id = receipt.split(" operation_id=")[1]
+    pending = directory / (".lngnb-key-state-update-" + operation_id)
+    for fixed, candidate in ((before[state.name], after[state.name]),
+                             (after[state.name], before[state.name])):
+        state.write_bytes(fixed)
+        pending.touch(mode=0o600, exist_ok=False)
+        pending.write_bytes(candidate)
+        assert recover()[0] == b"key_resume_record_confirmed_guard_retained\n"
+        assert {p.name: p.read_bytes() for p in directory.iterdir()} == after
+    assert recover()[0] == b"key_resume_record_confirmed_guard_retained\n"
+    assert {p.name: p.read_bytes() for p in directory.iterdir()} == after
+    assert (backup / "saved").read_bytes() == before["publisher"]
+
 
 if len(sys.argv) == 3:
     history_cases(Path(sys.argv[2]))
