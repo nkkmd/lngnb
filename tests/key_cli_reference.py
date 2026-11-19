@@ -265,6 +265,32 @@ def cleanup_case(root):
     assert saved.read_bytes() == original
 
 
+    target = directory / residue
+    target.touch(mode=0o600, exist_ok=False)
+    target.write_bytes(original)
+    next_snapshot = hashlib.sha256(final[state.name]).hexdigest()
+    args[3] = next_snapshot
+    next_intent = start()[0].decode().splitlines()[0]
+    active = {p.name: p.read_bytes() for p in directory.iterdir()}
+
+    def remove(**kwargs):
+        return invoke(directory, "cleanup-remove", [OLD], residue=residue,
+                      backup=(backup, "saved"),
+                      extra=["--expect-key-id", key_id, "--start", next_intent], **kwargs)
+
+    remove(expected=1, closed_output=True)
+    assert {p.name: p.read_bytes() for p in directory.iterdir()} == active
+    requested, removed, status = remove()[0].decode().splitlines()
+    assert requested == "key_cleanup_removal_requested"
+    assert removed.endswith("disposition=removed_present")
+    assert status == "key_cleanup_removal_recorded"
+    assert recover_completion(removed)[0] == b"key_cleanup_completion_confirmed\n"
+    after_removal = {p.name: p.read_bytes() for p in directory.iterdir()}
+    assert after_removal.keys() == active.keys() - {residue}
+    assert {name for name in after_removal if after_removal[name] != active[name]} == {state.name}
+    assert saved.read_bytes() == original
+
+
 if len(sys.argv) == 3:
     history_cases(Path(sys.argv[2]))
     cleanup_case(Path(sys.argv[2]))
