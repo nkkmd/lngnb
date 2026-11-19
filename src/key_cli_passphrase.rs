@@ -7,6 +7,7 @@ use lngnb::keyfile::{
 
 #[derive(Debug, PartialEq, Eq)]
 enum Stage {
+    RecordResume,
     Preserve,
     VerifyPreserved,
     Update,
@@ -29,6 +30,11 @@ enum Stage {
 #[derive(Debug, PartialEq, Eq)]
 enum Anchor {
     First(Box<KeyResumeIntent>),
+    Held {
+        area_id: [u8; 32],
+        snapshot_hash: [u8; 32],
+        key: Id,
+    },
     Rotation(KeyStateDiagnostic),
 }
 
@@ -86,7 +92,24 @@ pub(super) fn parse(args: &[OsString], rotation: bool) -> Result<Command, AppErr
             .ok_or_else(usage)
     };
     let mut parse_line = |flag| take(flag)?.to_str().ok_or_else(usage);
-    let anchor = if rotation {
+    let anchor = if !rotation && stage == "resume-record" {
+        let decode = |value: &str| {
+            let mut id = [0; 32];
+            if value.len() != 64
+                || data_encoding::HEXLOWER
+                    .decode_mut(value.as_bytes(), &mut id)
+                    .is_err()
+            {
+                return Err(usage());
+            }
+            Ok(id)
+        };
+        Anchor::Held {
+            area_id: decode(parse_line("--expect-area-id")?)?,
+            snapshot_hash: decode(parse_line("--snapshot-hash")?)?,
+            key: Id::parse(Kind::Key, parse_line("--expect-key-id")?).map_err(|_| usage())?,
+        }
+    } else if rotation {
         Anchor::Rotation(
             KeyPassphraseCompletedIntent::parse_previous_completion(parse_line(
                 "--previous-completed",
@@ -101,6 +124,7 @@ pub(super) fn parse(args: &[OsString], rotation: bool) -> Result<Command, AppErr
     let stage = match stage.to_str() {
         Some("preserve") if rotation && preservations.is_empty() => Stage::Preserve,
         Some("verify-preserved") if rotation && preservations.is_empty() => Stage::VerifyPreserved,
+        Some("resume-record") if !rotation => Stage::RecordResume,
         Some("update") if !rotation => Stage::Update,
         Some("prepare") if rotation => Stage::Update,
         Some(
@@ -109,6 +133,7 @@ pub(super) fn parse(args: &[OsString], rotation: bool) -> Result<Command, AppErr
         ) => {
             let line = parse_line("--start")?;
             let start = match &anchor {
+                Anchor::Held { .. } => return Err(usage()),
                 Anchor::First(resume) => KeyPassphraseStartIntent::parse_receipt(line, resume),
                 Anchor::Rotation(previous) => {
                     KeyPassphraseStartIntent::parse_rotation_receipt(line, previous)
@@ -193,7 +218,7 @@ impl Request {
                     .key_passphrase_recovery_expected(name, &self.backup_name, resume)
                     .map_err(fail)?,
             )),
-            Anchor::Rotation(_) => None,
+            Anchor::Held { .. } | Anchor::Rotation(_) => None,
         };
         let mut paths = vec![self.backup_dir];
         let mut indices = Vec::new();
@@ -215,7 +240,9 @@ impl Request {
         let mut terminal = SecretTerminal::open_interruptible(signals)?;
         let old = terminal.current_passphrase()?;
         let new = match self.stage {
-            Stage::Start(_) | Stage::Preserve | Stage::VerifyPreserved => None,
+            Stage::RecordResume | Stage::Start(_) | Stage::Preserve | Stage::VerifyPreserved => {
+                None
+            }
             Stage::Update => Some(terminal.new_passphrase()?),
             _ => Some(terminal.recovery_passphrase()?),
         };
@@ -242,7 +269,29 @@ impl Request {
         let old = old.as_str();
         let new = new.as_ref().map_or("", |p| p.as_str());
         let backup = self.backup_name.as_str();
-        let status = if let Anchor::Rotation(previous) = &self.anchor {
+        let status = if let Anchor::Held {
+            area_id,
+            snapshot_hash,
+            key,
+        } = &self.anchor
+        {
+            let public = source.load(name, old).map_err(fail)?.public_key();
+            if key_id(&public) != *key {
+                return Err(fail(KeyFileError::UnexpectedPublicKey));
+            }
+            let expected = source
+                .key_resume_selection(name, &backups[0], backup, area_id, snapshot_hash, public)
+                .map_err(fail)?;
+            signals.check_cancelled()?;
+            let prepared = source
+                .prepare_key_resume(name, old, &mut backups, 0, backup, &proofs, &expected)
+                .map_err(fail)?;
+            signals.check_cancelled()?;
+            prepared.intent().write_receipt(output).map_err(fail)?;
+            output.flush().map_err(|_| Error::HistoryOutput)?;
+            prepared.record().map_err(fail)?;
+            "key_resume_recorded_guard_retained"
+        } else if let Anchor::Rotation(previous) = &self.anchor {
             self.stage.run_rotation(
                 source,
                 name,
@@ -257,7 +306,9 @@ impl Request {
         } else {
             let (resume, expected) = first.expect("first update anchor");
             match self.stage {
-                Stage::Preserve | Stage::VerifyPreserved => unreachable!("rotation-only stage"),
+                Stage::RecordResume | Stage::Preserve | Stage::VerifyPreserved => {
+                    unreachable!("rotation-only stage")
+                }
                 Stage::Update => release_status(
                     source
                         .change_first_key_passphrase(
@@ -406,6 +457,7 @@ impl Stage {
     ) -> Result<&'static str, Error> {
         let fail = Error::HistoryPassphrase;
         Ok(match self {
+            Self::RecordResume => unreachable!("resume record uses the held anchor"),
             Self::Preserve => {
                 source
                     .preserve_key_for_passphrase_rotation(

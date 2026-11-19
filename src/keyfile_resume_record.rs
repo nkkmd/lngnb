@@ -421,6 +421,36 @@ enum ResumeCurrent<'a> {
 }
 
 impl KeyDirectory {
+    /// 再開意思の準備に必要な識別情報を、指定したHeld履歴と現物から得る。
+    pub fn key_resume_selection(
+        &mut self,
+        current_name: &str,
+        backup: &KeyDirectory,
+        backup_name: &str,
+        area_id: &[u8; 32],
+        snapshot_hash: &[u8; 32],
+        public_key: [u8; 32],
+    ) -> Result<KeyResumeExpected> {
+        name(current_name)?;
+        name(backup_name)?;
+        let state = self.key_state_history(area_id)?;
+        if state.state != KeyHistoryState::Held || &state.snapshot_hash != snapshot_hash {
+            return invalid();
+        }
+        let current = HeldFile::open(self, current_name, MAX_KEYFILE_BYTES)?;
+        let preserved = HeldFile::open(backup, backup_name, MAX_KEYFILE_BYTES)?;
+        let guard = HeldFile::open(self, recovery_hold::GUARD, MAX_KEYFILE_BYTES)?;
+        Ok(KeyResumeExpected {
+            state,
+            current: KeyFileIdentity::from_metadata(&current.metadata),
+            ciphertext_sha256: Sha256::digest(&current.bytes).into(),
+            public_key,
+            preserved_directory: KeyDirectoryIdentity::from_metadata(&io(backup.dir.metadata())?),
+            preserved: KeyFileIdentity::from_metadata(&preserved.metadata),
+            guard: KeyFileIdentity::from_metadata(&guard.metadata),
+        })
+    }
+
     /// backup sliceは異なる領域を一つずつ開いて渡す。同じ領域の複数保全fileはindexを共有する。
     /// 入力の全過去保全を認証し、今回のfile/directory fsyncを確認して保持する。
     #[allow(clippy::too_many_arguments)]

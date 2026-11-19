@@ -291,9 +291,37 @@ def cleanup_case(root):
     assert saved.read_bytes() == original
 
 
+def resume_record_case(root):
+    directory = root / "resume-record"
+    backup = root / "resume-record-backup"
+    area, snapshot = (root / "resume-record-receipt").read_text().split()
+    before = {p.name: p.read_bytes() for p in directory.iterdir()}
+    key_id = decode_key(directory / "publisher", OLD)[2].decode()
+
+    def record(snapshot_hash=snapshot, **kwargs):
+        return invoke(directory, "history-passphrase", [OLD], history_stage="resume-record",
+                      backup=(backup, "saved"), extra=[
+                          "--expect-area-id", area, "--snapshot-hash", snapshot_hash,
+                          "--expect-key-id", key_id,
+                      ], **kwargs)
+
+    record("00" * 32, expected=1)
+    record(expected=1, closed_output=True)
+    assert {p.name: p.read_bytes() for p in directory.iterdir()} == before
+    receipt, status = record()[0].decode().splitlines()
+    assert area in receipt and snapshot in receipt
+    assert status == "key_resume_recorded_guard_retained"
+    record(expected=1)
+    after = {p.name: p.read_bytes() for p in directory.iterdir()}
+    assert before.keys() == after.keys()
+    assert {name for name in before if before[name] != after[name]} == {".lngnb-key-state"}
+    assert (backup / "saved").read_bytes() == before["publisher"]
+
+
 if len(sys.argv) == 3:
     history_cases(Path(sys.argv[2]))
     cleanup_case(Path(sys.argv[2]))
+    resume_record_case(Path(sys.argv[2]))
     print("HISTORY_KEY_CLI_CASES_OK")
     sys.exit(0)
 
