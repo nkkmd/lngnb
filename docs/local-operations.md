@@ -84,6 +84,17 @@ lngnb key history-passphrase resume-record --key-dir PATH --name NAME \
 
 `key history-passphrase recover-resume-record` は中断した再開記録の保存を確認します。記録時の領域ID・ハッシュ・鍵IDに代えて `--resume RECEIPT` に再開控えの一行全体を渡し、現在鍵とすべての保全先を同じように指定します。完全な新旧履歴の組合せ、または新履歴が固定済みの場合に復旧します。成功時は `key_resume_record_confirmed_guard_retained` を表示し、停止ガードを保持します。
 
+`key history-passphrase release-resume` は、再開記録に対応する停止ガードを明示的に解除します。
+
+```text
+lngnb key history-passphrase release-resume --key-dir PATH --name NAME \
+  --backup-dir PATH --backup-name NAME --resume RECEIPT [--preservation ID PATH NAME]...
+```
+
+再開控えの一行全体を一つの引数として渡します。再開の新履歴が固定され、追記用の一時名がすべて不在であることが必要です。現在鍵と暗号文が完全一致する別領域コピー、整理完了に対応するすべての保全先を再照合します。対話端末には現在鍵のパスフレーズ、続けて各保全先のパスフレーズを指定順に入力します。
+
+解除と保存を確認すると `key_resume_guard_removed`、すでに不在で今回の保存を確認すると `key_resume_guard_absence_confirmed` を表示します。控え・認証・保全が一致しない場合は解除を拒否します。中断や出力失敗で結果を受け取れなかった場合は、同じ控えと保全先を指定して再実行してください。追記用の一時名が残る場合は、先に `recover-resume-record` で再開記録を復旧してください。
+
 `key history-passphrase-rotation` は、各回の直前完了控えと更新直前の暗号文に完全一致する別領域保全を指定する。全段階に `--key-dir PATH --name NAME --backup-dir PATH --backup-name NAME --previous-completed RECEIPT` が必要。直前の初回更新または連続更新で出力した完了控え一行全体を、一つの引数として渡す。
 
 | 段階 | 追加の控え | 処理結果 |
