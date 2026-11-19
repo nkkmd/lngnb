@@ -18,7 +18,7 @@ impl KeyDirectory {
         resume: &KeyResumeIntent,
         receipts: &mut impl Write,
     ) -> Result<release::KeyResumeRelease> {
-        let expected = self.first_passphrase_expected(current_name, backup_name, resume)?;
+        let expected = self.key_resume_release_expected(current_name, backup_name, resume)?;
         let mut start = self
             .prepare_first_passphrase_change(
                 current_name,
@@ -99,7 +99,9 @@ impl KeyDirectory {
         )
     }
 
-    fn first_passphrase_expected(
+    /// 固定された再開履歴から、明示解除に渡す照合値を取得する。
+    /// 認証・保全・保存の確認は解除APIで行う。
+    pub fn key_resume_release_expected(
         &self,
         current_name: &str,
         backup_name: &str,

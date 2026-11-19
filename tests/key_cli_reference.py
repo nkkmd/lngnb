@@ -290,6 +290,40 @@ def cleanup_case(root):
     assert {name for name in after_removal if after_removal[name] != active[name]} == {state.name}
     assert saved.read_bytes() == original
 
+    # 二件の整理完了履歴と、それぞれの暗号文保全を含めて再開する。
+    proofs = []
+    for line in (completion, removed):
+        operation = line.split(" operation_id=")[1].split()[0]
+        proofs.extend(["--preservation", operation, str(backup), "saved"])
+    receipt, status = invoke(
+        directory, "history-passphrase", [OLD, OLD, OLD], history_stage="resume-record",
+        backup=(backup, "saved"), extra=[
+            "--expect-area-id", area,
+            "--snapshot-hash", hashlib.sha256(state.read_bytes()).hexdigest(),
+            "--expect-key-id", key_id,
+            *proofs,
+        ],
+    )[0].decode().splitlines()
+    assert status == "key_resume_recorded_guard_retained"
+    recorded = {p.name: p.read_bytes() for p in directory.iterdir()}
+    guard = ".lngnb-key-hold"
+    assert guard in recorded
+
+    def release(passwords, extra_proofs=proofs, **kwargs):
+        return invoke(directory, "history-passphrase", passwords, history_stage="release-resume",
+                      backup=(backup, "saved"), extra=["--resume", receipt, *extra_proofs], **kwargs)
+
+    release([OLD], [], expected=1)
+    release([OLD, OLD, b"public wrong example only"], expected=1)
+    assert {p.name: p.read_bytes() for p in directory.iterdir()} == recorded
+    assert saved.read_bytes() == original
+    assert release([OLD, OLD, OLD])[0] == b"key_resume_guard_removed\n"
+    assert release([OLD, OLD, OLD])[0] == b"key_resume_guard_absence_confirmed\n"
+    assert {p.name: p.read_bytes() for p in directory.iterdir()} == {
+        name: data for name, data in recorded.items() if name != guard
+    }
+    assert saved.read_bytes() == original
+
 
 def resume_record_case(root):
     directory = root / "resume-record"
@@ -335,6 +369,32 @@ def resume_record_case(root):
         assert {p.name: p.read_bytes() for p in directory.iterdir()} == after
     assert recover()[0] == b"key_resume_record_confirmed_guard_retained\n"
     assert {p.name: p.read_bytes() for p in directory.iterdir()} == after
+    assert (backup / "saved").read_bytes() == before["publisher"]
+
+    def release(passwords=(), *, selected=backup, line=receipt, **kwargs):
+        return invoke(directory, "history-passphrase", passwords, history_stage="release-resume",
+                      backup=(selected, "saved"), extra=["--resume", line], **kwargs)
+
+    guard = directory / ".lngnb-key-hold"
+    without_guard = {name: data for name, data in after.items() if name != guard.name}
+    assert guard.name in after
+    # 現物が同一でも、控えに記録された領域と異なるコピーは拒否する。
+    other = root / "resume-record-other"
+    other.mkdir(mode=0o700)
+    other_copy = other / "saved"
+    other_copy.touch(mode=0o600, exist_ok=False)
+    other_copy.write_bytes(before["publisher"])
+    release(line=receipt.replace(snapshot, "00" * 32), expected=1)
+    release([b"public wrong example only"], expected=1)
+    release([OLD], selected=other, expected=1)
+    assert {p.name: p.read_bytes() for p in directory.iterdir()} == after
+    assert (backup / "saved").read_bytes() == other_copy.read_bytes() == before["publisher"]
+
+    # 出力を失っても、同じ控えで不在と保存を再確認できる。
+    release([OLD], expected=1, closed_output=True)
+    assert {p.name: p.read_bytes() for p in directory.iterdir()} == without_guard
+    assert release([OLD])[0] == b"key_resume_guard_absence_confirmed\n"
+    assert {p.name: p.read_bytes() for p in directory.iterdir()} == without_guard
     assert (backup / "saved").read_bytes() == before["publisher"]
 
 
