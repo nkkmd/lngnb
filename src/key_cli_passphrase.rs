@@ -8,6 +8,7 @@ use lngnb::keyfile::{
 #[derive(Debug, PartialEq, Eq)]
 enum Stage {
     RecordResume,
+    RecoverResumeRecord,
     Preserve,
     VerifyPreserved,
     Update,
@@ -125,6 +126,7 @@ pub(super) fn parse(args: &[OsString], rotation: bool) -> Result<Command, AppErr
         Some("preserve") if rotation && preservations.is_empty() => Stage::Preserve,
         Some("verify-preserved") if rotation && preservations.is_empty() => Stage::VerifyPreserved,
         Some("resume-record") if !rotation => Stage::RecordResume,
+        Some("recover-resume-record") if !rotation => Stage::RecoverResumeRecord,
         Some("update") if !rotation => Stage::Update,
         Some("prepare") if rotation => Stage::Update,
         Some(
@@ -214,9 +216,12 @@ impl Request {
         let first = match &self.anchor {
             Anchor::First(resume) => Some((
                 resume,
-                source
-                    .key_passphrase_recovery_expected(name, &self.backup_name, resume)
-                    .map_err(fail)?,
+                if self.stage == Stage::RecoverResumeRecord {
+                    source.key_resume_record_recovery_expected(name, &self.backup_name, resume)
+                } else {
+                    source.key_passphrase_recovery_expected(name, &self.backup_name, resume)
+                }
+                .map_err(fail)?,
             )),
             Anchor::Held { .. } | Anchor::Rotation(_) => None,
         };
@@ -240,9 +245,11 @@ impl Request {
         let mut terminal = SecretTerminal::open_interruptible(signals)?;
         let old = terminal.current_passphrase()?;
         let new = match self.stage {
-            Stage::RecordResume | Stage::Start(_) | Stage::Preserve | Stage::VerifyPreserved => {
-                None
-            }
+            Stage::RecordResume
+            | Stage::RecoverResumeRecord
+            | Stage::Start(_)
+            | Stage::Preserve
+            | Stage::VerifyPreserved => None,
             Stage::Update => Some(terminal.new_passphrase()?),
             _ => Some(terminal.recovery_passphrase()?),
         };
@@ -308,6 +315,21 @@ impl Request {
             match self.stage {
                 Stage::RecordResume | Stage::Preserve | Stage::VerifyPreserved => {
                     unreachable!("rotation-only stage")
+                }
+                Stage::RecoverResumeRecord => {
+                    source
+                        .recover_key_resume_record(
+                            name,
+                            old,
+                            &mut backups,
+                            0,
+                            backup,
+                            &proofs,
+                            &expected,
+                            resume,
+                        )
+                        .map_err(fail)?;
+                    "key_resume_record_confirmed_guard_retained"
                 }
                 Stage::Update => release_status(
                     source
@@ -457,7 +479,9 @@ impl Stage {
     ) -> Result<&'static str, Error> {
         let fail = Error::HistoryPassphrase;
         Ok(match self {
-            Self::RecordResume => unreachable!("resume record uses the held anchor"),
+            Self::RecordResume | Self::RecoverResumeRecord => {
+                unreachable!("resume record is not a rotation stage")
+            }
             Self::Preserve => {
                 source
                     .preserve_key_for_passphrase_rotation(
