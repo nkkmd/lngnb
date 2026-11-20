@@ -192,16 +192,18 @@ fn missing_database_and_unknown_versions_are_not_initialized_or_modified() {
     let t = Temp::new();
     drop(t.store());
     let before = stdfs::read(t.data().join(DB)).unwrap();
-    let c = raw_conn(&t.data());
-    c.pragma_update(None, "user_version", 999).unwrap();
-    drop(c);
-    let unknown = stdfs::read(t.data().join(DB)).unwrap();
-    assert_ne!(before, unknown);
-    assert!(matches!(
-        RecordStore::open(&t.data(), Limits::default()),
-        Err(StorageError::UnsupportedFormat)
-    ));
-    assert_eq!(stdfs::read(t.data().join(DB)).unwrap(), unknown);
+    for version in [12, 999] {
+        let c = raw_conn(&t.data());
+        c.pragma_update(None, "user_version", version).unwrap();
+        drop(c);
+        let unsupported = stdfs::read(t.data().join(DB)).unwrap();
+        assert_ne!(before, unsupported);
+        assert!(matches!(
+            RecordStore::open(&t.data(), Limits::default()),
+            Err(StorageError::UnsupportedFormat)
+        ));
+        assert_eq!(stdfs::read(t.data().join(DB)).unwrap(), unsupported);
+    }
     let c = raw_conn(&t.data());
     c.pragma_update(None, "user_version", SCHEMA_VERSION)
         .unwrap();

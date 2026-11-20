@@ -16,7 +16,7 @@ use std::{
 };
 
 pub const IMPLEMENTATION: &str = "lngnb-rust-sqlite-1";
-pub const SCHEMA_VERSION: i64 = 12;
+pub const SCHEMA_VERSION: i64 = 13;
 const DB: &str = "database.sqlite";
 const SCHEMA: &str = "
 CREATE TABLE storage_state (
@@ -241,6 +241,17 @@ CREATE TABLE history (
  actor TEXT NOT NULL, reason TEXT NOT NULL, rules TEXT NOT NULL,
  at TEXT NOT NULL
 ) STRICT;
+CREATE TABLE publication_changes (
+ generation INTEGER PRIMARY KEY REFERENCES history(generation),
+ record_id BLOB NOT NULL REFERENCES records(id),
+ decision TEXT NOT NULL CHECK(decision IN ('approve_public','approve_untrusted','revoke'))
+) STRICT;
+CREATE INDEX history_publication_by_record ON history(target,generation)
+ WHERE new_state='publication_saved_local_only';
+CREATE TRIGGER publication_changes_no_update BEFORE UPDATE ON publication_changes
+ BEGIN SELECT RAISE(ABORT,'immutable_publication_change'); END;
+CREATE TRIGGER publication_changes_no_delete BEFORE DELETE ON publication_changes
+ BEGIN SELECT RAISE(ABORT,'immutable_publication_change'); END;
 CREATE INDEX history_admin_config ON history(generation) WHERE new_state='admin_config_saved_local_only';
 CREATE INDEX history_blob_retention ON history(target,generation) WHERE new_state IN ('blob_staged_local_only','blob_retained_local_only');
 ";
@@ -515,6 +526,7 @@ fn check_format(conn: &Connection, budget: SqlInspectionBudget) -> Result<()> {
     )?;
     let expected_state = if [
         "admin_config_saved_local_only",
+        "publication_saved_local_only",
         "stored_local_only",
         "blob_retained_local_only",
         "blob_staged_local_only",
@@ -1011,5 +1023,6 @@ mod filesystem_tests;
 
 mod publication;
 pub use publication::{
-    DistributionGate, PublicationAnchor, PublicationPermission, RecordPublication,
+    DistributionGate, ManualPublicationChange, PublicationAnchor, PublicationPermission,
+    RecordPublication, SavedPublicationPermission,
 };
