@@ -131,6 +131,64 @@ fn load_permission(conn: &Connection, id: Id) -> Result<Option<SavedPublicationP
 }
 
 impl RecordStore {
+    /// 停止中の保存領域について、固定Record本体の配信可否を読み取る。
+    /// gate は呼び出し側の運用制限。結果はこの読取り時点の判定で、送信許可証にはならない。
+    pub fn record_publication(&self, id: Id, gate: DistributionGate) -> Result<RecordPublication> {
+        let snapshot = self.conn.unchecked_transaction()?;
+        let publication = self.assess_record_publication(id, gate)?;
+        snapshot.commit()?;
+        Ok(publication)
+    }
+
+    fn assess_record_publication(
+        &self,
+        id: Id,
+        gate: DistributionGate,
+    ) -> Result<RecordPublication> {
+        if gate == DistributionGate::Closed
+            || id.kind != Kind::Record
+            || self.startup_state()? != StartupState::Clean
+        {
+            return Ok(RecordPublication::Private);
+        }
+        let valid = self.conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM evaluations e
+                JOIN evaluation_state v ON v.singleton=1
+                JOIN history h ON h.generation=v.generation
+                JOIN storage_state s ON s.singleton=1 AND s.namespace=h.namespace
+                WHERE e.record_id=?1 AND e.validation='valid' AND v.dirty=0
+                  AND h.new_state='evaluated_local_only' AND h.rules='lngnb-validation-1'
+                  AND h.generation<=s.generation
+                  AND NOT EXISTS (SELECT 1 FROM known_invalid k WHERE k.record_id=e.record_id)
+            )",
+            [&id.bytes],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !valid {
+            return Ok(RecordPublication::Private);
+        }
+
+        let permission = load_permission(&self.conn, id)?.ok_or(StorageError::Corrupt)?;
+        let record = self.record(id)?.ok_or(StorageError::Corrupt)?;
+        let knowledge = Id {
+            kind: Kind::Knowledge,
+            bytes: record.identity().knowledge,
+        };
+        let genesis = record.genesis().map_err(|_| StorageError::Corrupt)?;
+        let anchor = match self.saved_pin(knowledge)? {
+            Some(pin) if pin.bytes == genesis => PublicationAnchor::Pinned,
+            _ => PublicationAnchor::Untrusted,
+        };
+        Ok(RecordPublication::assess(
+            permission.permission,
+            Some(Validation::Valid),
+            anchor,
+            permission.explicitly_stopped,
+            gate,
+        ))
+    }
+
     /// 既存Recordの許可を返す。対象がなければNone。
     pub fn saved_publication_permission(
         &self,
@@ -201,6 +259,87 @@ mod tests {
     use super::*;
 
     use crate::storage::tests::{Temp, fixture, logical_snapshot};
+
+    #[test]
+    fn current_publication_requires_matching_pin_permission_and_clean_evaluation() {
+        let temp = Temp::new();
+        let record = fixture();
+        let id = record.id();
+        let knowledge = Id {
+            kind: Kind::Knowledge,
+            bytes: record.identity().knowledge,
+        };
+        let mut writer = temp.store().begin().unwrap();
+        writer.insert(&record).unwrap();
+        writer
+            .save_manual_publication_change(id, ManualPublicationChange::ApproveUntrusted, "allow")
+            .unwrap();
+        writer.finish().unwrap();
+        let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
+        assert_eq!(
+            store
+                .record_publication(id, DistributionGate::Open)
+                .unwrap(),
+            RecordPublication::Private
+        );
+
+        let mut writer = store.begin().unwrap();
+        writer
+            .revalidate(super::super::EvaluationLimits::default())
+            .unwrap();
+        writer.finish().unwrap();
+        let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
+        assert_eq!(
+            store
+                .record_publication(id, DistributionGate::Open)
+                .unwrap(),
+            RecordPublication::UntrustedPublic
+        );
+        assert_eq!(
+            store
+                .record_publication(id, DistributionGate::Closed)
+                .unwrap(),
+            RecordPublication::Private
+        );
+
+        let mut writer = store.begin().unwrap();
+        writer.save_pin(knowledge, Some(id), "adopt").unwrap();
+        writer.finish().unwrap();
+        let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
+        assert_eq!(
+            store
+                .record_publication(id, DistributionGate::Open)
+                .unwrap(),
+            RecordPublication::Private
+        );
+
+        let mut writer = store.begin().unwrap();
+        writer
+            .save_manual_publication_change(
+                id,
+                ManualPublicationChange::ApprovePublic,
+                "allow pinned",
+            )
+            .unwrap();
+        writer.finish().unwrap();
+        let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
+        assert_eq!(
+            store
+                .record_publication(id, DistributionGate::Open)
+                .unwrap(),
+            RecordPublication::Public
+        );
+
+        let writer = store.begin().unwrap();
+        drop(writer);
+        let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
+        assert_eq!(
+            store
+                .record_publication(id, DistributionGate::Open)
+                .unwrap(),
+            RecordPublication::Private
+        );
+    }
 
     #[test]
     fn manual_permission_and_revocation_survive_reopen_and_duplicate_receive() {
