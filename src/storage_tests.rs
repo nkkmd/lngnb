@@ -192,7 +192,7 @@ fn missing_database_and_unknown_versions_are_not_initialized_or_modified() {
     let t = Temp::new();
     drop(t.store());
     let before = stdfs::read(t.data().join(DB)).unwrap();
-    for version in [12, 999] {
+    for version in [12, 13, 999] {
         let c = raw_conn(&t.data());
         c.pragma_update(None, "user_version", version).unwrap();
         drop(c);
