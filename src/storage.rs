@@ -1008,3 +1008,8 @@ pub use sql_inspection::SqlInspectionBudget;
 #[cfg(test)]
 #[path = "storage_filesystem_tests.rs"]
 mod filesystem_tests;
+
+mod publication;
+pub use publication::{
+    DistributionGate, PublicationAnchor, PublicationPermission, RecordPublication,
+};
