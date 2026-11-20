@@ -16,7 +16,7 @@ use std::{
 };
 
 pub const IMPLEMENTATION: &str = "lngnb-rust-sqlite-1";
-pub const SCHEMA_VERSION: i64 = 13;
+pub const SCHEMA_VERSION: i64 = 14;
 const DB: &str = "database.sqlite";
 const SCHEMA: &str = "
 CREATE TABLE storage_state (
@@ -252,6 +252,18 @@ CREATE TRIGGER publication_changes_no_update BEFORE UPDATE ON publication_change
  BEGIN SELECT RAISE(ABORT,'immutable_publication_change'); END;
 CREATE TRIGGER publication_changes_no_delete BEFORE DELETE ON publication_changes
  BEGIN SELECT RAISE(ABORT,'immutable_publication_change'); END;
+CREATE TABLE pin_changes (
+ generation INTEGER PRIMARY KEY REFERENCES history(generation),
+ old_genesis BLOB REFERENCES records(id),
+ new_genesis BLOB REFERENCES records(id),
+ CHECK(old_genesis IS NOT new_genesis)
+) STRICT;
+CREATE INDEX history_pin_by_knowledge ON history(target,generation)
+ WHERE new_state='pin_saved_local_only';
+CREATE TRIGGER pin_changes_no_update BEFORE UPDATE ON pin_changes
+ BEGIN SELECT RAISE(ABORT,'immutable_pin_change'); END;
+CREATE TRIGGER pin_changes_no_delete BEFORE DELETE ON pin_changes
+ BEGIN SELECT RAISE(ABORT,'immutable_pin_change'); END;
 CREATE INDEX history_admin_config ON history(generation) WHERE new_state='admin_config_saved_local_only';
 CREATE INDEX history_blob_retention ON history(target,generation) WHERE new_state IN ('blob_staged_local_only','blob_retained_local_only');
 ";
@@ -271,6 +283,7 @@ pub enum StorageError {
     RandomUnavailable,
     BlobHashMismatch,
     InvalidBlobId,
+    InvalidPinTarget,
     InspectionPending,
     EvaluationInputPending,
     StaleRecoveryReview,
@@ -293,6 +306,7 @@ impl std::fmt::Display for StorageError {
             Self::RandomUnavailable => "random_unavailable",
             Self::BlobHashMismatch => "transfer_hash_mismatch",
             Self::InvalidBlobId => "invalid_blob_id",
+            Self::InvalidPinTarget => "invalid_pin_target",
             Self::InspectionPending => "startup_inspection_pending",
             Self::EvaluationInputPending => "evaluation_input_pending",
             Self::StaleRecoveryReview => "stale_recovery_review",
@@ -527,6 +541,7 @@ fn check_format(conn: &Connection, budget: SqlInspectionBudget) -> Result<()> {
     let expected_state = if [
         "admin_config_saved_local_only",
         "publication_saved_local_only",
+        "pin_saved_local_only",
         "stored_local_only",
         "blob_retained_local_only",
         "blob_staged_local_only",
@@ -1026,3 +1041,5 @@ pub use publication::{
     DistributionGate, ManualPublicationChange, PublicationAnchor, PublicationPermission,
     RecordPublication, SavedPublicationPermission,
 };
+
+mod pin;
