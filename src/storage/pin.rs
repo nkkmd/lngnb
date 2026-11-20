@@ -182,7 +182,7 @@ mod tests {
              WHERE target=?1 AND ((reason='adopt' AND old_genesis IS NULL AND new_genesis=?2)
                                OR (reason='replace' AND old_genesis=?2 AND new_genesis=?3)
                                OR (reason='release' AND old_genesis=?3 AND new_genesis IS NULL))",
-                params![knowledge.bytes, id.bytes],
+                params![knowledge.bytes, id.bytes, replacement_id.bytes],
                 |r| r.get(0),
             )
             .unwrap();
