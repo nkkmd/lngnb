@@ -21,6 +21,7 @@ use std::{
 const NAME: &str = "admin.sock";
 const APPROVE_PUBLIC_TAG: &[u8] = b"\xffAPP\x01";
 const APPROVE_UNTRUSTED_TAG: &[u8] = b"\xffAPU\x01";
+const PIN_TAG: &[u8] = b"\xffPIN\x01";
 const REVOKE_TAG: &[u8] = b"\xffREV\x01";
 const MAGIC: [u8; 4] = *b"LNA\x01";
 const MAX_FRAME: usize = crate::cbor::MAX_RECORD;
@@ -354,6 +355,9 @@ impl Connection<'_> {
         let Some(bytes) = self.receive_optional().map_err(RecordError::Transport)? else {
             return Ok(());
         };
+        if let Some(request) = bytes.strip_prefix(PIN_TAG) {
+            return self.serve_pin(request);
+        }
         let Some((change, request)) = [
             ManualPublicationChange::Revoke,
             ManualPublicationChange::ApprovePublic,
@@ -382,6 +386,42 @@ impl Connection<'_> {
         let committed = self.change_publication(id, reason, change)?;
         self.send(&publication_reply(id, committed, change))
             .map_err(RecordError::Transport)
+    }
+
+    fn serve_pin(&mut self, request: &[u8]) -> std::result::Result<(), RecordError> {
+        use crate::id::{Id, Kind};
+        let invalid = || RecordError::Transport(Error::InvalidFrame);
+        let (target, reason) = request.split_at_checked(65).ok_or_else(invalid)?;
+        let reason = std::str::from_utf8(reason).map_err(|_| invalid())?;
+        if reason.len() > 1024 || reason.trim().is_empty() {
+            return Err(invalid());
+        }
+        let knowledge = Id {
+            kind: Kind::Knowledge,
+            bytes: target[1..33].try_into().map_err(|_| invalid())?,
+        };
+        let genesis_bytes = target[33..].try_into().map_err(|_| invalid())?;
+        let genesis = match target[0] {
+            0 if genesis_bytes == [0; 32] => None,
+            1 => Some(Id {
+                kind: Kind::Record,
+                bytes: genesis_bytes,
+            }),
+            _ => return Err(invalid()),
+        };
+        let Access::Write(writer) = &mut self.listener.access else {
+            return Err(RecordError::ReadOnly);
+        };
+        let status = match writer.save_pin_change(knowledge, genesis, reason, Some(self.uid)) {
+            Ok(changed) => u8::from(changed),
+            Err(StorageError::InvalidPinTarget) => 2,
+            Err(e) => return Err(RecordError::Storage(e)),
+        };
+        let mut reply = [0; 67];
+        reply[0] = 7;
+        reply[1] = status;
+        reply[2..].copy_from_slice(target);
+        self.send(&reply).map_err(RecordError::Transport)
     }
 
     fn commit_record(&mut self, bytes: &[u8]) -> std::result::Result<Receipt, RecordError> {

@@ -59,6 +59,16 @@ impl RecordWriter {
     /// 認証・必要な配信遮断を済ませた管理操作向け。指定なしで解除する。
     /// 同じ指定の再適用では履歴・世代を進めずfalseを返す。
     pub fn save_pin(&mut self, knowledge: Id, genesis: Option<Id>, reason: &str) -> Result<bool> {
+        self.save_pin_change(knowledge, genesis, reason, None)
+    }
+
+    pub(super) fn save_pin_change(
+        &mut self,
+        knowledge: Id,
+        genesis: Option<Id>,
+        reason: &str,
+        peer_uid: Option<u32>,
+    ) -> Result<bool> {
         if self.failed {
             return Err(StorageError::UnresolvedFailure);
         }
@@ -84,7 +94,10 @@ impl RecordWriter {
             }
             let tx = self.store.conn.transaction()?;
             advance(&tx)?;
-            audit(
+            if peer_uid.is_some() {
+                tx.execute("UPDATE evaluation_state SET dirty=1 WHERE singleton=1", [])?;
+            }
+            audit_with_uid(
                 &tx,
                 Some(&knowledge.bytes),
                 if previous.is_some() {
@@ -94,6 +107,7 @@ impl RecordWriter {
                 },
                 "pin_saved_local_only",
                 reason,
+                peer_uid.unwrap_or_else(|| rustix::process::geteuid().as_raw()),
             )?;
             if tx.execute(
                 "INSERT INTO pin_changes(generation,old_genesis,new_genesis)
@@ -117,6 +131,76 @@ impl RecordWriter {
 mod tests {
     use super::*;
     use crate::storage::tests::{Temp, fixture, logical_snapshot};
+
+    #[test]
+    fn management_pin_requires_reevaluation_and_keeps_approval_bound_to_record() {
+        let temp = Temp::new();
+        let record = fixture();
+        let id = record.id();
+        let knowledge = Id {
+            kind: Kind::Knowledge,
+            bytes: record.identity().knowledge,
+        };
+        let mut writer = temp.store().begin().unwrap();
+        writer.insert(&record).unwrap();
+        writer.revalidate(EvaluationLimits::default()).unwrap();
+        writer
+            .save_manual_publication_change(id, ManualPublicationChange::ApprovePublic, "approve")
+            .unwrap();
+        assert!(
+            writer
+                .save_pin_change(knowledge, Some(id), "adopt", Some(1234))
+                .unwrap()
+        );
+        assert!(
+            !writer
+                .send_record(
+                    id,
+                    DistributionGate::Open,
+                    PublicationPermission::Public,
+                    |_| panic!("evaluation is stale")
+                )
+                .unwrap()
+        );
+        writer.revalidate(EvaluationLimits::default()).unwrap();
+        assert!(
+            writer
+                .send_record(
+                    id,
+                    DistributionGate::Open,
+                    PublicationPermission::Public,
+                    |_| Ok(())
+                )
+                .unwrap()
+        );
+        assert!(
+            writer
+                .save_pin_change(knowledge, None, "release", Some(1234))
+                .unwrap()
+        );
+        writer.revalidate(EvaluationLimits::default()).unwrap();
+        assert!(
+            !writer
+                .send_record(
+                    id,
+                    DistributionGate::Open,
+                    PublicationPermission::Public,
+                    |_| panic!("pin was released")
+                )
+                .unwrap()
+        );
+        assert!(
+            !writer
+                .send_record(
+                    id,
+                    DistributionGate::Open,
+                    PublicationPermission::Untrusted,
+                    |_| panic!("approval must not transfer")
+                )
+                .unwrap()
+        );
+        writer.finish().unwrap();
+    }
 
     #[test]
     fn pin_and_release_preserve_history_across_reopen() {
