@@ -429,9 +429,7 @@ fn serve(
             break;
         }
         // 途中frame・不正Record・保存失敗・応答喪失のどれでもfinishへ進めない。
-        connection
-            .store_record_or_probe()
-            .map_err(|_| Error::Unconfirmed)?;
+        connection.serve_request().map_err(|_| Error::Unconfirmed)?;
     }
     // Connectionは全て終結済み。socket整理の失敗でもfinishしない。
     let writer = listener.close_writer().map_err(|_| Error::Unconfirmed)?;

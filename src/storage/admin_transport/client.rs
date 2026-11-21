@@ -196,5 +196,40 @@ pub fn submit(path: &Path, record: &LocalRecord, timeout: Duration) -> Result<Re
     })
 }
 
+/// 認証済み管理socketへ明示した一件の公開取消しを送る。応答不明時の自動再送は行わない。
+pub fn revoke_publication(
+    path: &Path,
+    id: crate::id::Id,
+    reason: &str,
+    timeout: Duration,
+) -> Result<bool> {
+    if id.kind != crate::id::Kind::Record || reason.len() > 1024 || reason.trim().is_empty() {
+        return Err(Error::Policy);
+    }
+    let (mut stream, deadline) = connect(path, timeout)?;
+    let mut request = MAGIC.to_vec();
+    request.extend_from_slice(
+        &((super::REVOKE_TAG.len() + id.bytes.len() + reason.len()) as u32).to_be_bytes(),
+    );
+    request.extend_from_slice(super::REVOKE_TAG);
+    request.extend_from_slice(&id.bytes);
+    request.extend_from_slice(reason.as_bytes());
+    send_all(&mut stream, &request, deadline).map_err(|_| Error::OutcomeUnknown)?;
+    let mut header = [0; 8];
+    transfer(&mut stream, &mut header, deadline).map_err(|_| Error::OutcomeUnknown)?;
+    if header[..4] != MAGIC || header[4..] != 34u32.to_be_bytes() {
+        return Err(Error::OutcomeUnknown);
+    }
+    let mut reply = [0; 34];
+    transfer(&mut stream, &mut reply, deadline).map_err(|_| Error::OutcomeUnknown)?;
+    if reply == super::revoke_reply(id, true) {
+        Ok(true)
+    } else if reply == super::revoke_reply(id, false) {
+        Ok(false)
+    } else {
+        Err(Error::OutcomeUnknown)
+    }
+}
+
 #[cfg(test)]
 mod tests;

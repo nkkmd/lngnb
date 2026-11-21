@@ -19,6 +19,7 @@ use std::{
 };
 
 const NAME: &str = "admin.sock";
+const REVOKE_TAG: &[u8] = b"\xffREV\x01";
 const MAGIC: [u8; 4] = *b"LNA\x01";
 const MAX_FRAME: usize = crate::cbor::MAX_RECORD;
 const MAX_TIMEOUT: Duration = Duration::from_secs(30);
@@ -333,6 +334,34 @@ impl Connection<'_> {
         };
         self.commit_record(&bytes).map(Some)
     }
+    /// 認証済み管理接続で一件の要求を処理する。
+    pub fn serve_request(&mut self) -> std::result::Result<(), RecordError> {
+        if !matches!(self.listener.access, Access::Write(_)) {
+            return Err(RecordError::ReadOnly);
+        }
+        let Some(bytes) = self.receive_optional().map_err(RecordError::Transport)? else {
+            return Ok(());
+        };
+        let Some(request) = bytes.strip_prefix(REVOKE_TAG) else {
+            return self.commit_record(&bytes).map(|_| ());
+        };
+        let invalid = RecordError::Transport(Error::InvalidFrame);
+        let (id, reason) = request.split_at_checked(32).ok_or(invalid)?;
+        let reason = std::str::from_utf8(reason)
+            .ok()
+            .filter(|reason| reason.len() <= 1024 && !reason.trim().is_empty())
+            .ok_or(RecordError::Transport(Error::InvalidFrame))?;
+        let id = crate::id::Id {
+            kind: crate::id::Kind::Record,
+            bytes: id
+                .try_into()
+                .map_err(|_| RecordError::Transport(Error::InvalidFrame))?,
+        };
+        let committed = self.revoke_publication(id, reason)?;
+        self.send(&revoke_reply(id, committed))
+            .map_err(RecordError::Transport)
+    }
+
     fn commit_record(&mut self, bytes: &[u8]) -> std::result::Result<Receipt, RecordError> {
         let request = RecordRequest::check(bytes).map_err(RecordError::Invalid)?;
         let receipt = match &mut self.listener.access {
@@ -409,6 +438,13 @@ impl fmt::Display for RecordError {
     }
 }
 impl std::error::Error for RecordError {}
+fn revoke_reply(id: crate::id::Id, committed: bool) -> [u8; 34] {
+    let mut reply = [0; 34];
+    reply[0] = 4;
+    reply[1] = u8::from(committed);
+    reply[2..].copy_from_slice(&id.bytes);
+    reply
+}
 fn retry(e: &std::io::Error) -> bool {
     matches!(
         e.kind(),
