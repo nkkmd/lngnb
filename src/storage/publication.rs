@@ -135,7 +135,12 @@ impl RecordStore {
     /// gate は呼び出し側の運用制限。結果はこの読取り時点の判定で、送信許可証にはならない。
     pub fn record_publication(&self, id: Id, gate: DistributionGate) -> Result<RecordPublication> {
         let snapshot = self.conn.unchecked_transaction()?;
-        let publication = self.assess_record_publication(id, gate)?;
+        let publication = if self.startup_state()? == StartupState::Clean {
+            self.assess_record_publication(id, gate)?
+                .map_or(RecordPublication::Private, |(publication, _)| publication)
+        } else {
+            RecordPublication::Private
+        };
         snapshot.commit()?;
         Ok(publication)
     }
@@ -144,12 +149,9 @@ impl RecordStore {
         &self,
         id: Id,
         gate: DistributionGate,
-    ) -> Result<RecordPublication> {
-        if gate == DistributionGate::Closed
-            || id.kind != Kind::Record
-            || self.startup_state()? != StartupState::Clean
-        {
-            return Ok(RecordPublication::Private);
+    ) -> Result<Option<(RecordPublication, LocalRecord)>> {
+        if gate == DistributionGate::Closed || id.kind != Kind::Record {
+            return Ok(None);
         }
         let valid = self.conn.query_row(
             "SELECT EXISTS(
@@ -166,7 +168,7 @@ impl RecordStore {
             |row| row.get::<_, bool>(0),
         )?;
         if !valid {
-            return Ok(RecordPublication::Private);
+            return Ok(None);
         }
 
         let permission = load_permission(&self.conn, id)?.ok_or(StorageError::Corrupt)?;
@@ -180,13 +182,14 @@ impl RecordStore {
             Some(pin) if pin.bytes == genesis => PublicationAnchor::Pinned,
             _ => PublicationAnchor::Untrusted,
         };
-        Ok(RecordPublication::assess(
+        let publication = RecordPublication::assess(
             permission.permission,
             Some(Validation::Valid),
             anchor,
             permission.explicitly_stopped,
             gate,
-        ))
+        );
+        Ok(Some((publication, record)))
     }
 
     /// 既存Recordの許可を返す。対象がなければNone。
@@ -199,6 +202,45 @@ impl RecordStore {
 }
 
 impl RecordWriter {
+    /// 排他writerを保持したまま固定Recordの配信可否を判定して送信する。
+    /// 呼び出し側はゲートの変更を同じ所有者で直列化し、指定経路へ期限付きで同期送信する。
+    pub fn send_record(
+        &mut self,
+        id: Id,
+        gate: DistributionGate,
+        route: PublicationPermission,
+        send: impl FnOnce(&[u8]) -> std::io::Result<()>,
+    ) -> Result<bool> {
+        if !self.began_clean || self.failed || self.store.blob_recovery.needs_review() {
+            return Ok(false);
+        }
+
+        let result: Result<_> = (|| {
+            let snapshot = self.store.conn.unchecked_transaction()?;
+            let assessment = self.store.assess_record_publication(id, gate)?;
+            snapshot.commit()?;
+            Ok(assessment)
+        })();
+        if result.is_err() {
+            self.failed = true;
+        }
+        let Some((publication, record)) = result? else {
+            return Ok(false);
+        };
+        if !matches!(
+            (publication, route),
+            (RecordPublication::Public, PublicationPermission::Public)
+                | (
+                    RecordPublication::UntrustedPublic,
+                    PublicationPermission::Untrusted
+                )
+        ) {
+            return Ok(false);
+        }
+        send(record.bytes()).map_err(StorageError::Io)?;
+        Ok(true)
+    }
+
     /// 認証と必要な配信遮断を済ませた呼び出し元向けの内部保存操作。
     /// 対象がなければfalse。成功は配信を開始または再開する資格を与えない。
     pub fn save_manual_publication_change(
@@ -259,6 +301,102 @@ mod tests {
     use super::*;
 
     use crate::storage::tests::{Temp, fixture, logical_snapshot};
+
+    #[test]
+    fn live_send_rechecks_route_gate_and_revocation() {
+        let temp = Temp::new();
+        let record = fixture();
+        let id = record.id();
+        let mut writer = temp.store().begin().unwrap();
+        writer.insert(&record).unwrap();
+        writer
+            .revalidate(super::super::EvaluationLimits::default())
+            .unwrap();
+        writer
+            .save_manual_publication_change(id, ManualPublicationChange::ApproveUntrusted, "allow")
+            .unwrap();
+
+        assert!(
+            writer
+                .send_record(
+                    id,
+                    DistributionGate::Open,
+                    PublicationPermission::Untrusted,
+                    |bytes| {
+                        assert_eq!(bytes, record.bytes());
+                        Ok(())
+                    }
+                )
+                .unwrap()
+        );
+        assert!(
+            !writer
+                .send_record(
+                    id,
+                    DistributionGate::Open,
+                    PublicationPermission::Public,
+                    |_| panic!("wrong route")
+                )
+                .unwrap()
+        );
+        assert!(
+            !writer
+                .send_record(
+                    id,
+                    DistributionGate::Closed,
+                    PublicationPermission::Untrusted,
+                    |_| panic!("gate closed")
+                )
+                .unwrap()
+        );
+
+        writer
+            .save_manual_publication_change(id, ManualPublicationChange::Revoke, "stop")
+            .unwrap();
+        assert!(
+            !writer
+                .send_record(
+                    id,
+                    DistributionGate::Open,
+                    PublicationPermission::Untrusted,
+                    |_| panic!("revoked")
+                )
+                .unwrap()
+        );
+        writer
+            .save_manual_publication_change(
+                id,
+                ManualPublicationChange::ApproveUntrusted,
+                "allow again",
+            )
+            .unwrap();
+        writer
+            .store
+            .conn
+            .execute_batch(
+                "CREATE TEMP TRIGGER fail_revoke BEFORE INSERT ON publication_changes
+             WHEN NEW.decision='revoke' BEGIN SELECT RAISE(ABORT, 'test failure'); END;",
+            )
+            .unwrap();
+        assert!(matches!(
+            writer.save_manual_publication_change(id, ManualPublicationChange::Revoke, "stop"),
+            Err(StorageError::Sql(_))
+        ));
+        assert!(
+            !writer
+                .send_record(
+                    id,
+                    DistributionGate::Open,
+                    PublicationPermission::Untrusted,
+                    |_| panic!("revocation failed")
+                )
+                .unwrap()
+        );
+        assert!(matches!(
+            writer.finish(),
+            Err(StorageError::UnresolvedFailure)
+        ));
+    }
 
     #[test]
     fn current_publication_requires_matching_pin_permission_and_clean_evaluation() {
