@@ -850,7 +850,9 @@ impl RecordStore {
             StartupState::InspectionPending => return Err(StorageError::InspectionPending),
         }
         transition(&mut self.conn, "running", "begin_record_session")?;
-        Ok(RecordWriter::new(self))
+        let mut writer = RecordWriter::new(self);
+        writer.began_clean = true;
+        Ok(writer)
     }
 }
 
@@ -858,6 +860,7 @@ impl RecordStore {
 pub struct RecordWriter {
     store: RecordStore,
     failed: bool,
+    began_clean: bool,
     records: u64,
     bytes: u64,
     reserved: u64,
@@ -874,6 +877,7 @@ impl RecordWriter {
         Self {
             store,
             failed: false,
+            began_clean: false,
             records: 0,
             bytes: 0,
             reserved: 0,
