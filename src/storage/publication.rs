@@ -136,7 +136,7 @@ impl RecordStore {
     pub fn record_publication(&self, id: Id, gate: DistributionGate) -> Result<RecordPublication> {
         let snapshot = self.conn.unchecked_transaction()?;
         let publication = if self.startup_state()? == StartupState::Clean {
-            self.assess_record_publication(id, gate)?
+            self.assess_record_publication(id, gate, None)?
                 .map_or(RecordPublication::Private, |(publication, _)| publication)
         } else {
             RecordPublication::Private
@@ -149,6 +149,7 @@ impl RecordStore {
         &self,
         id: Id,
         gate: DistributionGate,
+        genesis_id: Option<Id>,
     ) -> Result<Option<(RecordPublication, LocalRecord)>> {
         if gate == DistributionGate::Closed || id.kind != Kind::Record {
             return Ok(None);
@@ -182,6 +183,9 @@ impl RecordStore {
             Some(pin) if pin.bytes == genesis => PublicationAnchor::Pinned,
             _ => PublicationAnchor::Untrusted,
         };
+        if genesis_id.is_some_and(|expected| expected.bytes != genesis) {
+            return Ok(None);
+        }
         let publication = RecordPublication::assess(
             permission.permission,
             Some(Validation::Valid),
@@ -201,6 +205,13 @@ impl RecordStore {
     }
 }
 
+/// 固定Record取得で指定できる公開経路。仕様 A4.2。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FixedRecordScope {
+    Public { genesis_id: Option<Id> },
+    Untrusted { genesis_id: Id },
+}
+
 impl RecordWriter {
     /// 排他writerを保持したまま固定Recordの配信可否を判定して送信する。
     /// 呼び出し側はゲートの変更を同じ所有者で直列化し、指定経路へ期限付きで同期送信する。
@@ -209,6 +220,38 @@ impl RecordWriter {
         id: Id,
         gate: DistributionGate,
         route: PublicationPermission,
+        send: impl FnOnce(&[u8]) -> std::io::Result<()>,
+    ) -> Result<bool> {
+        self.send_record_in_scope(id, gate, route, None, send)
+    }
+
+    /// 取得要求のGenesisを現在の評価・公開許可と同じ保存世代で照合する。
+    /// 呼び出し側は要求IDの種類を検査し、期限付きで同期送信する。
+    pub fn send_fixed_record(
+        &mut self,
+        id: Id,
+        gate: DistributionGate,
+        scope: FixedRecordScope,
+        send: impl FnOnce(&[u8]) -> std::io::Result<()>,
+    ) -> Result<bool> {
+        let (route, genesis_id) = match scope {
+            FixedRecordScope::Public { genesis_id } => (PublicationPermission::Public, genesis_id),
+            FixedRecordScope::Untrusted { genesis_id } => {
+                (PublicationPermission::Untrusted, Some(genesis_id))
+            }
+        };
+        if genesis_id.is_some_and(|genesis| genesis.kind != Kind::Record) {
+            return Ok(false);
+        }
+        self.send_record_in_scope(id, gate, route, genesis_id, send)
+    }
+
+    fn send_record_in_scope(
+        &mut self,
+        id: Id,
+        gate: DistributionGate,
+        route: PublicationPermission,
+        genesis_id: Option<Id>,
         send: impl FnOnce(&[u8]) -> std::io::Result<()>,
     ) -> Result<bool> {
         if !self.began_clean
@@ -221,7 +264,7 @@ impl RecordWriter {
 
         let result: Result<_> = (|| {
             let snapshot = self.store.conn.unchecked_transaction()?;
-            let assessment = self.store.assess_record_publication(id, gate)?;
+            let assessment = self.store.assess_record_publication(id, gate, genesis_id)?;
             snapshot.commit()?;
             Ok(assessment)
         })();
@@ -336,6 +379,85 @@ mod tests {
     use super::*;
 
     use crate::storage::tests::{Temp, fixture, logical_snapshot};
+
+    #[test]
+    fn fixed_send_requires_the_requested_genesis_and_scope() {
+        let temp = Temp::new();
+        let record = fixture();
+        let id = record.id();
+        let knowledge = Id {
+            kind: Kind::Knowledge,
+            bytes: record.identity().knowledge,
+        };
+        let mut other_genesis = id;
+        other_genesis.bytes[0] ^= 1;
+        let mut writer = temp.store().begin().unwrap();
+        writer.insert(&record).unwrap();
+        writer.revalidate(EvaluationLimits::default()).unwrap();
+        writer
+            .save_manual_publication_change(id, ManualPublicationChange::ApproveUntrusted, "allow")
+            .unwrap();
+        let untrusted = FixedRecordScope::Untrusted { genesis_id: id };
+
+        assert!(
+            writer
+                .send_fixed_record(id, DistributionGate::Open, untrusted, |bytes| {
+                    assert_eq!(bytes, record.bytes());
+                    Ok(())
+                })
+                .unwrap()
+        );
+        for genesis_id in [other_genesis, knowledge] {
+            assert!(
+                !writer
+                    .send_fixed_record(
+                        id,
+                        DistributionGate::Open,
+                        FixedRecordScope::Untrusted { genesis_id },
+                        |_| panic!("unexpected Genesis")
+                    )
+                    .unwrap()
+            );
+        }
+
+        writer
+            .save_pin_change(knowledge, Some(id), "adopt", None)
+            .unwrap();
+        writer.revalidate(EvaluationLimits::default()).unwrap();
+        writer
+            .save_manual_publication_change(id, ManualPublicationChange::ApprovePublic, "allow")
+            .unwrap();
+        for genesis_id in [None, Some(id)] {
+            assert!(
+                writer
+                    .send_fixed_record(
+                        id,
+                        DistributionGate::Open,
+                        FixedRecordScope::Public { genesis_id },
+                        |bytes| {
+                            assert_eq!(bytes, record.bytes());
+                            Ok(())
+                        }
+                    )
+                    .unwrap()
+            );
+        }
+        for scope in [
+            untrusted,
+            FixedRecordScope::Public {
+                genesis_id: Some(other_genesis),
+            },
+        ] {
+            assert!(
+                !writer
+                    .send_fixed_record(id, DistributionGate::Open, scope, |_| panic!(
+                        "wrong public scope or Genesis"
+                    ))
+                    .unwrap()
+            );
+        }
+        writer.finish().unwrap();
+    }
 
     #[test]
     fn live_send_rechecks_route_gate_and_revocation() {

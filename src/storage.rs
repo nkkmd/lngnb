@@ -1061,8 +1061,8 @@ mod filesystem_tests;
 
 mod publication;
 pub use publication::{
-    DistributionGate, ManualPublicationChange, PublicationAnchor, PublicationPermission,
-    RecordPublication, SavedPublicationPermission,
+    DistributionGate, FixedRecordScope, ManualPublicationChange, PublicationAnchor,
+    PublicationPermission, RecordPublication, SavedPublicationPermission,
 };
 
 mod pin;
