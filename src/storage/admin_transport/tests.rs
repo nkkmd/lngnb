@@ -517,31 +517,50 @@ fn short_accept_wait_preserves_request_deadline_and_empty_probe_is_not_a_frame()
 }
 
 #[test]
-fn authenticated_revoke_request_confirms_only_the_requested_record() {
+fn authenticated_publication_changes_confirm_the_requested_record_and_mode() {
     let area = Area::new();
     let mut writer = initialized_writer(&area);
     let record = crate::storage::tests::fixture();
     let id = record.id();
     writer.insert(&record).unwrap();
     let mut server = Listener::bind_writer(writer, MAX_FRAME, Duration::from_secs(1)).unwrap();
-    let mut client = UnixStream::connect(area.endpoint()).unwrap();
-    let mut request = REVOKE_TAG.to_vec();
-    request.extend_from_slice(&id.bytes);
-    request.extend_from_slice(b"operator request");
-    client.write_all(&frame(&request)).unwrap();
-    let mut connection = server.accept().unwrap();
-    connection.serve_request().unwrap();
-    let mut reply = [0; 42];
-    client.read_exact(&mut reply).unwrap();
-    assert_eq!(reply.as_slice(), frame(&revoke_reply(id, true)));
-    assert!(
-        connection
+    for (change, expected) in [
+        (
+            ManualPublicationChange::ApprovePublic,
+            super::super::PublicationPermission::Public,
+        ),
+        (
+            ManualPublicationChange::Revoke,
+            super::super::PublicationPermission::None,
+        ),
+        (
+            ManualPublicationChange::ApproveUntrusted,
+            super::super::PublicationPermission::Untrusted,
+        ),
+    ] {
+        let mut client = UnixStream::connect(area.endpoint()).unwrap();
+        let mut request = publication_wire(change).0.to_vec();
+        request.extend_from_slice(&id.bytes);
+        request.extend_from_slice(b"operator request");
+        client.write_all(&frame(&request)).unwrap();
+        let mut connection = server.accept().unwrap();
+        connection.serve_request().unwrap();
+        let mut reply = [0; 42];
+        client.read_exact(&mut reply).unwrap();
+        assert_eq!(
+            reply.as_slice(),
+            frame(&publication_reply(id, true, change))
+        );
+        let saved = connection
             .store()
             .saved_publication_permission(id)
             .unwrap()
-            .unwrap()
-            .explicitly_stopped
-    );
-    drop(connection);
+            .unwrap();
+        assert_eq!(saved.permission, expected);
+        assert_eq!(
+            saved.explicitly_stopped,
+            change == ManualPublicationChange::Revoke
+        );
+    }
     server.close_writer().unwrap().finish().unwrap();
 }
