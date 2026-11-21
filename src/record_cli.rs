@@ -4,7 +4,7 @@ use lngnb::{
     authoring_input,
     id::{Id, Kind},
     record::LocalRecord,
-    storage::{admin_transport::client, management::Receipt},
+    storage::{ManualPublicationChange, admin_transport::client, management::Receipt},
 };
 use std::{ffi::OsString, fmt, io::Write, path::PathBuf, time::Duration};
 
@@ -16,7 +16,11 @@ pub struct Command {
 #[derive(Debug, PartialEq, Eq)]
 enum Operation {
     Submit(PathBuf),
-    Revoke { id: Id, reason: String },
+    Publication {
+        id: Id,
+        reason: String,
+        change: ManualPublicationChange,
+    },
 }
 pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
     let usage =
@@ -25,7 +29,10 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
         return Err(usage());
     };
     if action == "revoke-publication" {
-        return parse_revoke(rest);
+        return parse_publication(rest, false);
+    }
+    if action == "approve-publication" {
+        return parse_publication(rest, true);
     }
     if action != "submit" || rest.len() != 4 {
         return Err(usage());
@@ -47,16 +54,19 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
         operation: Operation::Submit(record.ok_or_else(usage)?),
     })
 }
-fn parse_revoke(args: &[OsString]) -> Result<Command, AppError> {
+fn parse_publication(args: &[OsString], approve: bool) -> Result<Command, AppError> {
     let usage = || {
-        AppError::Usage(
-            "record revoke-publication --data-dir PATH --record-id ID --reason TEXT を指定してください",
-        )
+        AppError::Usage(if approve {
+            "record approve-publication --data-dir PATH --record-id ID --mode public|untrusted --reason TEXT を指定してください"
+        } else {
+            "record revoke-publication --data-dir PATH --record-id ID --reason TEXT を指定してください"
+        })
     };
-    if args.len() != 6 {
+    if args.len() != if approve { 8 } else { 6 } {
         return Err(usage());
     }
     let (mut data, mut id, mut reason) = (None, None, None);
+    let mut change = (!approve).then_some(ManualPublicationChange::Revoke);
     for pair in args.chunks_exact(2) {
         match pair[0].to_str() {
             Some("--data-dir") if data.is_none() && !pair[1].is_empty() => {
@@ -67,6 +77,13 @@ fn parse_revoke(args: &[OsString]) -> Result<Command, AppError> {
                     Id::parse(Kind::Record, pair[1].to_str().ok_or_else(usage)?)
                         .map_err(|_| usage())?,
                 )
+            }
+            Some("--mode") if change.is_none() => {
+                change = Some(match pair[1].to_str() {
+                    Some("public") => ManualPublicationChange::ApprovePublic,
+                    Some("untrusted") => ManualPublicationChange::ApproveUntrusted,
+                    _ => return Err(usage()),
+                });
             }
             Some("--reason") if reason.is_none() => {
                 reason = Some(
@@ -82,9 +99,10 @@ fn parse_revoke(args: &[OsString]) -> Result<Command, AppError> {
     }
     Ok(Command {
         data: data.ok_or_else(usage)?,
-        operation: Operation::Revoke {
+        operation: Operation::Publication {
             id: id.ok_or_else(usage)?,
             reason: reason.ok_or_else(usage)?,
+            change: change.ok_or_else(usage)?,
         },
     })
 }
@@ -93,6 +111,9 @@ pub enum Error {
     Input,
     InvalidRecord,
     Revoke(client::Error),
+    Approval(client::Error),
+    ApprovalTargetMissing,
+    ApprovalOutput,
     RevokeTargetMissing,
     RevokeOutput,
     Client(client::Error),
@@ -104,6 +125,7 @@ impl Error {
             self,
             Self::Client(client::Error::OutcomeUnknown)
                 | Self::Revoke(client::Error::OutcomeUnknown)
+                | Self::Approval(client::Error::OutcomeUnknown)
         ) {
             3
         } else {
@@ -119,6 +141,10 @@ impl fmt::Display for Error {
             Self::Client(client::Error::OutcomeUnknown) => "Recordの保存確定を確認できません。保存済みの可能性があります。入力と保存領域を保全して確認してください。自動再送・直接保存への切替は行っていません。",
             Self::Client(_) => "管理接続先を確認できず、Recordは送信していません。初期化・socket削除・直接保存への切替は行っていません。",
             Self::Revoke(client::Error::OutcomeUnknown) => "公開取消しの確定を確認できません。自動再送は行っていません。",
+            Self::Approval(client::Error::OutcomeUnknown) => "公開承認の確定を確認できません。自動再送は行っていません。",
+            Self::Approval(_) => "公開承認要求を送信できませんでした。",
+            Self::ApprovalTargetMissing => "対象Recordが存在しないため公開承認を保存しませんでした。",
+            Self::ApprovalOutput => "公開承認は確定しましたが、結果の出力に失敗しました。",
             Self::Revoke(_) => "公開取消し要求を送信できませんでした。",
             Self::RevokeTargetMissing => "対象Recordが存在しないため公開取消しを保存しませんでした。",
             Self::RevokeOutput => "公開取消しは確定しましたが、結果の出力に失敗しました。",
@@ -130,7 +156,28 @@ impl std::error::Error for Error {}
 pub fn run(command: Command, output: &mut impl Write) -> Result<(), Error> {
     let path = match command.operation {
         Operation::Submit(path) => path,
-        Operation::Revoke { id, reason } => {
+        Operation::Publication { id, reason, change }
+            if change != ManualPublicationChange::Revoke =>
+        {
+            let confirmed = client::change_publication(
+                &command.data,
+                id,
+                &reason,
+                change,
+                Duration::from_secs(30),
+            )
+            .map_err(Error::Approval)?;
+            if !confirmed {
+                return Err(Error::ApprovalTargetMissing);
+            }
+            return writeln!(
+                output,
+                "公開承認の保存確定応答を照合しました。\nrecord_id: {id}"
+            )
+            .and_then(|()| output.flush())
+            .map_err(|_| Error::ApprovalOutput);
+        }
+        Operation::Publication { id, reason, .. } => {
             if !client::revoke_publication(&command.data, id, &reason, Duration::from_secs(30))
                 .map_err(Error::Revoke)?
             {

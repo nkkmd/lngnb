@@ -245,12 +245,8 @@ impl RecordWriter {
         Ok(true)
     }
 
-    pub(super) fn revoke_authenticated_publication(
-        &mut self,
-        id: Id,
-        reason: &str,
-        uid: u32,
-    ) -> Result<bool> {
+    #[cfg(test)]
+    fn revoke_authenticated_publication(&mut self, id: Id, reason: &str, uid: u32) -> Result<bool> {
         self.save_publication_change(id, ManualPublicationChange::Revoke, reason, uid)
     }
 
@@ -265,7 +261,7 @@ impl RecordWriter {
         self.save_publication_change(id, change, reason, rustix::process::geteuid().as_raw())
     }
 
-    fn save_publication_change(
+    pub(super) fn save_publication_change(
         &mut self,
         id: Id,
         change: ManualPublicationChange,
@@ -282,7 +278,18 @@ impl RecordWriter {
             let Some(old) = load_permission(&self.store.conn, id)? else {
                 return Ok(false);
             };
-            if change == ManualPublicationChange::Revoke {
+            if change == ManualPublicationChange::Revoke
+                || matches!(
+                    (old.permission, change),
+                    (
+                        PublicationPermission::Public,
+                        ManualPublicationChange::ApproveUntrusted
+                    ) | (
+                        PublicationPermission::Untrusted,
+                        ManualPublicationChange::ApprovePublic
+                    )
+                )
+            {
                 self.publication_block = Some(id);
             }
             let capacity = self.store.capacity()?;
@@ -409,6 +416,36 @@ mod tests {
                 "allow again",
             )
             .unwrap();
+        assert!(
+            !writer
+                .send_record(
+                    id,
+                    DistributionGate::Closed,
+                    PublicationPermission::Untrusted,
+                    |_| panic!("gate closed after approval")
+                )
+                .unwrap()
+        );
+        assert!(
+            !writer
+                .send_record(
+                    id,
+                    DistributionGate::Open,
+                    PublicationPermission::Public,
+                    |_| panic!("wrong route after approval")
+                )
+                .unwrap()
+        );
+        assert!(
+            writer
+                .send_record(
+                    id,
+                    DistributionGate::Open,
+                    PublicationPermission::Untrusted,
+                    |_| Ok(())
+                )
+                .unwrap()
+        );
         writer
             .store
             .conn

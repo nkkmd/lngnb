@@ -46,6 +46,7 @@ const HELP: &str = "lngnb — 分散図書館・知識基盤（開発初期段�
   lngnb admin config-change --data-dir PATH --request-timeout-ms N --max-new-records N --max-diagnostic-records N --startup-records-per-step N
   lngnb admin serve --data-dir PATH [--request-timeout-ms N] [--max-new-records N] [--max-diagnostic-records N] [--startup-records-per-step N] [--startup-record-bytes-per-step N] [--startup-blob-bytes-per-step N] [--startup-blob-targets-per-step N] [--startup-record-edges-per-step N] [--startup-evaluation-records-per-step N] [--sql-inspection-callbacks N] [--sql-inspection-timeout-ms N] [--startup-inspection-timeout-ms N] [--startup-record-input-timeout-ms N] [--startup-blob-input-timeout-ms N] [--startup-evaluation-timeout-ms N]
   lngnb record submit --data-dir PATH --record PATH
+  lngnb record approve-publication --data-dir PATH --record-id ID --mode public|untrusted --reason TEXT
   lngnb record revoke-publication --data-dir PATH --record-id ID --reason TEXT
   lngnb document history --data-dir PATH --knowledge-id KNOWLEDGE_ID --genesis-id GENESIS_ID
   lngnb document inspect --data-dir PATH --knowledge-id KNOWLEDGE_ID --genesis-id GENESIS_ID --revision-id REVISION_ID

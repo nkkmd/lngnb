@@ -203,15 +203,31 @@ pub fn revoke_publication(
     reason: &str,
     timeout: Duration,
 ) -> Result<bool> {
+    change_publication(
+        path,
+        id,
+        reason,
+        super::ManualPublicationChange::Revoke,
+        timeout,
+    )
+}
+
+/// 認証済み管理socketで公開区分を一件変更し、確定応答を照合する。
+pub fn change_publication(
+    path: &Path,
+    id: crate::id::Id,
+    reason: &str,
+    change: super::ManualPublicationChange,
+    timeout: Duration,
+) -> Result<bool> {
+    let (tag, _) = super::publication_wire(change);
     if id.kind != crate::id::Kind::Record || reason.len() > 1024 || reason.trim().is_empty() {
         return Err(Error::Policy);
     }
     let (mut stream, deadline) = connect(path, timeout)?;
     let mut request = MAGIC.to_vec();
-    request.extend_from_slice(
-        &((super::REVOKE_TAG.len() + id.bytes.len() + reason.len()) as u32).to_be_bytes(),
-    );
-    request.extend_from_slice(super::REVOKE_TAG);
+    request.extend_from_slice(&((tag.len() + id.bytes.len() + reason.len()) as u32).to_be_bytes());
+    request.extend_from_slice(tag);
     request.extend_from_slice(&id.bytes);
     request.extend_from_slice(reason.as_bytes());
     send_all(&mut stream, &request, deadline).map_err(|_| Error::OutcomeUnknown)?;
@@ -222,9 +238,9 @@ pub fn revoke_publication(
     }
     let mut reply = [0; 34];
     transfer(&mut stream, &mut reply, deadline).map_err(|_| Error::OutcomeUnknown)?;
-    if reply == super::revoke_reply(id, true) {
+    if reply == super::publication_reply(id, true, change) {
         Ok(true)
-    } else if reply == super::revoke_reply(id, false) {
+    } else if reply == super::publication_reply(id, false, change) {
         Ok(false)
     } else {
         Err(Error::OutcomeUnknown)

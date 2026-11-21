@@ -4,7 +4,7 @@
 //! bytesであり、呼出し側で操作・完成署名Recordを検査する。秘密鍵を渡してはならない。
 //! 同じUID/rootによる意図的な置換や、接続後のfd譲渡は防御範囲外。
 use super::{
-    RecordStore, RecordWriter, StorageError, anchored, check_area,
+    ManualPublicationChange, RecordStore, RecordWriter, StorageError, anchored, check_area,
     management::{Receipt, RecordRequest},
 };
 use rustix::event::{self, PollFd, PollFlags};
@@ -19,6 +19,8 @@ use std::{
 };
 
 const NAME: &str = "admin.sock";
+const APPROVE_PUBLIC_TAG: &[u8] = b"\xffAPP\x01";
+const APPROVE_UNTRUSTED_TAG: &[u8] = b"\xffAPU\x01";
 const REVOKE_TAG: &[u8] = b"\xffREV\x01";
 const MAGIC: [u8; 4] = *b"LNA\x01";
 const MAX_FRAME: usize = crate::cbor::MAX_RECORD;
@@ -296,12 +298,22 @@ impl Connection<'_> {
     pub fn store(&self) -> &RecordStore {
         self.listener.access.store()
     }
-    /// 検査済み管理要求による固定Recordの公開取消し。履歴にはソケットで認証したUIDを記録する。
-    /// 応答の符号化と送信は呼び出し側が行う。
+    /// 検査済み管理要求による固定Recordの公開取消し。
     pub fn revoke_publication(
         &mut self,
         id: crate::id::Id,
         reason: &str,
+    ) -> std::result::Result<bool, RecordError> {
+        self.change_publication(id, reason, ManualPublicationChange::Revoke)
+    }
+
+    /// 検査済み管理要求による公開許可の変更。履歴にはソケットで認証したUIDを記録する。
+    /// 応答の符号化と送信は呼び出し側が行う。
+    fn change_publication(
+        &mut self,
+        id: crate::id::Id,
+        reason: &str,
+        change: ManualPublicationChange,
     ) -> std::result::Result<bool, RecordError> {
         if !self.complete || self.sent || self.publication_handled {
             return Err(RecordError::Transport(Error::InvalidFrame));
@@ -309,7 +321,7 @@ impl Connection<'_> {
         self.publication_handled = true;
         match &mut self.listener.access {
             Access::Write(writer) => writer
-                .revoke_authenticated_publication(id, reason, self.uid)
+                .save_publication_change(id, change, reason, self.uid)
                 .map_err(RecordError::Storage),
             Access::Inspect(_) => Err(RecordError::ReadOnly),
         }
@@ -342,7 +354,17 @@ impl Connection<'_> {
         let Some(bytes) = self.receive_optional().map_err(RecordError::Transport)? else {
             return Ok(());
         };
-        let Some(request) = bytes.strip_prefix(REVOKE_TAG) else {
+        let Some((change, request)) = [
+            ManualPublicationChange::Revoke,
+            ManualPublicationChange::ApprovePublic,
+            ManualPublicationChange::ApproveUntrusted,
+        ]
+        .into_iter()
+        .find_map(|change| {
+            bytes
+                .strip_prefix(publication_wire(change).0)
+                .map(|request| (change, request))
+        }) else {
             return self.commit_record(&bytes).map(|_| ());
         };
         let invalid = RecordError::Transport(Error::InvalidFrame);
@@ -357,8 +379,8 @@ impl Connection<'_> {
                 .try_into()
                 .map_err(|_| RecordError::Transport(Error::InvalidFrame))?,
         };
-        let committed = self.revoke_publication(id, reason)?;
-        self.send(&revoke_reply(id, committed))
+        let committed = self.change_publication(id, reason, change)?;
+        self.send(&publication_reply(id, committed, change))
             .map_err(RecordError::Transport)
     }
 
@@ -438,9 +460,20 @@ impl fmt::Display for RecordError {
     }
 }
 impl std::error::Error for RecordError {}
-fn revoke_reply(id: crate::id::Id, committed: bool) -> [u8; 34] {
+fn publication_wire(change: ManualPublicationChange) -> (&'static [u8], u8) {
+    match change {
+        ManualPublicationChange::Revoke => (REVOKE_TAG, 4),
+        ManualPublicationChange::ApprovePublic => (APPROVE_PUBLIC_TAG, 5),
+        ManualPublicationChange::ApproveUntrusted => (APPROVE_UNTRUSTED_TAG, 6),
+    }
+}
+fn publication_reply(
+    id: crate::id::Id,
+    committed: bool,
+    change: ManualPublicationChange,
+) -> [u8; 34] {
     let mut reply = [0; 34];
-    reply[0] = 4;
+    reply[0] = publication_wire(change).1;
     reply[1] = u8::from(committed);
     reply[2..].copy_from_slice(&id.bytes);
     reply
