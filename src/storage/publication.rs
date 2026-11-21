@@ -211,7 +211,11 @@ impl RecordWriter {
         route: PublicationPermission,
         send: impl FnOnce(&[u8]) -> std::io::Result<()>,
     ) -> Result<bool> {
-        if !self.began_clean || self.failed || self.store.blob_recovery.needs_review() {
+        if !self.began_clean
+            || self.failed
+            || self.publication_block == Some(id)
+            || self.store.blob_recovery.needs_review()
+        {
             return Ok(false);
         }
 
@@ -241,6 +245,15 @@ impl RecordWriter {
         Ok(true)
     }
 
+    pub(super) fn revoke_authenticated_publication(
+        &mut self,
+        id: Id,
+        reason: &str,
+        uid: u32,
+    ) -> Result<bool> {
+        self.save_publication_change(id, ManualPublicationChange::Revoke, reason, uid)
+    }
+
     /// 認証と必要な配信遮断を済ませた呼び出し元向けの内部保存操作。
     /// 対象がなければfalse。成功は配信を開始または再開する資格を与えない。
     pub fn save_manual_publication_change(
@@ -248,6 +261,16 @@ impl RecordWriter {
         id: Id,
         change: ManualPublicationChange,
         reason: &str,
+    ) -> Result<bool> {
+        self.save_publication_change(id, change, reason, rustix::process::geteuid().as_raw())
+    }
+
+    fn save_publication_change(
+        &mut self,
+        id: Id,
+        change: ManualPublicationChange,
+        reason: &str,
+        uid: u32,
     ) -> Result<bool> {
         if self.failed {
             return Err(StorageError::UnresolvedFailure);
@@ -259,6 +282,9 @@ impl RecordWriter {
             let Some(old) = load_permission(&self.store.conn, id)? else {
                 return Ok(false);
             };
+            if change == ManualPublicationChange::Revoke {
+                self.publication_block = Some(id);
+            }
             let capacity = self.store.capacity()?;
             if capacity.available <= capacity.reserved_floor.saturating_add(65536) {
                 return Err(StorageError::Capacity);
@@ -271,12 +297,13 @@ impl RecordWriter {
                 (PublicationPermission::Public, false) => "approve_public",
                 (PublicationPermission::Untrusted, false) => "approve_untrusted",
             };
-            audit(
+            audit_with_uid(
                 &tx,
                 Some(&id.bytes),
                 previous,
                 "publication_saved_local_only",
                 reason,
+                uid,
             )?;
             if tx.execute(
                 "INSERT INTO publication_changes(generation,record_id,decision)
@@ -287,6 +314,7 @@ impl RecordWriter {
                 return Err(StorageError::Corrupt);
             }
             tx.commit()?;
+            self.publication_block = None;
             Ok(true)
         })();
         if result.is_err() {
@@ -351,8 +379,19 @@ mod tests {
         );
 
         writer
-            .save_manual_publication_change(id, ManualPublicationChange::Revoke, "stop")
+            .revoke_authenticated_publication(id, "stop", 1234)
             .unwrap();
+        assert_eq!(writer.publication_block, None);
+        let actor: String = writer
+            .store
+            .conn
+            .query_row(
+                "SELECT actor FROM history ORDER BY generation DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(actor, "uid:1234");
         assert!(
             !writer
                 .send_record(
@@ -379,7 +418,7 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(
-            writer.save_manual_publication_change(id, ManualPublicationChange::Revoke, "stop"),
+            writer.revoke_authenticated_publication(id, "stop", 1234),
             Err(StorageError::Sql(_))
         ));
         assert!(
@@ -392,6 +431,7 @@ mod tests {
                 )
                 .unwrap()
         );
+        assert_eq!(writer.publication_block, Some(id));
         assert!(matches!(
             writer.finish(),
             Err(StorageError::UnresolvedFailure)
