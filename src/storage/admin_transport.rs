@@ -200,6 +200,7 @@ impl Listener {
             uid,
             received: false,
             complete: false,
+            publication_handled: false,
             sent: false,
         })
     }
@@ -284,6 +285,7 @@ pub struct Connection<'a> {
     uid: u32,
     received: bool,
     complete: bool,
+    publication_handled: bool,
     sent: bool,
 }
 impl Connection<'_> {
@@ -292,6 +294,24 @@ impl Connection<'_> {
     }
     pub fn store(&self) -> &RecordStore {
         self.listener.access.store()
+    }
+    /// 検査済み管理要求による固定Recordの公開取消し。履歴にはソケットで認証したUIDを記録する。
+    /// 応答の符号化と送信は呼び出し側が行う。
+    pub fn revoke_publication(
+        &mut self,
+        id: crate::id::Id,
+        reason: &str,
+    ) -> std::result::Result<bool, RecordError> {
+        if !self.complete || self.sent || self.publication_handled {
+            return Err(RecordError::Transport(Error::InvalidFrame));
+        }
+        self.publication_handled = true;
+        match &mut self.listener.access {
+            Access::Write(writer) => writer
+                .revoke_authenticated_publication(id, reason, self.uid)
+                .map_err(RecordError::Storage),
+            Access::Inspect(_) => Err(RecordError::ReadOnly),
+        }
     }
     /// 認証済み接続から完成Recordだけを読み、共通処理で一件commit後にlocal-only応答。
     /// 応答失敗でもcommit済みRecordを削除せず、receiptを付けて確定済みと区別する。

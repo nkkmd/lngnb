@@ -615,7 +615,24 @@ fn audit(
     new: &str,
     reason: &str,
 ) -> Result<()> {
-    tx.execute("INSERT INTO history(generation,namespace,target,old_state,new_state,actor,reason,rules,at) SELECT generation,namespace,?1,?2,?3,?4,?5,'lngnb-validation-1',strftime('%Y-%m-%dT%H:%M:%fZ','now') FROM storage_state WHERE singleton=1",params![target,old,new,format!("uid:{}",rustix::process::geteuid().as_raw()),reason])?;
+    audit_with_uid(
+        tx,
+        target,
+        old,
+        new,
+        reason,
+        rustix::process::geteuid().as_raw(),
+    )
+}
+fn audit_with_uid(
+    tx: &Transaction<'_>,
+    target: Option<&[u8]>,
+    old: &str,
+    new: &str,
+    reason: &str,
+    uid: u32,
+) -> Result<()> {
+    tx.execute("INSERT INTO history(generation,namespace,target,old_state,new_state,actor,reason,rules,at) SELECT generation,namespace,?1,?2,?3,?4,?5,'lngnb-validation-1',strftime('%Y-%m-%dT%H:%M:%fZ','now') FROM storage_state WHERE singleton=1",params![target,old,new,format!("uid:{uid}"),reason])?;
     Ok(())
 }
 fn advance(tx: &Transaction<'_>) -> Result<()> {
@@ -861,6 +878,7 @@ pub struct RecordWriter {
     store: RecordStore,
     failed: bool,
     began_clean: bool,
+    publication_block: Option<Id>,
     records: u64,
     bytes: u64,
     reserved: u64,
@@ -878,6 +896,7 @@ impl RecordWriter {
             store,
             failed: false,
             began_clean: false,
+            publication_block: None,
             records: 0,
             bytes: 0,
             reserved: 0,
