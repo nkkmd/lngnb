@@ -43,6 +43,8 @@
 
 別の端末から`record submit`を実行できます。`admin probe`等の要求0bytesでの切断は無操作として扱います。最初のbyte以降の途中frame、不正Record、認証/保存/応答失敗では保守的に受理側を終了し、正常停止を記録しません。入力と領域、残っているsocketを保全して確認してください。一件の保存応答を受け取っても受理側全体の正常終了の証明ではありません。
 
+採用・変更には `lngnb record pin --data-dir PATH --knowledge-id ID --genesis-id ID --reason TEXT`、解除には `lngnb record unpin --data-dir PATH --knowledge-id ID --reason TEXT` を使用します。同じ版の管理受理側に接続します。採用先は指定Knowledgeの保存済みGenesisに限ります。同じ設定の再指定は `changed: false` を返します。変更確定後は再評価が確定するまで固定Recordの配信判定を閉じます。保存確定応答は配信開始を意味しません。確定不明は終了3です。
+
 稼働中の管理受理側と同じ版のCLIで、`lngnb record approve-publication --data-dir PATH --record-id ID --mode public|untrusted --reason TEXT` を使えます。公開区分を明示し、理由の制約と終了コードは取消しと共通です。保存確定後も、配信には検証結果、Genesis pinと公開区分の一致、運用ゲートの条件が適用されます。
 
 稼働中の管理受理側と同じ版のCLIで、`lngnb record revoke-publication --data-dir PATH --record-id ID --reason TEXT` を使えます。理由は空白以外を含むUTF-8で最大1,024バイトです。対象IDと確定応答を照合して成功を表示します。対象が存在しない場合は終了1、引数不正は2、送信後の確定不明は3です。確定不明時の自動再送や直接保存への切替はありません。

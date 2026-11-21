@@ -247,5 +247,54 @@ pub fn change_publication(
     }
 }
 
+/// Noneは対象Genesisが利用できないことを示す。
+pub fn change_pin(
+    path: &Path,
+    knowledge: crate::id::Id,
+    genesis: Option<crate::id::Id>,
+    reason: &str,
+    timeout: Duration,
+) -> Result<Option<bool>> {
+    use crate::id::Kind;
+    if knowledge.kind != Kind::Knowledge
+        || genesis.is_some_and(|id| id.kind != Kind::Record)
+        || reason.len() > 1024
+        || reason.trim().is_empty()
+    {
+        return Err(Error::Policy);
+    }
+    let mut target = [0; 65];
+    target[0] = u8::from(genesis.is_some());
+    target[1..33].copy_from_slice(&knowledge.bytes);
+    if let Some(genesis) = genesis {
+        target[33..].copy_from_slice(&genesis.bytes);
+    }
+    let (mut stream, deadline) = connect(path, timeout)?;
+    let mut request = MAGIC.to_vec();
+    request.extend_from_slice(
+        &((super::PIN_TAG.len() + target.len() + reason.len()) as u32).to_be_bytes(),
+    );
+    request.extend_from_slice(super::PIN_TAG);
+    request.extend_from_slice(&target);
+    request.extend_from_slice(reason.as_bytes());
+    send_all(&mut stream, &request, deadline).map_err(|_| Error::OutcomeUnknown)?;
+    let mut header = [0; 8];
+    transfer(&mut stream, &mut header, deadline).map_err(|_| Error::OutcomeUnknown)?;
+    if header[..4] != MAGIC || header[4..] != 67u32.to_be_bytes() {
+        return Err(Error::OutcomeUnknown);
+    }
+    let mut reply = [0; 67];
+    transfer(&mut stream, &mut reply, deadline).map_err(|_| Error::OutcomeUnknown)?;
+    if reply[0] != 7 || reply[2..] != target {
+        return Err(Error::OutcomeUnknown);
+    }
+    match reply[1] {
+        0 => Ok(Some(false)),
+        1 => Ok(Some(true)),
+        2 => Ok(None),
+        _ => Err(Error::OutcomeUnknown),
+    }
+}
+
 #[cfg(test)]
 mod tests;
