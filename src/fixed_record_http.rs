@@ -78,6 +78,92 @@ pub fn read_request_head(
     }
 }
 
+/// 受理済みのTCP接続から、本文を持たないHTTP/1.1要求を一件処理する。
+/// 接続はこの関数が所有し、戻る際に閉じる。
+/// falseは固定Record以外の経路、Errは受信・保存・送信の失敗を示す。
+pub fn serve_fixed_record_connection(
+    writer: &mut RecordWriter,
+    gate: DistributionGate,
+    stream: TcpStream,
+    read_deadline: Instant,
+    write_deadline: Instant,
+) -> Result<bool, StorageError> {
+    let mut reader = BufReader::new(stream);
+    let head = read_request_head(&mut reader, read_deadline)?;
+    let (method, target) =
+        parse_bodyless_request(&head).ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?;
+    send_fixed_record_response(
+        writer,
+        gate,
+        method,
+        target,
+        reader.get_mut(),
+        write_deadline,
+    )
+}
+
+fn parse_bodyless_request(head: &[u8]) -> Option<(&str, &str)> {
+    let head = std::str::from_utf8(head).ok()?.strip_suffix("\r\n\r\n")?;
+    let mut lines = head.split("\r\n");
+    let mut request = lines.next()?.split(' ');
+    let method = request.next()?;
+    let target = request.next()?;
+    if method.is_empty()
+        || !method.bytes().all(is_token)
+        || !target.starts_with('/')
+        || target.len() > REQUEST_TARGET_LIMIT
+        || !target
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() && byte != b'#')
+        || request.next() != Some("HTTP/1.1")
+        || request.next().is_some()
+    {
+        return None;
+    }
+
+    let mut host_seen = false;
+    let mut length_seen = false;
+    for line in lines {
+        let (name, value) = line.split_once(':')?;
+        if name.is_empty()
+            || !name.bytes().all(is_token)
+            || value
+                .bytes()
+                .any(|byte| byte.is_ascii_control() && byte != b'\t')
+        {
+            return None;
+        }
+        let value = value.trim_matches([' ', '\t']);
+        if name.eq_ignore_ascii_case("host") {
+            if host_seen
+                || value.is_empty()
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b".-_:[]".contains(&byte))
+            {
+                return None;
+            }
+            host_seen = true;
+        } else if name.eq_ignore_ascii_case("content-length") {
+            if length_seen || value.is_empty() || !value.bytes().all(|byte| byte == b'0') {
+                return None;
+            }
+            length_seen = true;
+        } else if name.eq_ignore_ascii_case("transfer-encoding")
+            || name.eq_ignore_ascii_case("expect")
+        {
+            return None;
+        }
+    }
+    host_seen.then_some((method, target))
+}
+
+fn is_token(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || b"!#$%&'*+-.^_".contains(&byte)
+        || matches!(byte, b'`' | b'|' | b'~')
+}
+
 /// 解析済みHTTP要求を固定Record経路へ振り分ける。
 /// falseの場合は応答を送らず、呼び出し側が他の経路を処理する。
 /// sendは応答全体を期限内に同期送信し、405にはAllow: GETを付ける。
