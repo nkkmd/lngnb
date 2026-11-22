@@ -1,6 +1,6 @@
 //! 固定Record取得のHTTP応答。接続の解析と期限管理は呼び出し側が担う。
 
-use std::io::{self, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::time::Instant;
 
@@ -13,6 +13,70 @@ const UNAVAILABLE: &[u8] = br#"{"api_version":"lngnb-http-1","error":{"code":"no
 
 const REQUEST_TARGET_LIMIT: usize = 16 * 1024;
 const METHOD_NOT_ALLOWED: &[u8] = br#"{"api_version":"lngnb-http-1","error":{"code":"method_not_allowed","message":"Method not allowed","retry_after_seconds":null}}"#;
+
+const REQUEST_LINE_LIMIT: usize = REQUEST_TARGET_LIMIT + 1024;
+const REQUEST_HEADERS_LIMIT: usize = 32 * 1024;
+
+/// HTTP/1.xのリクエスト行とヘッダー終端までを絶対期限付きで受信する。
+/// 解析と振り分けはこの受信が成功した後に行う。残りのデータはreaderに保持する。
+/// blocking socketを専有し、エラー時は接続を閉じる。
+pub fn read_request_head(
+    reader: &mut BufReader<TcpStream>,
+    deadline: Instant,
+) -> io::Result<Vec<u8>> {
+    let mut head = Vec::new();
+    let mut line_start = 0;
+    let mut request_line_end = None;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        reader.get_ref().set_read_timeout(Some(remaining))?;
+        let chunk = match reader.fill_buf() {
+            Ok([]) => return Err(io::ErrorKind::UnexpectedEof.into()),
+            Ok(chunk) => chunk,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            Err(error) => return Err(error),
+        };
+        let mut end = None;
+        for (index, &byte) in chunk.iter().enumerate() {
+            let (start, limit) = request_line_end.map_or((0, REQUEST_LINE_LIMIT), |start| {
+                (start, REQUEST_HEADERS_LIMIT)
+            });
+            if head.len() - start == limit {
+                return Err(io::ErrorKind::InvalidData.into());
+            }
+            head.push(byte);
+            if byte == b'\n' {
+                if !head.ends_with(b"\r\n") {
+                    return Err(io::ErrorKind::InvalidData.into());
+                }
+                if request_line_end.is_none() {
+                    if head.len() == 2 {
+                        return Err(io::ErrorKind::InvalidData.into());
+                    }
+                    request_line_end = Some(head.len());
+                } else if head.len() - line_start == 2 {
+                    end = Some(index + 1);
+                    break;
+                }
+                line_start = head.len();
+            }
+        }
+        let consumed = end.unwrap_or(chunk.len());
+        reader.consume(consumed);
+        if Instant::now() >= deadline {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        if end.is_some() {
+            return Ok(head);
+        }
+    }
+}
 
 /// 解析済みHTTP要求を固定Record経路へ振り分ける。
 /// falseの場合は応答を送らず、呼び出し側が他の経路を処理する。
@@ -191,6 +255,40 @@ mod tests {
     use std::io::Read;
     use std::net::TcpListener;
     use std::time::Duration;
+
+    #[test]
+    fn request_head_bounds_and_preserves_remaining_bytes() {
+        for (header_size, expected_error) in [
+            (REQUEST_HEADERS_LIMIT, None),
+            (REQUEST_HEADERS_LIMIT + 1, Some(io::ErrorKind::InvalidData)),
+        ] {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (server, _) = listener.accept().unwrap();
+            let head = format!(
+                "GET /v1/records/id HTTP/1.1\r\nX: {}\r\n\r\n",
+                "a".repeat(header_size - 7)
+            );
+            client.write_all(head.as_bytes()).unwrap();
+            client.write_all(b"tail").unwrap();
+            let mut reader = BufReader::with_capacity(1024, server);
+            assert_eq!(
+                read_request_head(&mut reader, Instant::now())
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::TimedOut
+            );
+            let result = read_request_head(&mut reader, Instant::now() + Duration::from_secs(2));
+            if let Some(kind) = expected_error {
+                assert_eq!(result.unwrap_err().kind(), kind);
+            } else {
+                assert_eq!(result.unwrap(), head.as_bytes());
+                let mut tail = [0; 4];
+                reader.read_exact(&mut tail).unwrap();
+                assert_eq!(&tail, b"tail");
+            }
+        }
+    }
 
     #[test]
     fn response_writes_allow_and_refuses_expired_deadlines() {
