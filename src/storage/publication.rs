@@ -381,6 +381,64 @@ mod tests {
     use crate::storage::tests::{Temp, fixture, logical_snapshot};
 
     #[test]
+    fn fixed_http_router_dispatches_only_single_record_paths() {
+        use crate::fixed_record_http::route_fixed_record_request;
+
+        let temp = Temp::new();
+        let record = fixture();
+        let id = record.id();
+        let mut writer = temp.store().begin().unwrap();
+        writer.insert(&record).unwrap();
+        writer.revalidate(EvaluationLimits::default()).unwrap();
+        writer
+            .save_manual_publication_change(id, ManualPublicationChange::ApproveUntrusted, "allow")
+            .unwrap();
+        let path = format!("/v1/records/{id}");
+        let target = format!("{path}?scope=untrusted&genesis_id={id}");
+        for target in [
+            "/v1/records",
+            "/v1/records/",
+            &format!("{path}/verification"),
+        ] {
+            assert!(
+                !route_fixed_record_request(
+                    &mut writer,
+                    DistributionGate::Open,
+                    "GET",
+                    target,
+                    |_, _, _| panic!("unhandled route"),
+                )
+                .unwrap()
+            );
+        }
+        for (method, target, expected) in [
+            ("GET", target.as_str(), 200),
+            ("GET", path.as_str(), 404),
+            ("PUT", target.as_str(), 405),
+            ("GET", "/v1/records/invalid", 400),
+            ("GET", &format!("{target}&{}", "x".repeat(16 * 1024)), 400),
+        ] {
+            assert!(
+                route_fixed_record_request(
+                    &mut writer,
+                    DistributionGate::Open,
+                    method,
+                    target,
+                    |status, content_type, bytes| {
+                        assert_eq!(status, expected);
+                        if status == 200 {
+                            assert_eq!((content_type, bytes), ("application/cbor", record.bytes()));
+                        }
+                        Ok(())
+                    },
+                )
+                .unwrap()
+            );
+        }
+        writer.finish().unwrap();
+    }
+
+    #[test]
     fn fixed_http_get_preserves_cbor_and_hides_private_records() {
         use crate::fixed_record_http::send_fixed_record_get;
 
