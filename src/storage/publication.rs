@@ -381,6 +381,60 @@ mod tests {
     use crate::storage::tests::{Temp, fixture, logical_snapshot};
 
     #[test]
+    fn fixed_http_connection_reads_and_sends_a_record() {
+        use crate::fixed_record_http::serve_fixed_record_connection;
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::time::{Duration, Instant};
+
+        let temp = Temp::new();
+        let record = fixture();
+        let id = record.id();
+        let mut writer = temp.store().begin().unwrap();
+        writer.insert(&record).unwrap();
+        writer.revalidate(EvaluationLimits::default()).unwrap();
+        writer
+            .save_manual_publication_change(id, ManualPublicationChange::ApproveUntrusted, "allow")
+            .unwrap();
+
+        for (extra, accepted) in [("", true), ("Content-Length: 1\r\n", false)] {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (server, _) = listener.accept().unwrap();
+            write!(client, "GET /v1/records/{id}?scope=untrusted&genesis_id={id} HTTP/1.1\r\nHost: localhost\r\n{extra}\r\n").unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let result = serve_fixed_record_connection(
+                &mut writer,
+                DistributionGate::Open,
+                server,
+                deadline,
+                deadline,
+            );
+            client
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut response = Vec::new();
+            client.read_to_end(&mut response).unwrap();
+            if accepted {
+                assert!(result.unwrap());
+                assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+                let body_start = response
+                    .windows(4)
+                    .position(|part| part == b"\r\n\r\n")
+                    .unwrap()
+                    + 4;
+                assert_eq!(&response[body_start..], record.bytes());
+            } else {
+                assert!(
+                    matches!(result, Err(StorageError::Io(error)) if error.kind() == std::io::ErrorKind::InvalidData)
+                );
+                assert!(response.is_empty());
+            }
+        }
+        writer.finish().unwrap();
+    }
+
+    #[test]
     fn fixed_http_router_dispatches_only_single_record_paths() {
         use crate::fixed_record_http::route_fixed_record_request;
 
