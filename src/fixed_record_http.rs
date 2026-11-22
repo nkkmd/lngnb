@@ -9,6 +9,41 @@ const JSON: &str = "application/json";
 const INVALID: &[u8] = br#"{"api_version":"lngnb-http-1","error":{"code":"invalid_request","message":"Invalid request","retry_after_seconds":null}}"#;
 const UNAVAILABLE: &[u8] = br#"{"api_version":"lngnb-http-1","error":{"code":"not_available","message":"This Record is unavailable on this relay","retry_after_seconds":null}}"#;
 
+const REQUEST_TARGET_LIMIT: usize = 16 * 1024;
+const METHOD_NOT_ALLOWED: &[u8] = br#"{"api_version":"lngnb-http-1","error":{"code":"method_not_allowed","message":"Method not allowed","retry_after_seconds":null}}"#;
+
+/// 解析済みHTTP要求を固定Record経路へ振り分ける。
+/// falseの場合は応答を送らず、呼び出し側が他の経路を処理する。
+/// sendは応答全体を期限内に同期送信し、405にはAllow: GETを付ける。
+pub fn route_fixed_record_request(
+    writer: &mut RecordWriter,
+    gate: DistributionGate,
+    method: &str,
+    target: &str,
+    send: impl FnOnce(u16, &'static str, &[u8]) -> io::Result<()>,
+) -> Result<bool, StorageError> {
+    if target.len() > REQUEST_TARGET_LIMIT {
+        send(400, JSON, INVALID)?;
+        return Ok(true);
+    }
+    let (path, query) = match target.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (target, None),
+    };
+    let Some(record_id) = path.strip_prefix("/v1/records/") else {
+        return Ok(false);
+    };
+    if record_id.is_empty() || record_id.contains('/') {
+        return Ok(false);
+    }
+    if method == "GET" {
+        send_fixed_record_get(writer, gate, record_id, query, send)?;
+    } else {
+        send(405, JSON, METHOD_NOT_ALLOWED)?;
+    }
+    Ok(true)
+}
+
 /// 固定RecordのGETへ振り分け済みの要求を処理する。
 /// IDはパスの正規表記、queryはHTTP層で分離した未デコードの値。
 /// sendは応答全体を期限内に同期送信する。エラー後の再送は行わない。
