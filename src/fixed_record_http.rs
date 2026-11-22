@@ -1,6 +1,8 @@
 //! 固定Record取得のHTTP応答。接続の解析と期限管理は呼び出し側が担う。
 
-use std::io;
+use std::io::{self, Write};
+use std::net::TcpStream;
+use std::time::Instant;
 
 use crate::id::{Id, Kind};
 use crate::storage::{DistributionGate, FixedRecordScope, RecordWriter, StorageError};
@@ -42,6 +44,76 @@ pub fn route_fixed_record_request(
         send(405, JSON, METHOD_NOT_ALLOWED)?;
     }
     Ok(true)
+}
+
+/// 解析済みの固定Record要求にHTTP/1.1応答を送る。
+/// deadlineはヘッダーと本文に共通の絶対期限。呼び出し側はblocking
+/// socketを専有し、応答済みまたは送信エラーの場合は接続を閉じる。
+pub fn send_fixed_record_response(
+    writer: &mut RecordWriter,
+    gate: DistributionGate,
+    method: &str,
+    target: &str,
+    stream: &mut TcpStream,
+    deadline: Instant,
+) -> Result<bool, StorageError> {
+    route_fixed_record_request(
+        writer,
+        gate,
+        method,
+        target,
+        |status, content_type, bytes| {
+            write_response(stream, deadline, method, status, content_type, bytes)
+        },
+    )
+}
+
+fn write_response(
+    stream: &mut TcpStream,
+    deadline: Instant,
+    method: &str,
+    status: u16,
+    content_type: &str,
+    bytes: &[u8],
+) -> io::Result<()> {
+    let reason = match status {
+        200 => "OK",
+        400 => "Bad Request",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        _ => return Err(io::ErrorKind::InvalidInput.into()),
+    };
+    let allow = if status == 405 { "Allow: GET\r\n" } else { "" };
+    let head = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\n\
+         Content-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n{allow}\r\n",
+        bytes.len()
+    );
+    write_before(stream, deadline, head.as_bytes())?;
+    if method != "HEAD" {
+        write_before(stream, deadline, bytes)?;
+    }
+    Ok(())
+}
+
+fn write_before(stream: &mut TcpStream, deadline: Instant, mut bytes: &[u8]) -> io::Result<()> {
+    while !bytes.is_empty() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        stream.set_write_timeout(Some(remaining))?;
+        match stream.write(bytes) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(written) => bytes = &bytes[written..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 /// 固定RecordのGETへ振り分け済みの要求を処理する。
@@ -111,4 +183,41 @@ fn decode_value(raw: &str) -> Option<String> {
         decoded.push(byte);
     }
     String::from_utf8(decoded).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+    use std::net::TcpListener;
+    use std::time::Duration;
+
+    #[test]
+    fn response_writes_allow_and_refuses_expired_deadlines() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        assert_eq!(
+            write_response(&mut server, Instant::now(), "PUT", 405, JSON, b"error")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut,
+        );
+        write_response(
+            &mut server,
+            Instant::now() + Duration::from_secs(2),
+            "PUT",
+            405,
+            JSON,
+            b"error",
+        )
+        .unwrap();
+        drop(server);
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"));
+        assert!(response.contains("\r\nAllow: GET\r\n"));
+        assert!(response.contains("\r\nContent-Length: 5\r\n"));
+        assert!(response.ends_with("\r\n\r\nerror"));
+    }
 }
