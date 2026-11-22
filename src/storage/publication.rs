@@ -381,6 +381,66 @@ mod tests {
     use crate::storage::tests::{Temp, fixture, logical_snapshot};
 
     #[test]
+    fn fixed_http_get_preserves_cbor_and_hides_private_records() {
+        use crate::fixed_record_http::send_fixed_record_get;
+
+        let temp = Temp::new();
+        let record = fixture();
+        let id = record.id();
+        let mut writer = temp.store().begin().unwrap();
+        writer.insert(&record).unwrap();
+        writer.revalidate(EvaluationLimits::default()).unwrap();
+        let query = format!("genesis_id={id}&scope=untrust%65d");
+        let missing = crate::id::record_id(b"missing");
+        let mut get = |id: Id, query: Option<&str>| {
+            let mut response = None;
+            send_fixed_record_get(
+                &mut writer,
+                DistributionGate::Open,
+                &id.to_string(),
+                query,
+                |status, content_type, bytes| {
+                    response = Some((status, content_type, bytes.to_vec()));
+                    Ok(())
+                },
+            )
+            .unwrap();
+            response.unwrap()
+        };
+        let private = get(id, Some(&query));
+        assert_eq!(private.0, 404);
+        assert_eq!(private, get(missing, Some(&query)));
+        for invalid in [
+            "scope=untrusted",
+            "scope=%FF",
+            "scope=%2570ublic",
+            "scope=public&scope=public",
+            "unknown=public",
+            "scope=%",
+        ] {
+            assert_eq!(get(id, Some(invalid)).0, 400);
+        }
+        writer
+            .save_manual_publication_change(id, ManualPublicationChange::ApproveUntrusted, "allow")
+            .unwrap();
+        send_fixed_record_get(
+            &mut writer,
+            DistributionGate::Open,
+            &id.to_string(),
+            Some(&query),
+            |status, content_type, bytes| {
+                assert_eq!(
+                    (status, content_type, bytes),
+                    (200, "application/cbor", record.bytes())
+                );
+                Ok(())
+            },
+        )
+        .unwrap();
+        writer.finish().unwrap();
+    }
+
+    #[test]
     fn fixed_send_requires_the_requested_genesis_and_scope() {
         let temp = Temp::new();
         let record = fixture();
