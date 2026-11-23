@@ -1,7 +1,7 @@
 //! 固定Record取得のHTTP応答。接続の解析と期限管理は呼び出し側が担う。
 
 use std::io::{self, BufRead, BufReader, Write};
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::time::Instant;
 
 use crate::id::{Id, Kind};
@@ -75,6 +75,46 @@ pub fn read_request_head(
         if end.is_some() {
             return Ok(head);
         }
+    }
+}
+
+/// 明示的に起動する開発用の平文HTTP待受け。ループバックだけにbindする。
+pub struct FixedRecordLoopbackListener {
+    listener: TcpListener,
+}
+
+impl FixedRecordLoopbackListener {
+    pub fn bind(address: SocketAddr) -> io::Result<Self> {
+        if !address.ip().is_loopback() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "loopback address required",
+            ));
+        }
+        let listener = TcpListener::bind(address)?;
+        listener.set_nonblocking(true)?;
+        Ok(Self { listener })
+    }
+
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.listener.local_addr()
+    }
+
+    /// 待機中の接続を最大一件処理する。接続がなければNoneを返す。
+    /// 接続を受理した場合のboolは固定Record処理の応答有無を示す。
+    pub fn serve_ready(
+        &mut self,
+        writer: &mut RecordWriter,
+        gate: DistributionGate,
+        deadline: Instant,
+    ) -> Result<Option<bool>, StorageError> {
+        let stream = match self.listener.accept() {
+            Ok((stream, _)) => stream,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        stream.set_nonblocking(false)?;
+        serve_fixed_record_connection(writer, gate, stream, deadline, deadline).map(Some)
     }
 }
 
@@ -339,7 +379,6 @@ fn decode_value(raw: &str) -> Option<String> {
 mod tests {
     use super::*;
     use std::io::Read;
-    use std::net::TcpListener;
     use std::time::Duration;
 
     #[test]

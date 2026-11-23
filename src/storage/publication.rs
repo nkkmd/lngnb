@@ -382,9 +382,9 @@ mod tests {
 
     #[test]
     fn fixed_http_connection_reads_and_sends_a_record() {
-        use crate::fixed_record_http::serve_fixed_record_connection;
+        use crate::fixed_record_http::FixedRecordLoopbackListener;
         use std::io::{Read, Write};
-        use std::net::{TcpListener, TcpStream};
+        use std::net::TcpStream;
         use std::time::{Duration, Instant};
 
         let temp = Temp::new();
@@ -397,26 +397,30 @@ mod tests {
             .save_manual_publication_change(id, ManualPublicationChange::ApproveUntrusted, "allow")
             .unwrap();
 
+        assert!(matches!(
+            FixedRecordLoopbackListener::bind(([0, 0, 0, 0], 0).into()),
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidInput
+        ));
+        let mut listener = FixedRecordLoopbackListener::bind(([127, 0, 0, 1], 0).into()).unwrap();
+        assert_eq!(
+            listener
+                .serve_ready(&mut writer, DistributionGate::Open, Instant::now())
+                .unwrap(),
+            None
+        );
+
         for (extra, accepted) in [("", true), ("Content-Length: 1\r\n", false)] {
-            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
             let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-            let (server, _) = listener.accept().unwrap();
             write!(client, "GET /v1/records/{id}?scope=untrusted&genesis_id={id} HTTP/1.1\r\nHost: localhost\r\n{extra}\r\n").unwrap();
             let deadline = Instant::now() + Duration::from_secs(2);
-            let result = serve_fixed_record_connection(
-                &mut writer,
-                DistributionGate::Open,
-                server,
-                deadline,
-                deadline,
-            );
+            let result = listener.serve_ready(&mut writer, DistributionGate::Open, deadline);
             client
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
             let mut response = Vec::new();
             client.read_to_end(&mut response).unwrap();
             if accepted {
-                assert!(result.unwrap());
+                assert_eq!(result.unwrap(), Some(true));
                 assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
                 let body_start = response
                     .windows(4)
