@@ -11,6 +11,8 @@ pub mod record;
 #[cfg(target_os = "linux")]
 pub mod secret_terminal;
 #[cfg(target_os = "linux")]
+pub mod server_tls;
+#[cfg(target_os = "linux")]
 pub mod storage;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
