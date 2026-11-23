@@ -219,8 +219,10 @@ impl LocalStartup {
         }
         self.validate_inputs()?;
         match self.stage.take() {
-            Some(Stage::Ready(writer, _)) => {
+            Some(Stage::Ready(mut writer, _)) => {
                 inspection::validate_for_resume(&writer.store)?;
+                // 起動検査でrunningを経由しても、検証済みの正常停止からの開始を引き継ぐ。
+                writer.began_clean = true;
                 Ok(writer)
             }
             _ => Err(StorageError::InspectionPending),
