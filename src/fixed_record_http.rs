@@ -1,7 +1,8 @@
 //! 固定Record取得のHTTP応答。接続の解析と期限管理は呼び出し側が担う。
 
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::id::{Id, Kind};
@@ -24,6 +25,16 @@ pub fn read_request_head(
     reader: &mut BufReader<TcpStream>,
     deadline: Instant,
 ) -> io::Result<Vec<u8>> {
+    read_request_head_from(reader, deadline, |socket| {
+        socket.read_until_deadline(deadline)
+    })
+}
+
+fn read_request_head_from<R: Read>(
+    reader: &mut BufReader<R>,
+    deadline: Instant,
+    mut prepare: impl FnMut(&mut R) -> io::Result<()>,
+) -> io::Result<Vec<u8>> {
     let mut head = Vec::new();
     let mut line_start = 0;
     let mut request_line_end = None;
@@ -32,7 +43,7 @@ pub fn read_request_head(
         if remaining.is_zero() {
             return Err(io::ErrorKind::TimedOut.into());
         }
-        reader.get_ref().set_read_timeout(Some(remaining))?;
+        prepare(reader.get_mut())?;
         let chunk = match reader.fill_buf() {
             Ok([]) => return Err(io::ErrorKind::UnexpectedEof.into()),
             Ok(chunk) => chunk,
@@ -118,27 +129,167 @@ impl FixedRecordLoopbackListener {
     }
 }
 
+/// 明示的なTLS設定で固定Recordだけを提供するHTTPS待受け。
+pub struct FixedRecordHttpsListener {
+    listener: TcpListener,
+    config: Arc<rustls::ServerConfig>,
+}
+
+impl FixedRecordHttpsListener {
+    pub fn bind(address: SocketAddr, config: rustls::ServerConfig) -> io::Result<Self> {
+        let listener = TcpListener::bind(address)?;
+        listener.set_nonblocking(true)?;
+        Ok(Self {
+            listener,
+            config: Arc::new(config),
+        })
+    }
+
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.listener.local_addr()
+    }
+
+    pub(crate) fn serve_ready(
+        &mut self,
+        writer: &mut RecordWriter,
+        gate: DistributionGate,
+        deadline: Instant,
+    ) -> Result<(), StorageError> {
+        let socket = match self.listener.accept() {
+            Ok((socket, _)) => socket,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        socket.set_nonblocking(false)?;
+        let mut connection =
+            rustls::ServerConnection::new(Arc::clone(&self.config)).map_err(io::Error::other)?;
+        let mut socket = DeadlineTcp { socket, deadline };
+        // HTTPへ進む前にTLSを確立し、相手側の失敗はこの接続だけで処理する。
+        if connection.complete_io(&mut socket).is_err() || connection.is_handshaking() {
+            return Ok(());
+        }
+
+        let mut stream = rustls::StreamOwned::new(connection, socket);
+        serve_request(writer, gate, &mut stream, deadline, deadline)?;
+        stream.conn.send_close_notify();
+        // 応答送信後の切断は保存セッションの失敗にしない。
+        let _ = stream.flush();
+        Ok(())
+    }
+}
+
+fn remaining(deadline: Instant) -> io::Result<std::time::Duration> {
+    let duration = deadline.saturating_duration_since(Instant::now());
+    if duration.is_zero() {
+        return Err(io::ErrorKind::TimedOut.into());
+    }
+    Ok(duration)
+}
+
+// rustlsが内部で行う複数回のI/Oにも毎回同じ絶対期限を適用する。
+struct DeadlineTcp {
+    socket: TcpStream,
+    deadline: Instant,
+}
+
+fn connection_error(error: io::Error) -> io::Error {
+    match error.kind() {
+        io::ErrorKind::Interrupted => error,
+        io::ErrorKind::WouldBlock => io::ErrorKind::TimedOut.into(),
+        _ => io::Error::new(io::ErrorKind::ConnectionAborted, error),
+    }
+}
+
+impl Read for DeadlineTcp {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        self.socket
+            .set_read_timeout(Some(remaining(self.deadline)?))
+            .map_err(connection_error)?;
+        self.socket.read(bytes).map_err(connection_error)
+    }
+}
+
+impl Write for DeadlineTcp {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.socket
+            .set_write_timeout(Some(remaining(self.deadline)?))
+            .map_err(connection_error)?;
+        self.socket.write(bytes).map_err(connection_error)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.socket.flush()
+    }
+}
+
+trait RequestStream: Read + Write {
+    fn read_until_deadline(&mut self, deadline: Instant) -> io::Result<()>;
+    fn write_until_deadline(&mut self, deadline: Instant) -> io::Result<()>;
+}
+
+impl RequestStream for TcpStream {
+    fn read_until_deadline(&mut self, deadline: Instant) -> io::Result<()> {
+        self.set_read_timeout(Some(remaining(deadline)?))
+    }
+
+    fn write_until_deadline(&mut self, deadline: Instant) -> io::Result<()> {
+        self.set_write_timeout(Some(remaining(deadline)?))
+    }
+}
+
+impl RequestStream for rustls::StreamOwned<rustls::ServerConnection, DeadlineTcp> {
+    fn read_until_deadline(&mut self, deadline: Instant) -> io::Result<()> {
+        self.sock.deadline = deadline;
+        Ok(())
+    }
+
+    fn write_until_deadline(&mut self, deadline: Instant) -> io::Result<()> {
+        self.sock.deadline = deadline;
+        Ok(())
+    }
+}
+
 /// 受理済みのTCP接続から、本文を持たないHTTP/1.1要求を一件処理する。
 /// 接続はこの関数が所有し、戻る際に閉じる。
 /// falseは固定Record以外の経路、Errは受信・保存・送信の失敗を示す。
 pub fn serve_fixed_record_connection(
     writer: &mut RecordWriter,
     gate: DistributionGate,
-    stream: TcpStream,
+    mut stream: TcpStream,
+    read_deadline: Instant,
+    write_deadline: Instant,
+) -> Result<bool, StorageError> {
+    serve_request(writer, gate, &mut stream, read_deadline, write_deadline)
+}
+
+fn serve_request(
+    writer: &mut RecordWriter,
+    gate: DistributionGate,
+    stream: &mut impl RequestStream,
     read_deadline: Instant,
     write_deadline: Instant,
 ) -> Result<bool, StorageError> {
     let mut reader = BufReader::new(stream);
-    let head = read_request_head(&mut reader, read_deadline)?;
+    let head = read_request_head_from(&mut reader, read_deadline, |stream| {
+        stream.read_until_deadline(read_deadline)
+    })?;
     let (method, target) =
         parse_bodyless_request(&head).ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?;
-    send_fixed_record_response(
+    route_fixed_record_request(
         writer,
         gate,
         method,
         target,
-        reader.get_mut(),
-        write_deadline,
+        |status, content_type, bytes| {
+            write_response(
+                *reader.get_mut(),
+                write_deadline,
+                method,
+                status,
+                content_type,
+                bytes,
+            )
+        },
     )
 }
 
@@ -259,7 +410,7 @@ pub fn send_fixed_record_response(
 }
 
 fn write_response(
-    stream: &mut TcpStream,
+    stream: &mut impl RequestStream,
     deadline: Instant,
     method: &str,
     status: u16,
@@ -283,16 +434,20 @@ fn write_response(
     if method != "HEAD" {
         write_before(stream, deadline, bytes)?;
     }
-    Ok(())
+    stream.flush()
 }
 
-fn write_before(stream: &mut TcpStream, deadline: Instant, mut bytes: &[u8]) -> io::Result<()> {
+fn write_before(
+    stream: &mut impl RequestStream,
+    deadline: Instant,
+    mut bytes: &[u8],
+) -> io::Result<()> {
     while !bytes.is_empty() {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(io::ErrorKind::TimedOut.into());
         }
-        stream.set_write_timeout(Some(remaining))?;
+        stream.write_until_deadline(deadline)?;
         match stream.write(bytes) {
             Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
             Ok(written) => bytes = &bytes[written..],

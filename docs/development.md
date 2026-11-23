@@ -6,7 +6,7 @@
 
 ## ビルドと通常検証
 
-現在のビルド確認対象はLinux x86_64（Ubuntu 24.04）です。RustupとCリンカー（Ubuntuでは`build-essential`）を用意し、取得したリポジトリ内で実行します。Rust 1.85.0・edition 2024を採用し、ツールチェーンと構成を固定しています。依存版はCargo.tomlとCargo.lockで固定しています。初回の依存取得にはネット接続が必要です。独立照合試験にはPython 3.12とvenvを用います（Ubuntuでは`python3-venv`）。TLSの回帰試験は一時証明書の生成にOpenSSL（Ubuntuでは`openssl`）を使用します。取得後のRustビルド・試験はofflineで実行します。
+現在のビルド確認対象はLinux x86_64（Ubuntu 24.04）です。RustupとCリンカー（Ubuntuでは`build-essential`）を用意し、取得したリポジトリ内で実行します。Rust 1.85.0・edition 2024を採用し、ツールチェーンと構成を固定しています。依存版はCargo.tomlとCargo.lockで固定しています。初回の依存取得にはネット接続が必要です。独立照合試験にはPython 3.12とvenvを用います（Ubuntuでは`python3-venv`）。TLSの回帰試験は一時証明書の生成にOpenSSL（Ubuntuでは`openssl`）を使用します。[固定RecordのHTTPS待受け](admin.md#固定recordのhttps待受け)のCLI結合試験は、ループバックTCPと管理IPC用のUnixソケットを使用します。取得後のRustビルド・試験はofflineで実行します。
 
 ```sh
 git clone https://github.com/nkkmd/lngnb.git

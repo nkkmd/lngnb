@@ -214,6 +214,26 @@ impl Listener {
         http: &mut crate::fixed_record_http::FixedRecordLoopbackListener,
         deadline: Instant,
     ) -> Result<()> {
+        self.serve_fixed_record(|writer| {
+            http.serve_ready(writer, super::DistributionGate::Open, deadline)
+                .map(|_| ())
+        })
+    }
+
+    pub fn serve_https(
+        &mut self,
+        https: &mut crate::fixed_record_http::FixedRecordHttpsListener,
+        deadline: Instant,
+    ) -> Result<()> {
+        self.serve_fixed_record(|writer| {
+            https.serve_ready(writer, super::DistributionGate::Open, deadline)
+        })
+    }
+
+    fn serve_fixed_record(
+        &mut self,
+        serve: impl FnOnce(&mut super::RecordWriter) -> std::result::Result<(), StorageError>,
+    ) -> Result<()> {
         self.check_endpoint()?;
         let Access::Write(writer) = &mut self.access else {
             return Err(Error::WrongMode);
@@ -221,7 +241,7 @@ impl Listener {
         if writer.failed {
             return Err(Error::SessionFailed);
         }
-        match http.serve_ready(writer, super::DistributionGate::Open, deadline) {
+        match serve(writer) {
             Ok(_) => Ok(()),
             Err(StorageError::Io(error))
                 if !writer.failed

@@ -393,6 +393,185 @@ fn foreground_server_serves_loopback_http_and_admin_ipc() {
 }
 
 #[test]
+fn foreground_https_serves_verified_record_after_failed_connections() {
+    use lngnb::storage::{EvaluationLimits, ManualPublicationChange};
+    use std::io::{BufReader, Read, Write};
+    use std::net::{Shutdown, SocketAddr, TcpStream};
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    let temp = Temp::new();
+    let cert = temp.0.join("server.crt");
+    let key = temp.0.join("server.key");
+    let generated = Command::new("openssl")
+        .args([
+            "req",
+            "-x509",
+            "-newkey",
+            "ec",
+            "-pkeyopt",
+            "ec_paramgen_curve:P-256",
+            "-nodes",
+            "-days",
+            "1",
+            "-subj",
+            "/CN=localhost",
+            "-addext",
+            "subjectAltName=DNS:localhost",
+            "-addext",
+            "basicConstraints=critical,CA:FALSE",
+            "-out",
+        ])
+        .arg(&cert)
+        .arg("-keyout")
+        .arg(&key)
+        .output()
+        .unwrap();
+    assert!(generated.status.success());
+    fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let record = fixture();
+    let id = record.id();
+    let store = RecordStore::initialize(&temp.data(), Limits::default()).unwrap();
+    let mut writer = store.begin().unwrap();
+    writer.insert(&record).unwrap();
+    writer.revalidate(EvaluationLimits::default()).unwrap();
+    writer
+        .save_manual_publication_change(id, ManualPublicationChange::ApproveUntrusted, "test")
+        .unwrap();
+    writer.finish().unwrap();
+
+    let mut server = Server::configured(
+        &temp,
+        &[
+            "--dev-http-listen",
+            "127.0.0.1:0",
+            "--https-listen",
+            "127.0.0.1:0",
+            "--https-cert",
+            cert.to_str().unwrap(),
+            "--https-key",
+            key.to_str().unwrap(),
+        ],
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let (address, http): (SocketAddr, SocketAddr) = loop {
+        let log = fs::read_to_string(&server.log).unwrap();
+        let https = log
+            .lines()
+            .find_map(|line| line.strip_prefix("HTTPS待受け https://"));
+        let http = log
+            .lines()
+            .find_map(|line| line.strip_prefix("開発用HTTP待受け http://"));
+        if let (Some(https), Some(http)) = (https, http) {
+            break (https.parse().unwrap(), http.parse().unwrap());
+        }
+        assert!(Instant::now() < deadline, "HTTPS did not become ready");
+        thread::sleep(Duration::from_millis(10));
+    };
+    let connect = |address: SocketAddr| {
+        let socket = TcpStream::connect_timeout(&address, Duration::from_secs(3)).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(6)))
+            .unwrap();
+        socket
+            .set_write_timeout(Some(Duration::from_secs(6)))
+            .unwrap();
+        socket
+    };
+    let request = format!(
+        "GET /v1/records/{id}?scope=untrusted&genesis_id={id} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+    );
+
+    let mut plain = connect(address);
+    plain.write_all(request.as_bytes()).unwrap();
+    plain.shutdown(Shutdown::Write).unwrap();
+    let mut rejected = Vec::new();
+    match plain.read_to_end(&mut rejected) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+        Err(error) => panic!("plaintext connection was not closed: {error}"),
+    }
+    assert!(!rejected.windows(8).any(|bytes| bytes == b"HTTP/1.1"));
+
+    let stalled = connect(address);
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in rustls_pemfile::certs(&mut BufReader::new(fs::File::open(cert).unwrap())) {
+        roots.add(cert.unwrap()).unwrap();
+    }
+    let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS13])
+    .unwrap()
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let tls =
+        rustls::ClientConnection::new(Arc::new(config), "localhost".try_into().unwrap()).unwrap();
+    let mut client = rustls::StreamOwned::new(tls, connect(address));
+    client.write_all(request.as_bytes()).unwrap();
+    let mut response = Vec::new();
+    client.read_to_end(&mut response).unwrap();
+    assert_eq!(client.conn.alpn_protocol(), Some(b"http/1.1".as_slice()));
+    assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    let body = response
+        .windows(4)
+        .position(|part| part == b"\r\n\r\n")
+        .unwrap()
+        + 4;
+    assert_eq!(&response[body..], record.bytes());
+    assert_eq!((&stalled).read(&mut [0]).unwrap(), 0);
+    let mut development = connect(http);
+    development.write_all(request.as_bytes()).unwrap();
+    response.clear();
+    development.read_to_end(&mut response).unwrap();
+    assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    assert!(probe_cli(&temp.data()).status.success());
+
+    let _stalled_at_shutdown = connect(address);
+    server.signal("-TERM");
+    assert!(server.wait().success());
+    let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
+    assert_eq!(
+        store.startup_state().unwrap(),
+        lngnb::storage::StartupState::Clean
+    );
+}
+
+#[test]
+fn foreground_server_refuses_invalid_https_before_starting_ipc() {
+    let temp = Temp::new();
+    drop(RecordStore::initialize(&temp.data(), Limits::default()).unwrap());
+    let invalid = temp.0.join("invalid.pem");
+    fs::write(&invalid, b"invalid test PEM").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_lngnb"))
+        .args(["admin", "serve", "--data-dir"])
+        .arg(temp.data())
+        .args([
+            "--dev-http-listen",
+            "127.0.0.1:0",
+            "--https-listen",
+            "127.0.0.1:0",
+            "--https-cert",
+        ])
+        .arg(&invalid)
+        .arg("--https-key")
+        .arg(&invalid)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    assert!(output.stdout.is_empty());
+    assert!(!temp.data().join("admin.sock").exists());
+    let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
+    assert_eq!(
+        store.startup_state().unwrap(),
+        lngnb::storage::StartupState::Clean
+    );
+}
+
+#[test]
 fn foreground_server_refuses_missing_manual_wait_and_existing_endpoint() {
     for mode in 0..3 {
         let temp = Temp::new();
