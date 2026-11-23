@@ -44,6 +44,7 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
     }
     let accepts_config = action == "serve" || action == "config-save" || action == "config-change";
     let mut data = None;
+    let mut dev_http_listen = None;
     let mut timeout = None;
     let mut records = None;
     let mut diagnostic_records = None;
@@ -68,6 +69,15 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
         }
         match option.to_str() {
             Some("--data-dir") if data.is_none() => data = Some(PathBuf::from(value)),
+            Some("--dev-http-listen") if action == "serve" && dev_http_listen.is_none() => {
+                dev_http_listen = Some(
+                    value
+                        .to_str()
+                        .and_then(|value| value.parse::<std::net::SocketAddr>().ok())
+                        .filter(|address| address.ip().is_loopback())
+                        .ok_or_else(usage)?,
+                );
+            }
             Some("--request-timeout-ms") if accepts_config && timeout.is_none() => {
                 timeout = Some(number(value).ok_or_else(usage)?);
             }
@@ -178,6 +188,7 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
             Action::ChangeConfig(config)
         } else {
             Action::Serve(Overrides {
+                dev_http_listen,
                 timeout_ms: timeout,
                 max_new_records: records,
                 max_diagnostic_records: diagnostic_records,
@@ -522,6 +533,7 @@ mod tests {
         assert_eq!(
             command.action,
             Action::Serve(Overrides {
+                dev_http_listen: None,
                 timeout_ms: Some(500),
                 max_new_records: Some(1),
                 max_diagnostic_records: Some(7),
