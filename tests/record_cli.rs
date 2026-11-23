@@ -348,6 +348,51 @@ fn foreground_server_probes_submits_stops_and_restarts_without_losing_records() 
 }
 
 #[test]
+fn foreground_server_serves_loopback_http_and_admin_ipc() {
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpStream};
+    use std::time::Instant;
+
+    let temp = Temp::new();
+    drop(RecordStore::initialize(&temp.data(), Limits::default()).unwrap());
+    let mut server = Server::configured(&temp, &["--dev-http-listen", "127.0.0.1:0"]);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let address: SocketAddr = loop {
+        let log = fs::read_to_string(&server.log).unwrap();
+        if let Some(address) = log
+            .lines()
+            .find_map(|line| line.strip_prefix("開発用HTTP待受け http://"))
+        {
+            break address.parse().unwrap();
+        }
+        assert!(Instant::now() < deadline, "HTTP did not become ready");
+        thread::sleep(Duration::from_millis(10));
+    };
+    let mut http = TcpStream::connect_timeout(&address, Duration::from_secs(3)).unwrap();
+    http.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    http.write_all(
+        format!(
+            "GET /v1/records/{} HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            fixture().id()
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    let mut response = Vec::new();
+    http.read_to_end(&mut response).unwrap();
+    assert!(response.starts_with(b"HTTP/1.1 404 "));
+    assert!(probe_cli(&temp.data()).status.success());
+
+    server.signal("-TERM");
+    assert!(server.wait().success());
+    let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
+    assert_eq!(
+        store.startup_state().unwrap(),
+        lngnb::storage::StartupState::Clean
+    );
+}
+
+#[test]
 fn foreground_server_refuses_missing_manual_wait_and_existing_endpoint() {
     for mode in 0..3 {
         let temp = Temp::new();
