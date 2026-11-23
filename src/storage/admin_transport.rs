@@ -208,6 +208,40 @@ impl Listener {
             sent: false,
         })
     }
+    /// 管理受付と同じ排他writerで開発用HTTP接続を処理する。
+    pub fn serve_loopback_http(
+        &mut self,
+        http: &mut crate::fixed_record_http::FixedRecordLoopbackListener,
+        deadline: Instant,
+    ) -> Result<()> {
+        self.check_endpoint()?;
+        let Access::Write(writer) = &mut self.access else {
+            return Err(Error::WrongMode);
+        };
+        if writer.failed {
+            return Err(Error::SessionFailed);
+        }
+        match http.serve_ready(writer, super::DistributionGate::Open, deadline) {
+            Ok(_) => Ok(()),
+            Err(StorageError::Io(error))
+                if !writer.failed
+                    && matches!(
+                        error.kind(),
+                        std::io::ErrorKind::InvalidData
+                            | std::io::ErrorKind::UnexpectedEof
+                            | std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::BrokenPipe
+                    ) =>
+            {
+                Ok(())
+            }
+            Err(_) if writer.failed => Err(Error::SessionFailed),
+            Err(_) => Err(Error::Io),
+        }
+    }
+
     /// 通信受付だけを閉じて、自分のsocket名だけを除く。正常停止印は記録しない。
     /// 残存物・置換・削除/fsync失敗は成功にせず、再bindで上書きもしない。
     pub fn close(self) -> Result<RecordStore> {

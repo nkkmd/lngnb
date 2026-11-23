@@ -11,7 +11,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 /// この起動だけに適用する受理側予算。既定上限を超える設定は受けない。
@@ -219,6 +219,7 @@ impl Config {
 /// 省略と明示的な既定値指定を区別し、自動保存しない。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Overrides {
+    pub dev_http_listen: Option<std::net::SocketAddr>,
     pub timeout_ms: Option<u64>,
     pub max_new_records: Option<u64>,
     pub max_diagnostic_records: Option<u64>,
@@ -340,6 +341,11 @@ fn serve(
     stop: &AtomicBool,
     output: &mut impl Write,
 ) -> Result<(), Error> {
+    let mut http = overrides
+        .dev_http_listen
+        .map(lngnb::fixed_record_http::FixedRecordLoopbackListener::bind)
+        .transpose()
+        .map_err(|_| Error::Unconfirmed)?;
     let (mut startup, saved) = LocalStartup::open_with_admin_config(
         path,
         overrides.storage_limits(),
@@ -398,6 +404,12 @@ fn serve(
         .write_all(ready.as_bytes())
         .and_then(|()| output.flush())
         .map_err(|_| Error::Unconfirmed)?;
+    if let Some(http) = &http {
+        let address = http.local_addr().map_err(|_| Error::Unconfirmed)?;
+        writeln!(output, "開発用HTTP待受け http://{address}")
+            .and_then(|()| output.flush())
+            .map_err(|_| Error::Unconfirmed)?;
+    }
     while !stop.load(Ordering::SeqCst) {
         listener
             .serve_status_if_pending()
@@ -420,6 +432,14 @@ fn serve(
         if stop.load(Ordering::SeqCst) {
             break;
         }
+        if let Some(http) = &mut http {
+            listener
+                .serve_loopback_http(http, Instant::now() + Duration::from_secs(2))
+                .map_err(|_| Error::Unconfirmed)?;
+        }
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
         let mut connection = match listener.accept_for(Duration::from_millis(100)) {
             Ok(connection) => connection,
             Err(TransportError::Timeout) => continue,
@@ -432,6 +452,7 @@ fn serve(
         connection.serve_request().map_err(|_| Error::Unconfirmed)?;
     }
     // Connectionは全て終結済み。socket整理の失敗でもfinishしない。
+    drop(http);
     let writer = listener.close_writer().map_err(|_| Error::Unconfirmed)?;
     writer.finish().map_err(|_| Error::Unconfirmed)?;
     output
