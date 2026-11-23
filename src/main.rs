@@ -44,6 +44,7 @@ const HELP: &str = "lngnb — 分散図書館・知識基盤（開発初期段�
   lngnb admin config-show --data-dir PATH
   lngnb admin config-save --data-dir PATH --request-timeout-ms N --max-new-records N --max-diagnostic-records N --startup-records-per-step N
   lngnb admin config-change --data-dir PATH --request-timeout-ms N --max-new-records N --max-diagnostic-records N --startup-records-per-step N
+  lngnb http dev-serve --data-dir PATH --listen LOOPBACK:PORT
   lngnb admin serve --data-dir PATH [--request-timeout-ms N] [--max-new-records N] [--max-diagnostic-records N] [--startup-records-per-step N] [--startup-record-bytes-per-step N] [--startup-blob-bytes-per-step N] [--startup-blob-targets-per-step N] [--startup-record-edges-per-step N] [--startup-evaluation-records-per-step N] [--sql-inspection-callbacks N] [--sql-inspection-timeout-ms N] [--startup-inspection-timeout-ms N] [--startup-record-input-timeout-ms N] [--startup-blob-input-timeout-ms N] [--startup-evaluation-timeout-ms N]
   lngnb record submit --data-dir PATH --record PATH
   lngnb record pin --data-dir PATH --knowledge-id ID --genesis-id ID --reason TEXT
@@ -209,12 +210,16 @@ enum Command {
     Record(record_cli::Command),
     #[cfg(target_os = "linux")]
     Admin(admin_cli::Command),
+    #[cfg(target_os = "linux")]
+    HttpDevServe(PathBuf, std::net::SocketAddr),
 }
 
 #[derive(Debug)]
 enum AppError {
     Usage(&'static str),
     Output(io::Error),
+    #[cfg(target_os = "linux")]
+    Http(&'static str),
     #[cfg(target_os = "linux")]
     Key(key_cli::Error),
     #[cfg(target_os = "linux")]
@@ -241,6 +246,8 @@ impl AppError {
             Self::Usage(_) => 2,
             Self::Output(_) => 1,
             #[cfg(target_os = "linux")]
+            Self::Http(_) => 1,
+            #[cfg(target_os = "linux")]
             Self::Key(e) => e.exit_code(),
             #[cfg(target_os = "linux")]
             Self::Document(e) => e.exit_code(),
@@ -266,6 +273,8 @@ impl fmt::Display for AppError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Usage(message) => write!(f, "{message}（使い方: lngnb --help）"),
+            #[cfg(target_os = "linux")]
+            Self::Http(message) => f.write_str(message),
             Self::Output(_) => f.write_str("標準出力への書込みに失敗しました"),
             #[cfg(target_os = "linux")]
             Self::Key(e) => e.fmt(f),
@@ -294,6 +303,8 @@ impl std::error::Error for AppError {
         match self {
             Self::Output(error) => Some(error),
             Self::Usage(_) => None,
+            #[cfg(target_os = "linux")]
+            Self::Http(_) => None,
             #[cfg(target_os = "linux")]
             Self::Key(_) => None,
             #[cfg(target_os = "linux")]
@@ -349,6 +360,23 @@ fn parse(args: &[OsString]) -> Result<Command, AppError> {
         [group, rest @ ..] if group == "record" => record_cli::parse(rest).map(Command::Record),
         #[cfg(target_os = "linux")]
         [group, rest @ ..] if group == "admin" => admin_cli::parse(rest).map(Command::Admin),
+        #[cfg(target_os = "linux")]
+        [group, action, data_flag, path, listen_flag, address]
+            if group == "http"
+                && action == "dev-serve"
+                && data_flag == "--data-dir"
+                && !path.is_empty()
+                && listen_flag == "--listen" =>
+        {
+            let address = address
+                .to_str()
+                .and_then(|value| value.parse::<std::net::SocketAddr>().ok())
+                .filter(|address| address.ip().is_loopback())
+                .ok_or(AppError::Usage(
+                    "待受け先にはループバックIPとポートを指定してください",
+                ))?;
+            Ok(Command::HttpDevServe(PathBuf::from(path), address))
+        }
         [group, action, rest @ ..] if group == "config" && action == "show" => {
             let config = match rest {
                 [] => Config::default(),
@@ -374,6 +402,8 @@ fn run(args: &[OsString], output: &mut impl Write) -> Result<(), AppError> {
             env!("CARGO_PKG_VERSION")
         ),
         Command::Config(config) => config.describe(),
+        #[cfg(target_os = "linux")]
+        Command::HttpDevServe(path, address) => return serve_http_dev(&path, address, output),
         #[cfg(target_os = "linux")]
         Command::Key(command) => return key_cli::run(command, output).map_err(AppError::Key),
         #[cfg(target_os = "linux")]
@@ -409,6 +439,59 @@ fn run(args: &[OsString], output: &mut impl Write) -> Result<(), AppError> {
         .write_all(text.as_bytes())
         .and_then(|()| output.flush())
         .map_err(AppError::Output)
+}
+
+#[cfg(target_os = "linux")]
+fn serve_http_dev(
+    path: &std::path::Path,
+    address: std::net::SocketAddr,
+    output: &mut impl Write,
+) -> Result<(), AppError> {
+    use lngnb::fixed_record_http::FixedRecordLoopbackListener;
+    use lngnb::storage::{DistributionGate, Limits, RecordStore, StorageError};
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    let signals = admin_server::Signals::install()
+        .map_err(|_| AppError::Http("終了シグナルを設定できませんでした"))?;
+    let mut listener = FixedRecordLoopbackListener::bind(address)
+        .map_err(|_| AppError::Http("開発用HTTP待受けを開けませんでした"))?;
+    let local_addr = listener
+        .local_addr()
+        .map_err(|_| AppError::Http("待受けアドレスを取得できませんでした"))?;
+    let mut writer = RecordStore::open(path, Limits::default())
+        .and_then(RecordStore::begin)
+        .map_err(|_| AppError::Http("保存領域の正常起動を確認できませんでした"))?;
+
+    let result = (|| {
+        writeln!(output, "開発用HTTP待受け http://{local_addr}")
+            .and_then(|()| output.flush())
+            .map_err(AppError::Output)?;
+        while !signals.stop.load(Ordering::SeqCst) {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            match listener.serve_ready(&mut writer, DistributionGate::Open, deadline) {
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                Ok(Some(_)) => (),
+                Err(StorageError::Io(error))
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::InvalidData
+                            | io::ErrorKind::UnexpectedEof
+                            | io::ErrorKind::TimedOut
+                            | io::ErrorKind::ConnectionReset
+                            | io::ErrorKind::ConnectionAborted
+                            | io::ErrorKind::BrokenPipe
+                    ) => {}
+                Err(_) => return Err(AppError::Http("開発用HTTP処理に失敗しました")),
+            }
+        }
+        Ok(())
+    })();
+    drop(listener);
+    writer
+        .finish()
+        .map_err(|_| AppError::Http("保存領域の正常終了を確認できませんでした"))?;
+    result
 }
 
 fn main() -> ExitCode {

@@ -305,12 +305,12 @@ impl fmt::Display for Error {
     }
 }
 impl std::error::Error for Error {}
-struct Signals {
-    stop: Arc<AtomicBool>,
+pub(crate) struct Signals {
+    pub(crate) stop: Arc<AtomicBool>,
     ids: Vec<signal_hook::SigId>,
 }
 impl Signals {
-    fn install() -> Result<Self, Error> {
+    pub(crate) fn install() -> Result<Self, Error> {
         let mut signals = Self {
             stop: Arc::new(AtomicBool::new(false)),
             ids: Vec::new(),
