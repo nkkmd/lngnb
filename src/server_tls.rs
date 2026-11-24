@@ -219,7 +219,7 @@ mod tests {
         let mut writer = store.begin().unwrap();
         let config = load_server_config(&cert, &key).unwrap();
         let mut listener =
-            FixedRecordHttpsListener::bind(([127, 0, 0, 1], 0).into(), config).unwrap();
+            FixedRecordHttpsListener::bind(([127, 0, 0, 1], 0).into(), config, None).unwrap();
         let address = listener.local_addr().unwrap();
         let mut stalled = TcpStream::connect(address).unwrap();
         stalled

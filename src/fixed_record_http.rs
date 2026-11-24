@@ -133,15 +133,27 @@ impl FixedRecordLoopbackListener {
 pub struct FixedRecordHttpsListener {
     listener: TcpListener,
     config: Arc<rustls::ServerConfig>,
+    host: Option<HttpsHost>,
 }
 
 impl FixedRecordHttpsListener {
-    pub fn bind(address: SocketAddr, config: rustls::ServerConfig) -> io::Result<Self> {
+    pub fn bind(
+        address: SocketAddr,
+        config: rustls::ServerConfig,
+        host: Option<HttpsHost>,
+    ) -> io::Result<Self> {
+        if !address.ip().is_loopback() && host.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "HTTPS host required",
+            ));
+        }
         let listener = TcpListener::bind(address)?;
         listener.set_nonblocking(true)?;
         Ok(Self {
             listener,
             config: Arc::new(config),
+            host,
         })
     }
 
@@ -175,7 +187,14 @@ impl FixedRecordHttpsListener {
         }
 
         let mut stream = rustls::StreamOwned::new(connection, socket);
-        serve_request(writer, gate, &mut stream, deadline, deadline)?;
+        serve_request(
+            writer,
+            gate,
+            &mut stream,
+            deadline,
+            deadline,
+            self.host.as_ref(),
+        )?;
         stream.conn.send_close_notify();
         // 応答送信後の切断は保存セッションの失敗にしない。
         let _ = stream.flush();
@@ -264,7 +283,14 @@ pub fn serve_fixed_record_connection(
     read_deadline: Instant,
     write_deadline: Instant,
 ) -> Result<bool, StorageError> {
-    serve_request(writer, gate, &mut stream, read_deadline, write_deadline)
+    serve_request(
+        writer,
+        gate,
+        &mut stream,
+        read_deadline,
+        write_deadline,
+        None,
+    )
 }
 
 fn serve_request(
@@ -273,13 +299,25 @@ fn serve_request(
     stream: &mut impl RequestStream,
     read_deadline: Instant,
     write_deadline: Instant,
+    expected_host: Option<&HttpsHost>,
 ) -> Result<bool, StorageError> {
     let mut reader = BufReader::new(stream);
     let head = read_request_head_from(&mut reader, read_deadline, |stream| {
         stream.read_until_deadline(read_deadline)
     })?;
-    let (method, target) =
+    let (method, target, host) =
         parse_bodyless_request(&head).ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?;
+    if expected_host.is_some_and(|expected| HttpsHost::parse(host).as_ref() != Some(expected)) {
+        write_response(
+            *reader.get_mut(),
+            write_deadline,
+            method,
+            400,
+            JSON,
+            INVALID,
+        )?;
+        return Ok(true);
+    }
     route_fixed_record_request(
         writer,
         gate,
@@ -298,7 +336,7 @@ fn serve_request(
     )
 }
 
-fn parse_bodyless_request(head: &[u8]) -> Option<(&str, &str)> {
+fn parse_bodyless_request(head: &[u8]) -> Option<(&str, &str, &str)> {
     let head = std::str::from_utf8(head).ok()?.strip_suffix("\r\n\r\n")?;
     let mut lines = head.split("\r\n");
     let mut request = lines.next()?.split(' ');
@@ -317,7 +355,7 @@ fn parse_bodyless_request(head: &[u8]) -> Option<(&str, &str)> {
         return None;
     }
 
-    let mut host_seen = false;
+    let mut host = None;
     let mut length_seen = false;
     for line in lines {
         let (name, value) = line.split_once(':')?;
@@ -331,10 +369,10 @@ fn parse_bodyless_request(head: &[u8]) -> Option<(&str, &str)> {
         }
         let value = value.trim_matches([' ', '\t']);
         if name.eq_ignore_ascii_case("host") {
-            if host_seen || !valid_host_authority(value) {
+            if host.is_some() || parse_host_authority(value).is_none() {
                 return None;
             }
-            host_seen = true;
+            host = Some(value);
         } else if name.eq_ignore_ascii_case("content-length") {
             if length_seen || value.is_empty() || !value.bytes().all(|byte| byte == b'0') {
                 return None;
@@ -346,24 +384,49 @@ fn parse_bodyless_request(head: &[u8]) -> Option<(&str, &str)> {
             return None;
         }
     }
-    host_seen.then_some((method, target))
+    Some((method, target, host?))
 }
 
-fn valid_host_authority(value: &str) -> bool {
+/// HTTPSで受け入れる単一の公開authority。既定ポートは443。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HttpsHost {
+    name: String,
+    port: u16,
+}
+
+impl HttpsHost {
+    pub fn parse(value: &str) -> Option<Self> {
+        let (name, port) = parse_host_authority(value)?;
+        let name = if name.contains(':') {
+            name.parse::<std::net::Ipv6Addr>().ok()?.to_string()
+        } else {
+            name.to_ascii_lowercase()
+        };
+        Some(Self {
+            name,
+            port: port.unwrap_or(443),
+        })
+    }
+}
+
+fn parse_host_authority(value: &str) -> Option<(&str, Option<u16>)> {
     if let Some(bracketed) = value.strip_prefix('[') {
-        return bracketed.split_once(']').is_some_and(|(address, suffix)| {
-            address.parse::<std::net::Ipv6Addr>().is_ok()
-                && (suffix.is_empty() || suffix.strip_prefix(':').is_some_and(valid_host_port))
-        });
+        let (address, suffix) = bracketed.split_once(']')?;
+        address.parse::<std::net::Ipv6Addr>().ok()?;
+        let port = if suffix.is_empty() {
+            None
+        } else {
+            Some(parse_host_port(suffix.strip_prefix(':')?)?)
+        };
+        return Some((address, port));
     }
 
-    let host = match value.split_once(':') {
-        Some((host, port)) if valid_host_port(port) => host,
-        Some(_) => return false,
-        None => value,
+    let (host, port) = match value.split_once(':') {
+        Some((host, port)) => (host, Some(parse_host_port(port)?)),
+        None => (value, None),
     };
     let name = host.strip_suffix('.').unwrap_or(host);
-    name.len() <= 253
+    let valid = name.len() <= 253
         && name.split('.').all(|label| {
             let bytes = label.as_bytes();
             bytes.len() <= 63
@@ -372,11 +435,15 @@ fn valid_host_authority(value: &str) -> bool {
                 && bytes
                     .iter()
                     .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
-        })
+        });
+    valid.then_some((name, port))
 }
 
-fn valid_host_port(port: &str) -> bool {
-    port.bytes().all(|byte| byte.is_ascii_digit()) && port.parse::<u16>().is_ok()
+fn parse_host_port(port: &str) -> Option<u16> {
+    if !port.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    port.parse().ok()
 }
 
 fn is_token(byte: u8) -> bool {
@@ -565,6 +632,24 @@ mod tests {
     use super::*;
     use std::io::Read;
     use std::time::Duration;
+
+    #[test]
+    fn https_host_matches_normalized_name_and_effective_port() {
+        assert_eq!(
+            HttpsHost::parse("Example.COM.:443"),
+            HttpsHost::parse("example.com")
+        );
+        assert_ne!(
+            HttpsHost::parse("example.com:8443"),
+            HttpsHost::parse("example.com")
+        );
+        assert_eq!(
+            HttpsHost::parse("[0:0:0:0:0:0:0:1]:443"),
+            HttpsHost::parse("[::1]")
+        );
+        assert!(HttpsHost::parse("https://example.com").is_none());
+        assert!(HttpsHost::parse("example.com,other.example").is_none());
+    }
 
     #[test]
     fn request_requires_one_valid_host_and_ignores_forwarding_headers() {

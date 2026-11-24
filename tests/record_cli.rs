@@ -451,6 +451,8 @@ fn foreground_https_serves_verified_record_after_failed_connections() {
             "127.0.0.1:0",
             "--https-listen",
             "127.0.0.1:0",
+            "--https-host",
+            "localhost",
             "--https-cert",
             cert.to_str().unwrap(),
             "--https-key",
@@ -515,6 +517,16 @@ fn foreground_https_serves_verified_record_after_failed_connections() {
             .unwrap();
         rustls::StreamOwned::new(tls, connect(address))
     };
+    let mut wrong_host = verified_client();
+    let wrong_request = request.replace(
+        "Host: localhost\r\n",
+        "Host: other.example\r\nForwarded: host=localhost\r\nX-Forwarded-Host: localhost\r\n",
+    );
+    wrong_host.write_all(wrong_request.as_bytes()).unwrap();
+    let mut denied = Vec::new();
+    wrong_host.read_to_end(&mut denied).unwrap();
+    assert!(denied.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
+
     let mut client = verified_client();
     client.write_all(request.as_bytes()).unwrap();
     let mut response = Vec::new();
