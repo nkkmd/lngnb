@@ -150,11 +150,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn matching_pem_negotiates_tls13_with_verified_certificate_and_http11() {
-        let temp = TempDir::new();
-        let (cert, key) = temp.certificate("server");
-        let server_config = load_server_config(&cert, &key).unwrap();
+    fn verified_client(cert: &Path) -> rustls::ClientConnection {
         let mut roots = rustls::RootCertStore::empty();
         let cert_file = File::open(cert).unwrap();
         roots
@@ -173,9 +169,16 @@ mod tests {
         .with_root_certificates(roots)
         .with_no_client_auth();
         client_config.alpn_protocols = vec![b"http/1.1".to_vec()];
-        let mut client =
-            rustls::ClientConnection::new(Arc::new(client_config), "localhost".try_into().unwrap())
-                .unwrap();
+        rustls::ClientConnection::new(Arc::new(client_config), "localhost".try_into().unwrap())
+            .unwrap()
+    }
+
+    #[test]
+    fn matching_pem_negotiates_tls13_with_verified_certificate_and_http11() {
+        let temp = TempDir::new();
+        let (cert, key) = temp.certificate("server");
+        let server_config = load_server_config(&cert, &key).unwrap();
+        let mut client = verified_client(&cert);
         let mut server = rustls::ServerConnection::new(Arc::new(server_config)).unwrap();
         for _ in 0..8 {
             let mut outgoing = Vec::new();
@@ -200,6 +203,62 @@ mod tests {
             Some(rustls::ProtocolVersion::TLSv1_3)
         );
         assert_eq!(client.alpn_protocol(), Some(b"http/1.1".as_slice()));
+    }
+
+    #[test]
+    fn https_listener_closes_incomplete_handshake_and_serves_next_request() {
+        use crate::fixed_record_http::FixedRecordHttpsListener;
+        use crate::storage::{DistributionGate, Limits, RecordStore};
+        use std::io::Write;
+        use std::net::TcpStream;
+        use std::time::{Duration, Instant};
+
+        let temp = TempDir::new();
+        let (cert, key) = temp.certificate("server");
+        let store = RecordStore::initialize(&temp.0.join("data"), Limits::default()).unwrap();
+        let mut writer = store.begin().unwrap();
+        let config = load_server_config(&cert, &key).unwrap();
+        let mut listener =
+            FixedRecordHttpsListener::bind(([127, 0, 0, 1], 0).into(), config).unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut stalled = TcpStream::connect(address).unwrap();
+        stalled
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        listener
+            .serve_ready(
+                &mut writer,
+                DistributionGate::Open,
+                Instant::now() + Duration::from_millis(50),
+            )
+            .unwrap();
+        assert_eq!(stalled.read(&mut [0]).unwrap(), 0);
+
+        let socket = TcpStream::connect(address).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        socket
+            .set_write_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut client = rustls::StreamOwned::new(verified_client(&cert), socket);
+        let reader = std::thread::spawn(move || {
+            client
+                .write_all(b"GET /v1/records/invalid HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .unwrap();
+            let mut response = Vec::new();
+            client.read_to_end(&mut response).unwrap();
+            assert!(response.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
+        });
+        listener
+            .serve_ready(
+                &mut writer,
+                DistributionGate::Open,
+                Instant::now() + Duration::from_secs(2),
+            )
+            .unwrap();
+        reader.join().unwrap();
+        writer.finish().unwrap();
     }
 
     #[test]

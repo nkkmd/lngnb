@@ -1,4 +1,4 @@
-//! 前面の管理受理側。公開HTTP・秘密鍵・自動復旧を扱わない。
+//! 前面の管理受理側と、明示された固定RecordのHTTP(S)待受け。
 use lngnb::storage::{
     EvaluationLimits, Limits, LocalStartup, LocalStartupBudget,
     admin_transport::{ConfigError, Error as TransportError, Listener},
@@ -6,7 +6,8 @@ use lngnb::storage::{
 use std::{
     fmt,
     io::Write,
-    path::Path,
+    net::SocketAddr,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -331,16 +332,37 @@ impl Drop for Signals {
         }
     }
 }
-pub fn run(path: &Path, config: Overrides, output: &mut impl Write) -> Result<(), Error> {
-    let signals = Signals::install()?;
-    serve(path, config, &signals.stop, output)
+#[derive(Debug, PartialEq, Eq)]
+pub struct HttpsOptions {
+    pub address: SocketAddr,
+    pub cert: PathBuf,
+    pub key: PathBuf,
 }
+
+pub fn run(
+    path: &Path,
+    config: Overrides,
+    https: Option<HttpsOptions>,
+    output: &mut impl Write,
+) -> Result<(), Error> {
+    let signals = Signals::install()?;
+    serve(path, config, https, &signals.stop, output)
+}
+
 fn serve(
     path: &Path,
     overrides: Overrides,
+    https: Option<HttpsOptions>,
     stop: &AtomicBool,
     output: &mut impl Write,
 ) -> Result<(), Error> {
+    let mut https = https
+        .map(|options| {
+            let config = lngnb::server_tls::load_server_config(&options.cert, &options.key)?;
+            lngnb::fixed_record_http::FixedRecordHttpsListener::bind(options.address, config)
+        })
+        .transpose()
+        .map_err(|_| Error::Unconfirmed)?;
     let mut http = overrides
         .dev_http_listen
         .map(lngnb::fixed_record_http::FixedRecordLoopbackListener::bind)
@@ -410,6 +432,12 @@ fn serve(
             .and_then(|()| output.flush())
             .map_err(|_| Error::Unconfirmed)?;
     }
+    if let Some(https) = &https {
+        let address = https.local_addr().map_err(|_| Error::Unconfirmed)?;
+        writeln!(output, "HTTPS待受け https://{address}")
+            .and_then(|()| output.flush())
+            .map_err(|_| Error::Unconfirmed)?;
+    }
     while !stop.load(Ordering::SeqCst) {
         listener
             .serve_status_if_pending()
@@ -440,6 +468,14 @@ fn serve(
         if stop.load(Ordering::SeqCst) {
             break;
         }
+        if let Some(https) = &mut https {
+            listener
+                .serve_https(https, Instant::now() + Duration::from_secs(2))
+                .map_err(|_| Error::Unconfirmed)?;
+        }
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
         let mut connection = match listener.accept_for(Duration::from_millis(100)) {
             Ok(connection) => connection,
             Err(TransportError::Timeout) => continue,
@@ -452,6 +488,7 @@ fn serve(
         connection.serve_request().map_err(|_| Error::Unconfirmed)?;
     }
     // Connectionは全て終結済み。socket整理の失敗でもfinishしない。
+    drop(https);
     drop(http);
     let writer = listener.close_writer().map_err(|_| Error::Unconfirmed)?;
     writer.finish().map_err(|_| Error::Unconfirmed)?;

@@ -1,7 +1,7 @@
 //! 管理socketの接続診断と前面の管理受理側。公開リレーではない。
 use super::{
     AppError,
-    admin_server::{Config, Overrides},
+    admin_server::{Config, HttpsOptions, Overrides},
 };
 use lngnb::storage::admin_transport::client;
 use std::{ffi::OsString, fmt, io::Write, path::PathBuf, time::Duration};
@@ -10,6 +10,7 @@ use std::{ffi::OsString, fmt, io::Write, path::PathBuf, time::Duration};
 pub struct Command {
     data: PathBuf,
     action: Action,
+    https: Option<HttpsOptions>,
 }
 #[derive(Debug, PartialEq, Eq)]
 enum Action {
@@ -45,6 +46,9 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
     let accepts_config = action == "serve" || action == "config-save" || action == "config-change";
     let mut data = None;
     let mut dev_http_listen = None;
+    let mut https_listen = None;
+    let mut https_cert = None;
+    let mut https_key = None;
     let mut timeout = None;
     let mut records = None;
     let mut diagnostic_records = None;
@@ -77,6 +81,20 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
                         .filter(|address| address.ip().is_loopback())
                         .ok_or_else(usage)?,
                 );
+            }
+            Some("--https-listen") if action == "serve" && https_listen.is_none() => {
+                https_listen = Some(
+                    value
+                        .to_str()
+                        .and_then(|value| value.parse::<std::net::SocketAddr>().ok())
+                        .ok_or_else(usage)?,
+                );
+            }
+            Some("--https-cert") if action == "serve" && https_cert.is_none() => {
+                https_cert = Some(PathBuf::from(value));
+            }
+            Some("--https-key") if action == "serve" && https_key.is_none() => {
+                https_key = Some(PathBuf::from(value));
             }
             Some("--request-timeout-ms") if accepts_config && timeout.is_none() => {
                 timeout = Some(number(value).ok_or_else(usage)?);
@@ -207,7 +225,13 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
             })
         }
     };
+    let https = match (https_listen, https_cert, https_key) {
+        (None, None, None) => None,
+        (Some(address), Some(cert), Some(key)) => Some(HttpsOptions { address, cert, key }),
+        _ => return Err(usage()),
+    };
     Ok(Command {
+        https,
         data: data.ok_or_else(usage)?,
         action,
     })
@@ -297,7 +321,8 @@ pub fn run(command: Command, output: &mut impl Write) -> Result<(), Error> {
         return save_config(&command.data, config, output);
     }
     if let Action::Serve(config) = command.action {
-        return super::admin_server::run(&command.data, config, output).map_err(Error::Server);
+        return super::admin_server::run(&command.data, config, command.https, output)
+            .map_err(Error::Server);
     }
     if command.action == Action::Evaluate {
         let diagnostic = client::evaluate(&command.data, Duration::from_secs(30))

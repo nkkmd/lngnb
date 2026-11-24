@@ -397,6 +397,24 @@ mod tests {
             .save_manual_publication_change(id, ManualPublicationChange::ApproveUntrusted, "allow")
             .unwrap();
 
+        writer.finish().unwrap();
+        let mut startup =
+            crate::storage::LocalStartup::open(&temp.data(), crate::storage::Limits::default())
+                .unwrap();
+        loop {
+            if startup
+                .step(
+                    EvaluationLimits::default(),
+                    crate::storage::LocalStartupBudget::default(),
+                )
+                .unwrap()
+                .checks_complete()
+            {
+                break;
+            }
+        }
+        let mut writer = startup.into_writer().unwrap();
+
         assert!(matches!(
             FixedRecordLoopbackListener::bind(([0, 0, 0, 0], 0).into()),
             Err(error) if error.kind() == std::io::ErrorKind::InvalidInput
