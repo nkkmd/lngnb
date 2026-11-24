@@ -331,12 +331,7 @@ fn parse_bodyless_request(head: &[u8]) -> Option<(&str, &str)> {
         }
         let value = value.trim_matches([' ', '\t']);
         if name.eq_ignore_ascii_case("host") {
-            if host_seen
-                || value.is_empty()
-                || !value
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || b".-_:[]".contains(&byte))
-            {
+            if host_seen || !valid_host_authority(value) {
                 return None;
             }
             host_seen = true;
@@ -352,6 +347,36 @@ fn parse_bodyless_request(head: &[u8]) -> Option<(&str, &str)> {
         }
     }
     host_seen.then_some((method, target))
+}
+
+fn valid_host_authority(value: &str) -> bool {
+    if let Some(bracketed) = value.strip_prefix('[') {
+        return bracketed.split_once(']').is_some_and(|(address, suffix)| {
+            address.parse::<std::net::Ipv6Addr>().is_ok()
+                && (suffix.is_empty() || suffix.strip_prefix(':').is_some_and(valid_host_port))
+        });
+    }
+
+    let host = match value.split_once(':') {
+        Some((host, port)) if valid_host_port(port) => host,
+        Some(_) => return false,
+        None => value,
+    };
+    let name = host.strip_suffix('.').unwrap_or(host);
+    name.len() <= 253
+        && name.split('.').all(|label| {
+            let bytes = label.as_bytes();
+            bytes.len() <= 63
+                && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+                && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+                && bytes
+                    .iter()
+                    .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+        })
+}
+
+fn valid_host_port(port: &str) -> bool {
+    port.bytes().all(|byte| byte.is_ascii_digit()) && port.parse::<u16>().is_ok()
 }
 
 fn is_token(byte: u8) -> bool {
@@ -540,6 +565,50 @@ mod tests {
     use super::*;
     use std::io::Read;
     use std::time::Duration;
+
+    #[test]
+    fn request_requires_one_valid_host_and_ignores_forwarding_headers() {
+        let parse = |headers: &str| {
+            let request = format!("GET /v1/records/id HTTP/1.1\r\n{headers}\r\n");
+            parse_bodyless_request(request.as_bytes()).is_some()
+        };
+        for host in [
+            "localhost",
+            "Example.COM.:443",
+            "127.0.0.1:8080",
+            "[::1]",
+            "[2001:db8::1]:443",
+        ] {
+            assert!(parse(&format!("Host: {host}\r\n")), "{host}");
+        }
+        for host in [
+            "",
+            "a:65536",
+            "a:",
+            "a:+80",
+            "a:80:90",
+            "a..b",
+            "-host",
+            "host-",
+            "user@host",
+            "https://host",
+            "host/path",
+            "a,b",
+            "a b",
+            "::1",
+            "[::1",
+            "[::1]extra",
+            "[fe80::1%eth0]",
+            "[127.0.0.1]",
+            "[::1]:",
+        ] {
+            assert!(!parse(&format!("Host: {host}\r\n")), "{host}");
+        }
+        assert!(!parse("Host: localhost\r\nhOsT: localhost\r\n"));
+        let forwarded = "Forwarded: host=proxy.example\r\nX-Forwarded-Host: proxy.example\r\n";
+        assert!(!parse(forwarded));
+        assert!(parse(&format!("Host: localhost\r\n{forwarded}")));
+    }
 
     #[test]
     fn request_head_bounds_and_preserves_remaining_bytes() {
