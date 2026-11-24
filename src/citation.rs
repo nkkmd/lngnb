@@ -55,6 +55,11 @@ impl PublicBaseUrl {
         Some(Self(value.to_owned()))
     }
 
+    pub fn authority(&self) -> &str {
+        let rest = &self.0["https://".len()..];
+        rest.split('/').next().expect("validated HTTPS URL")
+    }
+
     pub fn api_base_url(&self) -> String {
         format!("{}/v1", self.0)
     }

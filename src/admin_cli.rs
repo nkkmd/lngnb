@@ -50,6 +50,7 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
     let mut https_cert = None;
     let mut https_key = None;
     let mut https_host = None;
+    let mut public_base_url = None;
     let mut timeout = None;
     let mut records = None;
     let mut diagnostic_records = None;
@@ -93,6 +94,14 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
             }
             Some("--https-cert") if action == "serve" && https_cert.is_none() => {
                 https_cert = Some(PathBuf::from(value));
+            }
+            Some("--public-base-url") if action == "serve" && public_base_url.is_none() => {
+                public_base_url = Some(
+                    value
+                        .to_str()
+                        .and_then(lngnb::citation::PublicBaseUrl::parse)
+                        .ok_or_else(usage)?,
+                );
             }
             Some("--https-host") if action == "serve" && https_host.is_none() => {
                 https_host = Some(
@@ -234,6 +243,17 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
             })
         }
     };
+    if let Some(base) = &public_base_url {
+        let host =
+            lngnb::fixed_record_http::HttpsHost::parse(base.authority()).ok_or_else(usage)?;
+        if https_host
+            .as_ref()
+            .is_some_and(|explicit| *explicit != host)
+        {
+            return Err(usage());
+        }
+        https_host = Some(host);
+    }
     let https = match (https_listen, https_cert, https_key, https_host) {
         (None, None, None, None) => None,
         (Some(address), Some(cert), Some(key), host)
@@ -244,6 +264,7 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
                 cert,
                 key,
                 host,
+                public_base_url,
             })
         }
         _ => return Err(usage()),
@@ -473,6 +494,62 @@ fn evaluation_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_base_sets_https_host_and_rejects_inconsistent_options() {
+        let args = [
+            "serve",
+            "--data-dir",
+            "data",
+            "--https-listen",
+            "0.0.0.0:8443",
+            "--https-cert",
+            "cert.pem",
+            "--https-key",
+            "key.pem",
+            "--public-base-url",
+            "https://Relay.example/library",
+        ];
+        let parse_args = |extra: &[&str]| {
+            parse(
+                &args
+                    .iter()
+                    .chain(extra)
+                    .map(OsString::from)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let options = parse_args(&[]).unwrap().https.unwrap();
+        assert_eq!(
+            options.host,
+            lngnb::fixed_record_http::HttpsHost::parse("relay.example:443")
+        );
+        assert_eq!(
+            options.public_base_url.unwrap().api_base_url(),
+            "https://Relay.example/library/v1"
+        );
+        assert!(parse_args(&["--https-host", "relay.example:443"]).is_ok());
+        assert!(parse_args(&["--https-host", "relay.example:8443"]).is_err());
+        assert!(parse_args(&["--public-base-url", "https://relay.example"]).is_err());
+        for args in [
+            [
+                "serve",
+                "--data-dir",
+                "data",
+                "--public-base-url",
+                "https://relay.example",
+            ],
+            [
+                "serve",
+                "--data-dir",
+                "data",
+                "--public-base-url",
+                "http://relay.example",
+            ],
+        ] {
+            assert!(parse(&args.map(OsString::from)).is_err());
+        }
+    }
 
     #[test]
     fn probe_requires_one_explicit_path_without_echoing_arguments() {

@@ -338,6 +338,7 @@ pub struct HttpsOptions {
     pub cert: PathBuf,
     pub key: PathBuf,
     pub host: Option<lngnb::fixed_record_http::HttpsHost>,
+    pub public_base_url: Option<lngnb::citation::PublicBaseUrl>,
 }
 
 pub fn run(
@@ -447,6 +448,11 @@ fn serve(
     if let Some(https) = &https {
         let address = https.local_addr().map_err(|_| Error::Unconfirmed)?;
         writeln!(output, "HTTPS待受け https://{address}")
+            .and_then(|()| output.flush())
+            .map_err(|_| Error::Unconfirmed)?;
+    }
+    if let Some(base) = https_options.and_then(|options| options.public_base_url.as_ref()) {
+        writeln!(output, "公開API基底 {}", base.api_base_url())
             .and_then(|()| output.flush())
             .map_err(|_| Error::Unconfirmed)?;
     }
