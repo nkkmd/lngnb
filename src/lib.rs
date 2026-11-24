@@ -3,6 +3,7 @@ pub mod authoring;
 #[cfg(target_os = "linux")]
 pub mod authoring_input;
 pub mod cbor;
+pub mod citation;
 #[cfg(target_os = "linux")]
 pub mod fixed_record_http;
 pub mod id;

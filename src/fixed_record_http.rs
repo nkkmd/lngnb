@@ -409,7 +409,7 @@ impl HttpsHost {
     }
 }
 
-fn parse_host_authority(value: &str) -> Option<(&str, Option<u16>)> {
+pub(crate) fn parse_host_authority(value: &str) -> Option<(&str, Option<u16>)> {
     if let Some(bracketed) = value.strip_prefix('[') {
         let (address, suffix) = bracketed.split_once(']')?;
         address.parse::<std::net::Ipv6Addr>().ok()?;
