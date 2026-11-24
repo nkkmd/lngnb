@@ -403,32 +403,35 @@ fn foreground_https_serves_verified_record_after_failed_connections() {
     let temp = Temp::new();
     let cert = temp.0.join("server.crt");
     let key = temp.0.join("server.key");
-    let generated = Command::new("openssl")
-        .args([
-            "req",
-            "-x509",
-            "-newkey",
-            "ec",
-            "-pkeyopt",
-            "ec_paramgen_curve:P-256",
-            "-nodes",
-            "-days",
-            "1",
-            "-subj",
-            "/CN=localhost",
-            "-addext",
-            "subjectAltName=DNS:localhost",
-            "-addext",
-            "basicConstraints=critical,CA:FALSE",
-            "-out",
-        ])
-        .arg(&cert)
-        .arg("-keyout")
-        .arg(&key)
-        .output()
-        .unwrap();
-    assert!(generated.status.success());
-    fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).unwrap();
+    let generate_certificate = || {
+        let generated = Command::new("openssl")
+            .args([
+                "req",
+                "-x509",
+                "-newkey",
+                "ec",
+                "-pkeyopt",
+                "ec_paramgen_curve:P-256",
+                "-nodes",
+                "-days",
+                "1",
+                "-subj",
+                "/CN=localhost",
+                "-addext",
+                "subjectAltName=DNS:localhost",
+                "-addext",
+                "basicConstraints=critical,CA:FALSE",
+                "-out",
+            ])
+            .arg(&cert)
+            .arg("-keyout")
+            .arg(&key)
+            .output()
+            .unwrap();
+        assert!(generated.status.success());
+        fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).unwrap();
+    };
+    generate_certificate();
 
     let record = fixture();
     let id = record.id();
@@ -495,21 +498,24 @@ fn foreground_https_serves_verified_record_after_failed_connections() {
     assert!(!rejected.windows(8).any(|bytes| bytes == b"HTTP/1.1"));
 
     let stalled = connect(address);
-    let mut roots = rustls::RootCertStore::empty();
-    for cert in rustls_pemfile::certs(&mut BufReader::new(fs::File::open(cert).unwrap())) {
-        roots.add(cert.unwrap()).unwrap();
-    }
-    let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_protocol_versions(&[&rustls::version::TLS13])
-    .unwrap()
-    .with_root_certificates(roots)
-    .with_no_client_auth();
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    let tls =
-        rustls::ClientConnection::new(Arc::new(config), "localhost".try_into().unwrap()).unwrap();
-    let mut client = rustls::StreamOwned::new(tls, connect(address));
+    let verified_client = || {
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in rustls_pemfile::certs(&mut BufReader::new(fs::File::open(&cert).unwrap())) {
+            roots.add(cert.unwrap()).unwrap();
+        }
+        let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let tls = rustls::ClientConnection::new(Arc::new(config), "localhost".try_into().unwrap())
+            .unwrap();
+        rustls::StreamOwned::new(tls, connect(address))
+    };
+    let mut client = verified_client();
     client.write_all(request.as_bytes()).unwrap();
     let mut response = Vec::new();
     client.read_to_end(&mut response).unwrap();
@@ -529,7 +535,55 @@ fn foreground_https_serves_verified_record_after_failed_connections() {
     assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
     assert!(probe_cli(&temp.data()).status.success());
 
-    let _stalled_at_shutdown = connect(address);
+    let wait_for_reload = |log_path: &Path, message: &str| {
+        let deadline = Instant::now() + Duration::from_secs(6);
+        loop {
+            if fs::read_to_string(log_path)
+                .unwrap()
+                .lines()
+                .any(|line| line == message)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "reload result missing: {message}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    };
+
+    let old_certificate = fs::read(&cert).unwrap();
+    generate_certificate();
+    assert_ne!(fs::read(&cert).unwrap(), old_certificate);
+    server.signal("-HUP");
+    wait_for_reload(&server.log, "HTTPS証明書と秘密鍵を再読込みしました。");
+    let mut rotated = verified_client();
+    rotated.write_all(request.as_bytes()).unwrap();
+    response.clear();
+    rotated.read_to_end(&mut response).unwrap();
+    assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    assert_eq!(&response[body..], record.bytes());
+
+    fs::remove_file(&key).unwrap();
+    server.signal("-HUP");
+    wait_for_reload(
+        &server.log,
+        "HTTPS証明書または秘密鍵の再読込みに失敗し、HTTPS待受けを停止しました。",
+    );
+    assert_eq!(
+        TcpStream::connect_timeout(&address, Duration::from_secs(2))
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::ConnectionRefused
+    );
+    assert!(probe_cli(&temp.data()).status.success());
+    let mut development = connect(http);
+    development.write_all(request.as_bytes()).unwrap();
+    response.clear();
+    development.read_to_end(&mut response).unwrap();
+    assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+
     server.signal("-TERM");
     assert!(server.wait().success());
     let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();

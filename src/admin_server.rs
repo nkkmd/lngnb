@@ -345,18 +345,25 @@ pub fn run(
     https: Option<HttpsOptions>,
     output: &mut impl Write,
 ) -> Result<(), Error> {
-    let signals = Signals::install()?;
-    serve(path, config, https, &signals.stop, output)
+    let mut signals = Signals::install()?;
+    let reload = Arc::new(AtomicBool::new(false));
+    if https.is_some() {
+        let id = signal_hook::flag::register(signal_hook::consts::SIGHUP, Arc::clone(&reload))
+            .map_err(|_| Error::Signal)?;
+        signals.ids.push(id);
+    }
+    serve(path, config, https.as_ref(), &signals.stop, &reload, output)
 }
 
 fn serve(
     path: &Path,
     overrides: Overrides,
-    https: Option<HttpsOptions>,
+    https_options: Option<&HttpsOptions>,
     stop: &AtomicBool,
+    reload: &AtomicBool,
     output: &mut impl Write,
 ) -> Result<(), Error> {
-    let mut https = https
+    let mut https = https_options
         .map(|options| {
             let config = lngnb::server_tls::load_server_config(&options.cert, &options.key)?;
             lngnb::fixed_record_http::FixedRecordHttpsListener::bind(options.address, config)
@@ -463,6 +470,27 @@ fn serve(
         if let Some(http) = &mut http {
             listener
                 .serve_loopback_http(http, Instant::now() + Duration::from_secs(2))
+                .map_err(|_| Error::Unconfirmed)?;
+        }
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        if let Some((options, active)) = https_options
+            .zip(https.as_mut())
+            .filter(|_| reload.swap(false, Ordering::SeqCst))
+        {
+            let message = match lngnb::server_tls::load_server_config(&options.cert, &options.key) {
+                Ok(config) => {
+                    active.replace_config(config);
+                    "HTTPS証明書と秘密鍵を再読込みしました。"
+                }
+                Err(_) => {
+                    drop(https.take());
+                    "HTTPS証明書または秘密鍵の再読込みに失敗し、HTTPS待受けを停止しました。"
+                }
+            };
+            writeln!(output, "{message}")
+                .and_then(|()| output.flush())
                 .map_err(|_| Error::Unconfirmed)?;
         }
         if stop.load(Ordering::SeqCst) {

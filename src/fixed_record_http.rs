@@ -149,6 +149,11 @@ impl FixedRecordHttpsListener {
         self.listener.local_addr()
     }
 
+    /// 検証済みの設定を新しい接続に適用する。
+    pub fn replace_config(&mut self, config: rustls::ServerConfig) {
+        self.config = Arc::new(config);
+    }
+
     pub(crate) fn serve_ready(
         &mut self,
         writer: &mut RecordWriter,
