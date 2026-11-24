@@ -337,6 +337,7 @@ pub struct HttpsOptions {
     pub address: SocketAddr,
     pub cert: PathBuf,
     pub key: PathBuf,
+    pub host: Option<lngnb::fixed_record_http::HttpsHost>,
 }
 
 pub fn run(
@@ -366,7 +367,11 @@ fn serve(
     let mut https = https_options
         .map(|options| {
             let config = lngnb::server_tls::load_server_config(&options.cert, &options.key)?;
-            lngnb::fixed_record_http::FixedRecordHttpsListener::bind(options.address, config)
+            lngnb::fixed_record_http::FixedRecordHttpsListener::bind(
+                options.address,
+                config,
+                options.host.clone(),
+            )
         })
         .transpose()
         .map_err(|_| Error::Unconfirmed)?;

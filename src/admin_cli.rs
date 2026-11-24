@@ -49,6 +49,7 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
     let mut https_listen = None;
     let mut https_cert = None;
     let mut https_key = None;
+    let mut https_host = None;
     let mut timeout = None;
     let mut records = None;
     let mut diagnostic_records = None;
@@ -92,6 +93,14 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
             }
             Some("--https-cert") if action == "serve" && https_cert.is_none() => {
                 https_cert = Some(PathBuf::from(value));
+            }
+            Some("--https-host") if action == "serve" && https_host.is_none() => {
+                https_host = Some(
+                    value
+                        .to_str()
+                        .and_then(lngnb::fixed_record_http::HttpsHost::parse)
+                        .ok_or_else(usage)?,
+                );
             }
             Some("--https-key") if action == "serve" && https_key.is_none() => {
                 https_key = Some(PathBuf::from(value));
@@ -225,9 +234,18 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
             })
         }
     };
-    let https = match (https_listen, https_cert, https_key) {
-        (None, None, None) => None,
-        (Some(address), Some(cert), Some(key)) => Some(HttpsOptions { address, cert, key }),
+    let https = match (https_listen, https_cert, https_key, https_host) {
+        (None, None, None, None) => None,
+        (Some(address), Some(cert), Some(key), host)
+            if address.ip().is_loopback() || host.is_some() =>
+        {
+            Some(HttpsOptions {
+                address,
+                cert,
+                key,
+                host,
+            })
+        }
         _ => return Err(usage()),
     };
     Ok(Command {
