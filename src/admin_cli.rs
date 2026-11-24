@@ -51,6 +51,7 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
     let mut https_key = None;
     let mut https_host = None;
     let mut public_base_url = None;
+    let mut trusted_proxies = lngnb::fixed_record_http::TrustedProxySources::default();
     let mut timeout = None;
     let mut records = None;
     let mut diagnostic_records = None;
@@ -94,6 +95,15 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
             }
             Some("--https-cert") if action == "serve" && https_cert.is_none() => {
                 https_cert = Some(PathBuf::from(value));
+            }
+            Some("--trusted-proxy-ip") if action == "serve" => {
+                let ip = value
+                    .to_str()
+                    .and_then(|value| value.parse().ok())
+                    .ok_or_else(usage)?;
+                if !trusted_proxies.insert(ip) {
+                    return Err(usage());
+                }
             }
             Some("--public-base-url") if action == "serve" && public_base_url.is_none() => {
                 public_base_url = Some(
@@ -243,6 +253,9 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
             })
         }
     };
+    if !trusted_proxies.is_empty() && public_base_url.is_none() {
+        return Err(usage());
+    }
     if let Some(base) = &public_base_url {
         let host =
             lngnb::fixed_record_http::HttpsHost::parse(base.authority()).ok_or_else(usage)?;
@@ -265,6 +278,7 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
                 key,
                 host,
                 public_base_url,
+                trusted_proxies,
             })
         }
         _ => return Err(usage()),
@@ -494,6 +508,52 @@ fn evaluation_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxy_sources_require_a_public_https_base_and_literal_ips() {
+        let args = [
+            "serve",
+            "--data-dir",
+            "data",
+            "--https-listen",
+            "127.0.0.1:8443",
+            "--https-cert",
+            "cert.pem",
+            "--https-key",
+            "key.pem",
+            "--trusted-proxy-ip",
+        ];
+        let parse_args = |extra: &[&str]| {
+            parse(
+                &args
+                    .iter()
+                    .chain(extra)
+                    .map(OsString::from)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert!(parse_args(&["127.0.0.1"]).is_err());
+        assert!(
+            parse_args(&["127.0.0.0/8", "--public-base-url", "https://relay.example"]).is_err()
+        );
+        assert!(
+            parse_args(&[
+                "proxy.example",
+                "--public-base-url",
+                "https://relay.example"
+            ])
+            .is_err()
+        );
+        let command = parse_args(&[
+            "127.0.0.1",
+            "--trusted-proxy-ip",
+            "::1",
+            "--public-base-url",
+            "https://relay.example",
+        ])
+        .unwrap();
+        assert_eq!(command.https.unwrap().trusted_proxies.len(), 2);
+    }
 
     #[test]
     fn public_base_sets_https_host_and_rejects_inconsistent_options() {

@@ -129,6 +129,38 @@ impl FixedRecordLoopbackListener {
     }
 }
 
+/// 管理者が指定したリバースプロキシの接続元。照合にはTCPの対向アドレスを使う。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TrustedProxySources(Vec<std::net::IpAddr>);
+
+impl TrustedProxySources {
+    /// 単一のIPアドレスを登録する。IPv4-mapped IPv6はIPv4に正規化する。
+    pub fn insert(&mut self, ip: std::net::IpAddr) -> bool {
+        let ip = ip.to_canonical();
+        if ip.is_unspecified()
+            || ip.is_multicast()
+            || ip == std::net::IpAddr::V4(std::net::Ipv4Addr::BROADCAST)
+            || self.0.contains(&ip)
+        {
+            return false;
+        }
+        self.0.push(ip);
+        true
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn trusts_peer(&self, stream: &TcpStream) -> io::Result<bool> {
+        Ok(self.0.contains(&stream.peer_addr()?.ip().to_canonical()))
+    }
+}
+
 /// 明示的なTLS設定で固定Recordだけを提供するHTTPS待受け。
 pub struct FixedRecordHttpsListener {
     listener: TcpListener,
@@ -632,6 +664,22 @@ mod tests {
     use super::*;
     use std::io::Read;
     use std::time::Duration;
+
+    #[test]
+    fn trusted_proxy_sources_match_the_tcp_peer_only() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (peer, _) = listener.accept().unwrap();
+        let mut sources = TrustedProxySources::default();
+        assert!(!sources.trusts_peer(&peer).unwrap());
+        assert!(sources.insert("127.0.0.2".parse().unwrap()));
+        assert!(!sources.trusts_peer(&peer).unwrap());
+        assert!(sources.insert("::ffff:127.0.0.1".parse().unwrap()));
+        assert!(sources.trusts_peer(&peer).unwrap());
+        assert!(!sources.insert("127.0.0.1".parse().unwrap()));
+        assert!(!sources.insert("::".parse().unwrap()));
+        assert!(!sources.insert("224.0.0.1".parse().unwrap()));
+    }
 
     #[test]
     fn https_host_matches_normalized_name_and_effective_port() {
