@@ -453,6 +453,8 @@ fn foreground_https_serves_verified_record_after_failed_connections() {
             "127.0.0.1:0",
             "--public-base-url",
             "https://localhost/library",
+            "--trusted-proxy-ip",
+            "127.0.0.1",
             "--https-cert",
             cert.to_str().unwrap(),
             "--https-key",

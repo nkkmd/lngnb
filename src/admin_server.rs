@@ -339,6 +339,7 @@ pub struct HttpsOptions {
     pub key: PathBuf,
     pub host: Option<lngnb::fixed_record_http::HttpsHost>,
     pub public_base_url: Option<lngnb::citation::PublicBaseUrl>,
+    pub trusted_proxies: lngnb::fixed_record_http::TrustedProxySources,
 }
 
 pub fn run(
@@ -455,6 +456,15 @@ fn serve(
         writeln!(output, "公開API基底 {}", base.api_base_url())
             .and_then(|()| output.flush())
             .map_err(|_| Error::Unconfirmed)?;
+    }
+    if let Some(options) = https_options.filter(|options| !options.trusted_proxies.is_empty()) {
+        writeln!(
+            output,
+            "登録済みプロキシ接続元 {} 件",
+            options.trusted_proxies.len()
+        )
+        .and_then(|()| output.flush())
+        .map_err(|_| Error::Unconfirmed)?;
     }
     while !stop.load(Ordering::SeqCst) {
         listener
