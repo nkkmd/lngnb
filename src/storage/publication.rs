@@ -368,7 +368,8 @@ impl RecordWriter {
                      WHERE e.payload_blob=?1 AND e.validation='valid' AND e.payload='verified'
                      ORDER BY e.record_id LIMIT ?2",
                 )?;
-                let mut rows = query.query(params![blob_id.bytes, i64::from(max_candidates.get()) + 1])?;
+                let mut rows =
+                    query.query(params![blob_id.bytes, i64::from(max_candidates.get()) + 1])?;
                 let mut remaining = max_candidates.get();
                 while let Some(row) = rows.next()? {
                     if remaining == 0 {
