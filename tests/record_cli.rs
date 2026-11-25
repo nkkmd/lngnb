@@ -392,46 +392,83 @@ fn foreground_server_serves_loopback_http_and_admin_ipc() {
     );
 }
 
+fn generate_https_certificate(cert: &Path, key: &Path) {
+    let generated = Command::new("openssl")
+        .args([
+            "req",
+            "-x509",
+            "-newkey",
+            "ec",
+            "-pkeyopt",
+            "ec_paramgen_curve:P-256",
+            "-nodes",
+            "-days",
+            "1",
+            "-subj",
+            "/CN=localhost",
+            "-addext",
+            "subjectAltName=DNS:localhost",
+            "-addext",
+            "basicConstraints=critical,CA:FALSE",
+            "-out",
+        ])
+        .arg(cert)
+        .arg("-keyout")
+        .arg(key)
+        .output()
+        .unwrap();
+    assert!(generated.status.success());
+    fs::set_permissions(key, fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+fn connect_https_socket(address: std::net::SocketAddr) -> std::net::TcpStream {
+    use std::net::TcpStream;
+
+    let socket = TcpStream::connect_timeout(&address, Duration::from_secs(3)).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(6)))
+        .unwrap();
+    socket
+        .set_write_timeout(Some(Duration::from_secs(6)))
+        .unwrap();
+    socket
+}
+
+fn verified_https_client(
+    cert: &Path,
+    address: std::net::SocketAddr,
+) -> rustls::StreamOwned<rustls::ClientConnection, std::net::TcpStream> {
+    use std::io::BufReader;
+    use std::sync::Arc;
+
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in rustls_pemfile::certs(&mut BufReader::new(fs::File::open(cert).unwrap())) {
+        roots.add(cert.unwrap()).unwrap();
+    }
+    let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS13])
+    .unwrap()
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let tls =
+        rustls::ClientConnection::new(Arc::new(config), "localhost".try_into().unwrap()).unwrap();
+    rustls::StreamOwned::new(tls, connect_https_socket(address))
+}
+
 #[test]
 fn foreground_https_serves_verified_record_after_failed_connections() {
     use lngnb::storage::{EvaluationLimits, ManualPublicationChange};
-    use std::io::{BufReader, Read, Write};
+    use std::io::{Read, Write};
     use std::net::{Shutdown, SocketAddr, TcpStream};
-    use std::sync::Arc;
     use std::time::Instant;
 
     let temp = Temp::new();
     let cert = temp.0.join("server.crt");
     let key = temp.0.join("server.key");
-    let generate_certificate = || {
-        let generated = Command::new("openssl")
-            .args([
-                "req",
-                "-x509",
-                "-newkey",
-                "ec",
-                "-pkeyopt",
-                "ec_paramgen_curve:P-256",
-                "-nodes",
-                "-days",
-                "1",
-                "-subj",
-                "/CN=localhost",
-                "-addext",
-                "subjectAltName=DNS:localhost",
-                "-addext",
-                "basicConstraints=critical,CA:FALSE",
-                "-out",
-            ])
-            .arg(&cert)
-            .arg("-keyout")
-            .arg(&key)
-            .output()
-            .unwrap();
-        assert!(generated.status.success());
-        fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).unwrap();
-    };
-    generate_certificate();
+    generate_https_certificate(&cert, &key);
 
     let record = fixture();
     let id = record.id();
@@ -476,21 +513,11 @@ fn foreground_https_serves_verified_record_after_failed_connections() {
         assert!(Instant::now() < deadline, "HTTPS did not become ready");
         thread::sleep(Duration::from_millis(10));
     };
-    let connect = |address: SocketAddr| {
-        let socket = TcpStream::connect_timeout(&address, Duration::from_secs(3)).unwrap();
-        socket
-            .set_read_timeout(Some(Duration::from_secs(6)))
-            .unwrap();
-        socket
-            .set_write_timeout(Some(Duration::from_secs(6)))
-            .unwrap();
-        socket
-    };
     let request = format!(
         "GET /v1/records/{id}?scope=untrusted&genesis_id={id} HTTP/1.1\r\nHost: localhost\r\n\r\n"
     );
 
-    let mut plain = connect(address);
+    let mut plain = connect_https_socket(address);
     plain.write_all(request.as_bytes()).unwrap();
     plain.shutdown(Shutdown::Write).unwrap();
     let mut rejected = Vec::new();
@@ -501,25 +528,8 @@ fn foreground_https_serves_verified_record_after_failed_connections() {
     }
     assert!(!rejected.windows(8).any(|bytes| bytes == b"HTTP/1.1"));
 
-    let stalled = connect(address);
-    let verified_client = || {
-        let mut roots = rustls::RootCertStore::empty();
-        for cert in rustls_pemfile::certs(&mut BufReader::new(fs::File::open(&cert).unwrap())) {
-            roots.add(cert.unwrap()).unwrap();
-        }
-        let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .unwrap()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-        config.alpn_protocols = vec![b"http/1.1".to_vec()];
-        let tls = rustls::ClientConnection::new(Arc::new(config), "localhost".try_into().unwrap())
-            .unwrap();
-        rustls::StreamOwned::new(tls, connect(address))
-    };
-    let mut wrong_host = verified_client();
+    let stalled = connect_https_socket(address);
+    let mut wrong_host = verified_https_client(&cert, address);
     let wrong_request = request.replace(
         "Host: localhost\r\n",
         "Host: other.example\r\nForwarded: host=localhost\r\nX-Forwarded-Host: localhost\r\n",
@@ -529,7 +539,7 @@ fn foreground_https_serves_verified_record_after_failed_connections() {
     wrong_host.read_to_end(&mut denied).unwrap();
     assert!(denied.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
 
-    let mut client = verified_client();
+    let mut client = verified_https_client(&cert, address);
     client.write_all(request.as_bytes()).unwrap();
     let mut response = Vec::new();
     client.read_to_end(&mut response).unwrap();
@@ -542,7 +552,7 @@ fn foreground_https_serves_verified_record_after_failed_connections() {
         + 4;
     assert_eq!(&response[body..], record.bytes());
     assert_eq!((&stalled).read(&mut [0]).unwrap(), 0);
-    let mut development = connect(http);
+    let mut development = connect_https_socket(http);
     development.write_all(request.as_bytes()).unwrap();
     response.clear();
     development.read_to_end(&mut response).unwrap();
@@ -568,11 +578,11 @@ fn foreground_https_serves_verified_record_after_failed_connections() {
     };
 
     let old_certificate = fs::read(&cert).unwrap();
-    generate_certificate();
+    generate_https_certificate(&cert, &key);
     assert_ne!(fs::read(&cert).unwrap(), old_certificate);
     server.signal("-HUP");
     wait_for_reload(&server.log, "HTTPS証明書と秘密鍵を再読込みしました。");
-    let mut rotated = verified_client();
+    let mut rotated = verified_https_client(&cert, address);
     rotated.write_all(request.as_bytes()).unwrap();
     response.clear();
     rotated.read_to_end(&mut response).unwrap();
@@ -592,7 +602,7 @@ fn foreground_https_serves_verified_record_after_failed_connections() {
         std::io::ErrorKind::ConnectionRefused
     );
     assert!(probe_cli(&temp.data()).status.success());
-    let mut development = connect(http);
+    let mut development = connect_https_socket(http);
     development.write_all(request.as_bytes()).unwrap();
     response.clear();
     development.read_to_end(&mut response).unwrap();
@@ -605,6 +615,96 @@ fn foreground_https_serves_verified_record_after_failed_connections() {
         store.startup_state().unwrap(),
         lngnb::storage::StartupState::Clean
     );
+}
+
+#[test]
+fn foreground_https_stops_after_publication_revoke_save_failure() {
+    use lngnb::storage::{EvaluationLimits, ManualPublicationChange, PublicationPermission};
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpStream};
+    use std::time::Instant;
+
+    let temp = Temp::new();
+    let cert = temp.0.join("server.crt");
+    let key = temp.0.join("server.key");
+    generate_https_certificate(&cert, &key);
+
+    let record = fixture();
+    let id = record.id();
+    let store = RecordStore::initialize(&temp.data(), Limits::default()).unwrap();
+    let mut writer = store.begin().unwrap();
+    writer.insert(&record).unwrap();
+    writer.revalidate(EvaluationLimits::default()).unwrap();
+    writer
+        .save_manual_publication_change(id, ManualPublicationChange::ApproveUntrusted, "test")
+        .unwrap();
+    writer.finish().unwrap();
+
+    let options = [
+        "--https-listen",
+        "127.0.0.1:0",
+        "--public-base-url",
+        "https://localhost",
+        "--https-cert",
+        cert.to_str().unwrap(),
+        "--https-key",
+        key.to_str().unwrap(),
+    ];
+    let mut server = Server::configured(&temp, &options);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let address: SocketAddr = loop {
+        let log = fs::read_to_string(&server.log).unwrap();
+        if let Some(address) = log
+            .lines()
+            .find_map(|line| line.strip_prefix("HTTPS待受け https://"))
+        {
+            break address.parse().unwrap();
+        }
+        assert!(Instant::now() < deadline, "HTTPS did not become ready");
+        thread::sleep(Duration::from_millis(10));
+    };
+
+    let mut client = verified_https_client(&cert, address);
+    write!(
+        client,
+        "GET /v1/records/{id}?scope=untrusted&genesis_id={id} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+    )
+    .unwrap();
+    let mut response = Vec::new();
+    client.read_to_end(&mut response).unwrap();
+    assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    assert!(response.ends_with(record.bytes()));
+
+    // 停止履歴の追加後、同じtransactionの取消し行だけを失敗させる。
+    let conn = rusqlite::Connection::open(temp.data().join("database.sqlite")).unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER deny_publication_revoke BEFORE INSERT ON publication_changes
+         WHEN NEW.decision = 'revoke' BEGIN SELECT RAISE(ABORT, 'test'); END;",
+    )
+    .unwrap();
+    drop(conn);
+    let output = Command::new(env!("CARGO_BIN_EXE_lngnb"))
+        .args(["record", "revoke-publication", "--data-dir"])
+        .arg(temp.data())
+        .arg("--record-id")
+        .arg(id.to_string())
+        .args(["--reason", "test revoke failure"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    assert!(output.stdout.is_empty());
+    assert_eq!(server.wait().code(), Some(3));
+    assert_eq!(
+        TcpStream::connect_timeout(&address, Duration::from_secs(2))
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::ConnectionRefused
+    );
+    assert_review(&temp, true);
+    let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
+    let permission = store.saved_publication_permission(id).unwrap().unwrap();
+    assert_eq!(permission.permission, PublicationPermission::Untrusted);
+    assert!(!permission.explicitly_stopped);
 }
 
 #[test]
