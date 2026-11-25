@@ -16,7 +16,7 @@ use std::{
 };
 
 pub const IMPLEMENTATION: &str = "lngnb-rust-sqlite-1";
-pub const SCHEMA_VERSION: i64 = 14;
+pub const SCHEMA_VERSION: i64 = 15;
 const DB: &str = "database.sqlite";
 const SCHEMA: &str = "
 CREATE TABLE storage_state (
@@ -223,8 +223,11 @@ CREATE TABLE evaluations (
  record_id BLOB PRIMARY KEY NOT NULL REFERENCES records(id),
  validation TEXT NOT NULL CHECK(validation IN ('valid','pending','invalid')),
  payload TEXT CHECK(payload IN ('verified','missing','unavailable')),
- reason TEXT, related BLOB CHECK(related IS NULL OR length(related)=32), payload_reason TEXT
+ reason TEXT, related BLOB CHECK(related IS NULL OR length(related)=32), payload_reason TEXT,
+ payload_blob BLOB CHECK(payload_blob IS NULL OR length(payload_blob)=32)
 ) STRICT;
+CREATE INDEX verified_blob_revisions ON evaluations(payload_blob,record_id)
+ WHERE validation='valid' AND payload='verified';
 CREATE TABLE known_invalid (
  record_id BLOB PRIMARY KEY NOT NULL REFERENCES records(id),
  reason TEXT NOT NULL CHECK(reason='declared_length_mismatch'),
