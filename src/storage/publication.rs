@@ -1,4 +1,4 @@
-//! Record本体の公開可否。仕様 §7.2.2。状態案内、候補一覧、本文には別の条件がある。
+//! RecordとBlob本文の公開可否。仕様 §7.2.2〜§7.2.3。
 
 use super::*;
 
@@ -288,6 +288,89 @@ impl RecordWriter {
         Ok(true)
     }
 
+    /// 指定Revisionを公開根拠として照合し、検査済み本文だけを同期送信処理に渡す。
+    /// Revisionは内部で選んだ候補。候補の列挙と通信の処理予算は呼び出し側で管理する。
+    pub fn send_blob_from_revision(
+        &mut self,
+        blob_id: Id,
+        revision: Id,
+        gate: DistributionGate,
+        scope: FixedRecordScope,
+        send: impl FnOnce(&mut std::fs::File, u64) -> std::io::Result<()>,
+    ) -> Result<bool> {
+        let (expected, genesis) = match scope {
+            FixedRecordScope::Public { genesis_id } => (RecordPublication::Public, genesis_id),
+            FixedRecordScope::Untrusted { genesis_id } => {
+                (RecordPublication::UntrustedPublic, Some(genesis_id))
+            }
+        };
+        if blob_id.kind != Kind::Blob
+            || genesis.is_some_and(|id| id.kind != Kind::Record)
+            || !self.began_clean
+            || self.failed
+            || self.publication_block == Some(revision)
+            || self.store.blob_recovery.needs_review()
+        {
+            return Ok(false);
+        }
+
+        let result: Result<_> = (|| {
+            let snapshot = self.store.conn.unchecked_transaction()?;
+            let candidate =
+                self.verified_public_blob(blob_id, revision, gate, expected, genesis)?;
+            snapshot.commit()?;
+            Ok(candidate)
+        })();
+        if result.is_err() {
+            self.failed = true;
+        }
+        let Some((mut file, length)) = result? else {
+            return Ok(false);
+        };
+        send(&mut file, length).map_err(StorageError::Io)?;
+        Ok(true)
+    }
+
+    fn verified_public_blob(
+        &self,
+        blob_id: Id,
+        revision: Id,
+        gate: DistributionGate,
+        expected: RecordPublication,
+        genesis: Option<Id>,
+    ) -> Result<Option<(std::fs::File, u64)>> {
+        let Some((publication, record)) = self
+            .store
+            .assess_record_publication(revision, gate, genesis)?
+        else {
+            return Ok(None);
+        };
+        if publication != expected {
+            return Ok(None);
+        }
+        let Some((declared_id, length)) = record.payload().map_err(|_| StorageError::Corrupt)?
+        else {
+            return Ok(None);
+        };
+        if declared_id != blob_id.bytes {
+            return Ok(None);
+        }
+        let verified: bool = self.store.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM evaluations WHERE record_id=?1 AND payload='verified')",
+            [&revision.bytes],
+            |row| row.get(0),
+        )?;
+        if !verified {
+            return Ok(None);
+        }
+
+        let file = self.store.blob(blob_id)?.ok_or(StorageError::Corrupt)?;
+        if file.metadata()?.len() != length {
+            return Err(StorageError::Corrupt);
+        }
+        Ok(Some((file, length)))
+    }
+
     #[cfg(test)]
     fn revoke_authenticated_publication(&mut self, id: Id, reason: &str, uid: u32) -> Result<bool> {
         self.save_publication_change(id, ManualPublicationChange::Revoke, reason, uid)
@@ -379,6 +462,107 @@ mod tests {
     use super::*;
 
     use crate::storage::tests::{Temp, fixture, logical_snapshot};
+
+    #[test]
+    fn shared_blob_requires_a_current_verified_public_revision() {
+        use crate::storage::evaluation::tests::{bytes, rev};
+        use std::io::Read;
+
+        let temp = Temp::new();
+        let genesis = fixture();
+        let first = rev(&[], 14, "first");
+        let shared = rev(&[first.id()], 14, "shared");
+        let blob = crate::id::blob_id(&bytes());
+        let scope = FixedRecordScope::Untrusted {
+            genesis_id: genesis.id(),
+        };
+        let mut writer = temp.store().begin().unwrap();
+        for record in [&genesis, &first, &shared] {
+            writer.insert(record).unwrap();
+        }
+        for id in [genesis.id(), first.id()] {
+            writer
+                .save_manual_publication_change(
+                    id,
+                    ManualPublicationChange::ApproveUntrusted,
+                    "allow",
+                )
+                .unwrap();
+        }
+        writer.revalidate(EvaluationLimits::default()).unwrap();
+
+        let denied = |_: &mut std::fs::File, _: u64| panic!("unexpected blob send");
+        let open = DistributionGate::Open;
+        assert!(
+            !writer
+                .send_blob_from_revision(blob, first.id(), open, scope, denied)
+                .unwrap()
+        );
+        writer.put_blob(blob, bytes().as_slice()).unwrap();
+        assert!(
+            !writer
+                .send_blob_from_revision(blob, first.id(), open, scope, denied)
+                .unwrap()
+        );
+        writer.revalidate(EvaluationLimits::default()).unwrap();
+
+        for (candidate, gate, scope) in [
+            (genesis.id(), open, scope),
+            (shared.id(), open, scope),
+            (first.id(), DistributionGate::Closed, scope),
+            (
+                first.id(),
+                open,
+                FixedRecordScope::Public { genesis_id: None },
+            ),
+            (
+                first.id(),
+                open,
+                FixedRecordScope::Untrusted {
+                    genesis_id: first.id(),
+                },
+            ),
+        ] {
+            assert!(
+                !writer
+                    .send_blob_from_revision(blob, candidate, gate, scope, denied)
+                    .unwrap()
+            );
+        }
+        let send = |file: &mut std::fs::File, length| {
+            let mut actual = Vec::new();
+            file.read_to_end(&mut actual)?;
+            assert_eq!(actual, bytes());
+            assert_eq!(length, actual.len() as u64);
+            Ok(())
+        };
+        assert!(
+            writer
+                .send_blob_from_revision(blob, first.id(), open, scope, send)
+                .unwrap()
+        );
+        writer
+            .save_manual_publication_change(
+                shared.id(),
+                ManualPublicationChange::ApproveUntrusted,
+                "allow",
+            )
+            .unwrap();
+        writer
+            .save_manual_publication_change(first.id(), ManualPublicationChange::Revoke, "stop")
+            .unwrap();
+        assert!(
+            !writer
+                .send_blob_from_revision(blob, first.id(), open, scope, denied)
+                .unwrap()
+        );
+        assert!(
+            writer
+                .send_blob_from_revision(blob, shared.id(), open, scope, send)
+                .unwrap()
+        );
+        writer.finish().unwrap();
+    }
 
     #[test]
     fn fixed_http_connection_reads_and_sends_a_record() {
