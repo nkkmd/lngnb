@@ -5,8 +5,11 @@ on:
   pull_request:
 permissions:
   contents: read
+env:
+  CLEANUP_TESTS: 'keyfile::files::tests::cleanup_start_tests::'
+  RESUME_TESTS: 'keyfile::files::tests::resume_record_tests::'
 jobs:
-  rust:
+  regression:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
@@ -37,7 +40,9 @@ jobs:
       - name: Test
         env:
           TMPDIR: ${{ runner.temp }}
-        run: cargo test --locked --offline --all-targets
+        run: |
+          cargo test --locked --offline --all-targets -- \
+            --skip "$CLEANUP_TESTS" --skip "$RESUME_TESTS"
       - name: Isolated ext4 storage qualification
         run: bash tests/qualify-ext4.sh
       - name: Release build
@@ -55,3 +60,53 @@ jobs:
         run: |
           git diff --exit-code
           test ! -e lngnb-data
+  focused:
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [publication, cleanup, resume]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install pinned toolchain
+        run: |
+          rustup toolchain install 1.85.0 --profile minimal --component rustfmt --component clippy
+          rustc --version --verbose
+          cargo --version
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+      - name: Prepare independent reference checker
+        run: |
+          python3 -m venv /tmp/lngnb-reference
+          /tmp/lngnb-reference/bin/pip install -r tests/requirements.txt
+          echo "LNGNB_REFERENCE_PYTHON=/tmp/lngnb-reference/bin/python" >> "$GITHUB_ENV"
+      - name: Run selected suite
+        env:
+          SUITE: ${{ matrix.suite }}
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          case "$SUITE" in
+            publication)
+              cargo test --locked --offline --lib -- storage::publication:: fixed_record_http::
+              cargo test --locked --offline --test record_cli -- https
+              ;;
+            cleanup) cargo test --locked --offline --all-targets -- "$CLEANUP_TESTS" ;;
+            resume) cargo test --locked --offline --all-targets -- "$RESUME_TESTS" ;;
+          esac
+      - name: No tracked changes or runtime data
+        run: |
+          git diff --exit-code
+          test ! -e lngnb-data
+  rust:
+    needs: [regression, focused]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require every suite
+        env:
+          REGRESSION: ${{ needs.regression.result }}
+          FOCUSED: ${{ needs.focused.result }}
+        run: test "$REGRESSION" = success && test "$FOCUSED" = success
