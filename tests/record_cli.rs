@@ -475,6 +475,21 @@ fn foreground_https_serves_verified_record_after_failed_connections() {
     let store = RecordStore::initialize(&temp.data(), Limits::default()).unwrap();
     let mut writer = store.begin().unwrap();
     writer.insert(&record).unwrap();
+    let payload = vec![0x5a; 40_000];
+    let blob = lngnb::id::blob_id(&payload);
+    let first = parent_revision(&[], &payload);
+    let shared = parent_revision(&[first.id()], &payload);
+    for revision in [&first, &shared] {
+        writer.insert(revision).unwrap();
+        writer
+            .save_manual_publication_change(
+                revision.id(),
+                ManualPublicationChange::ApproveUntrusted,
+                "test",
+            )
+            .unwrap();
+    }
+    writer.put_blob(blob, payload.as_slice()).unwrap();
     writer.revalidate(EvaluationLimits::default()).unwrap();
     writer
         .save_manual_publication_change(id, ManualPublicationChange::ApproveUntrusted, "test")
@@ -558,6 +573,41 @@ fn foreground_https_serves_verified_record_after_failed_connections() {
     development.read_to_end(&mut response).unwrap();
     assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
     assert!(probe_cli(&temp.data()).status.success());
+
+    let get_blob = |target| {
+        let mut client = verified_https_client(&cert, address);
+        write!(
+            client,
+            "GET /v1/blobs/{target}?scope=untrusted&genesis_id={id} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        )
+        .unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        response
+    };
+    for revision in [&first, &shared] {
+        let response = get_blob(blob);
+        let split = response.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        let header = std::str::from_utf8(&response[..split]).unwrap();
+        assert!(header.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(header.contains("Content-Disposition: attachment\r\n"));
+        assert!(header.contains("X-Content-Type-Options: nosniff\r\n"));
+        assert_eq!(&response[split..], payload.as_slice());
+        assert!(
+            Command::new(env!("CARGO_BIN_EXE_lngnb"))
+                .args(["record", "revoke-publication", "--data-dir"])
+                .arg(temp.data())
+                .arg("--record-id")
+                .arg(revision.id().to_string())
+                .args(["--reason", "test"])
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let hidden = get_blob(blob);
+    assert!(hidden.starts_with(b"HTTP/1.1 404 Not Found\r\n"));
+    assert_eq!(hidden, get_blob(lngnb::id::blob_id(b"missing")));
 
     let wait_for_reload = |log_path: &Path, message: &str| {
         let deadline = Instant::now() + Duration::from_secs(6);
