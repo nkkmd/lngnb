@@ -12,6 +12,8 @@ const JSON: &str = "application/json";
 const INVALID: &[u8] = br#"{"api_version":"lngnb-http-1","error":{"code":"invalid_request","message":"Invalid request","retry_after_seconds":null}}"#;
 const UNAVAILABLE: &[u8] = br#"{"api_version":"lngnb-http-1","error":{"code":"not_available","message":"This Record is unavailable on this relay","retry_after_seconds":null}}"#;
 
+const BLOB_UNAVAILABLE: &[u8] = br#"{"api_version":"lngnb-http-1","error":{"code":"not_available","message":"This Blob is unavailable on this relay","retry_after_seconds":null}}"#;
+
 const REQUEST_TARGET_LIMIT: usize = 16 * 1024;
 const METHOD_NOT_ALLOWED: &[u8] = br#"{"api_version":"lngnb-http-1","error":{"code":"method_not_allowed","message":"Method not allowed","retry_after_seconds":null}}"#;
 
@@ -350,6 +352,33 @@ fn serve_request(
         )?;
         return Ok(true);
     }
+    if target.len() <= REQUEST_TARGET_LIMIT {
+        let (path, query) = target
+            .split_once('?')
+            .map_or((target, None), |(path, query)| (path, Some(query)));
+        if let Some(raw) = path.strip_prefix("/v1/blobs/") {
+            if raw.is_empty() || raw.contains('/') {
+                return Ok(false);
+            }
+            let stream = &mut **reader.get_mut();
+            let (status, body) = if method != "GET" {
+                (405, METHOD_NOT_ALLOWED)
+            } else if let (Ok(id), Some(scope)) = (Id::parse(Kind::Blob, raw), parse_scope(query)) {
+                let limit = std::num::NonZeroU32::new(100).unwrap();
+                match writer.send_public_blob(id, gate, scope, limit, |file, length| {
+                    write_blob(stream, write_deadline, file, length)
+                }) {
+                    Ok(true) => return Ok(true),
+                    Ok(false) | Err(StorageError::BudgetExceeded) => (404, BLOB_UNAVAILABLE),
+                    Err(error) => return Err(error),
+                }
+            } else {
+                (400, INVALID)
+            };
+            write_response(stream, write_deadline, method, status, JSON, body)?;
+            return Ok(true);
+        }
+    }
     route_fixed_record_request(
         writer,
         gate,
@@ -563,6 +592,30 @@ fn write_response(
     if method != "HEAD" {
         write_before(stream, deadline, bytes)?;
     }
+    stream.flush()
+}
+
+fn write_blob(
+    stream: &mut impl RequestStream,
+    deadline: Instant,
+    file: &mut impl Read,
+    mut length: u64,
+) -> io::Result<()> {
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+         Content-Disposition: attachment\r\nX-Content-Type-Options: nosniff\r\n\
+         Content-Length: {length}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n"
+    );
+    write_before(stream, deadline, head.as_bytes())?;
+    let mut buffer = [0; 16 * 1024];
+    while length > 0 {
+        remaining(deadline)?;
+        let count = length.min(buffer.len() as u64) as usize;
+        file.read_exact(&mut buffer[..count])?;
+        write_before(stream, deadline, &buffer[..count])?;
+        length -= count as u64;
+    }
+    stream.write_until_deadline(deadline)?;
     stream.flush()
 }
 
