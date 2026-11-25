@@ -212,6 +212,17 @@ pub enum FixedRecordScope {
     Untrusted { genesis_id: Id },
 }
 
+impl FixedRecordScope {
+    fn publication_target(self) -> (RecordPublication, Option<Id>) {
+        match self {
+            Self::Public { genesis_id } => (RecordPublication::Public, genesis_id),
+            Self::Untrusted { genesis_id } => {
+                (RecordPublication::UntrustedPublic, Some(genesis_id))
+            }
+        }
+    }
+}
+
 impl RecordWriter {
     /// 排他writerを保持したまま固定Recordの配信可否を判定して送信する。
     /// 呼び出し側はゲートの変更を同じ所有者で直列化し、指定経路へ期限付きで同期送信する。
@@ -298,12 +309,7 @@ impl RecordWriter {
         scope: FixedRecordScope,
         send: impl FnOnce(&mut std::fs::File, u64) -> std::io::Result<()>,
     ) -> Result<bool> {
-        let (expected, genesis) = match scope {
-            FixedRecordScope::Public { genesis_id } => (RecordPublication::Public, genesis_id),
-            FixedRecordScope::Untrusted { genesis_id } => {
-                (RecordPublication::UntrustedPublic, Some(genesis_id))
-            }
-        };
+        let (expected, genesis) = scope.publication_target();
         if blob_id.kind != Kind::Blob
             || genesis.is_some_and(|id| id.kind != Kind::Record)
             || !self.began_clean
@@ -322,6 +328,74 @@ impl RecordWriter {
             Ok(candidate)
         })();
         if result.is_err() {
+            self.failed = true;
+        }
+        let Some((mut file, length)) = result? else {
+            return Ok(false);
+        };
+        send(&mut file, length).map_err(StorageError::Io)?;
+        Ok(true)
+    }
+
+    /// Blob IDから現在の公開根拠を探し、根拠を満たした本文だけを同期処理に渡す。
+    /// 探索上限に達して結論を出せない場合は、未発見と区別して予算超過を返す。
+    pub fn send_public_blob(
+        &mut self,
+        blob_id: Id,
+        gate: DistributionGate,
+        scope: FixedRecordScope,
+        max_candidates: std::num::NonZeroU32,
+        send: impl FnOnce(&mut std::fs::File, u64) -> std::io::Result<()>,
+    ) -> Result<bool> {
+        let (expected, genesis) = scope.publication_target();
+        if blob_id.kind != Kind::Blob
+            || genesis.is_some_and(|id| id.kind != Kind::Record)
+            || gate == DistributionGate::Closed
+            || !self.began_clean
+            || self.failed
+            || self.store.blob_recovery.needs_review()
+        {
+            return Ok(false);
+        }
+
+        let result: Result<_> = (|| {
+            let conn = &self.store.conn;
+            let snapshot = conn.unchecked_transaction()?;
+            let candidate = sql_inspection::run(conn, self.store.limits.sql_inspection, || {
+                let mut query = conn.prepare(
+                    "SELECT e.record_id FROM evaluations e
+                     JOIN evaluation_state v ON v.singleton=1 AND v.dirty=0
+                     WHERE e.validation='valid' AND e.payload='verified'
+                     ORDER BY e.record_id LIMIT ?1",
+                )?;
+                let mut rows = query.query([i64::from(max_candidates.get()) + 1])?;
+                let mut remaining = max_candidates.get();
+                while let Some(row) = rows.next()? {
+                    if remaining == 0 {
+                        return Err(StorageError::BudgetExceeded);
+                    }
+                    remaining -= 1;
+                    let revision = Id {
+                        kind: Kind::Record,
+                        bytes: row.get(0)?,
+                    };
+                    if self.publication_block != Some(revision) {
+                        if let Some(candidate) =
+                            self.verified_public_blob(blob_id, revision, gate, expected, genesis)?
+                        {
+                            return Ok(Some(candidate));
+                        }
+                    }
+                }
+                Ok(None)
+            })?;
+            snapshot.commit()?;
+            Ok(candidate)
+        })();
+        if result
+            .as_ref()
+            .is_err_and(|error| !matches!(error, StorageError::BudgetExceeded))
+        {
             self.failed = true;
         }
         let Some((mut file, length)) = result? else {
@@ -559,6 +633,30 @@ mod tests {
         assert!(
             writer
                 .send_blob_from_revision(blob, shared.id(), open, scope, send)
+                .unwrap()
+        );
+        let limit = std::num::NonZeroU32::new(2).unwrap();
+        let missing = crate::id::blob_id(b"unreferenced");
+        assert!(matches!(
+            writer.send_public_blob(missing, open, scope, std::num::NonZeroU32::MIN, denied),
+            Err(StorageError::BudgetExceeded)
+        ));
+        assert!(
+            !writer
+                .send_public_blob(missing, open, scope, limit, denied)
+                .unwrap()
+        );
+        assert!(
+            writer
+                .send_public_blob(blob, open, scope, limit, send)
+                .unwrap()
+        );
+        writer
+            .save_manual_publication_change(shared.id(), ManualPublicationChange::Revoke, "stop")
+            .unwrap();
+        assert!(
+            !writer
+                .send_public_blob(blob, open, scope, limit, denied)
                 .unwrap()
         );
         writer.finish().unwrap();
