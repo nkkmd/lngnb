@@ -1251,7 +1251,11 @@ mod tests {
             .unwrap();
         assert!(
             writer
-                .save_manual_publication_change(id, ManualPublicationChange::ApproveUntrusted, "show")
+                .save_manual_publication_change(
+                    id,
+                    ManualPublicationChange::ApproveUntrusted,
+                    "show"
+                )
                 .is_err()
         );
         assert_eq!(read(&writer.store.conn), (namespace, 2));
