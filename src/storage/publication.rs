@@ -130,6 +130,40 @@ fn load_permission(conn: &Connection, id: Id) -> Result<Option<SavedPublicationP
     }))
 }
 
+/// 空のscope_genesisは通常公開、32 bytesは未確認公開のGenesisを表す。
+fn advance_disclosure(
+    tx: &Transaction<'_>,
+    assessed: Option<(RecordPublication, LocalRecord)>,
+) -> Result<()> {
+    let Some((publication, record)) = assessed else {
+        return Ok(());
+    };
+    let genesis = match publication {
+        RecordPublication::Private => return Ok(()),
+        RecordPublication::Public => None,
+        RecordPublication::UntrustedPublic => {
+            Some(record.genesis().map_err(|_| StorageError::Corrupt)?)
+        }
+    };
+    let scope = genesis.as_ref().map_or(&[][..], |id| id.as_slice());
+    let knowledge = record.identity().knowledge;
+    if tx.execute(
+        "UPDATE disclosure_generations SET generation=generation+1
+         WHERE knowledge_id=?1 AND scope_genesis=?2",
+        params![knowledge, scope],
+    )? == 0
+    {
+        let mut namespace = [0u8; 32];
+        getrandom::getrandom(&mut namespace).map_err(|_| StorageError::RandomUnavailable)?;
+        tx.execute(
+            "INSERT INTO disclosure_generations(knowledge_id,scope_genesis,namespace,generation)
+             VALUES(?1,?2,?3,1)",
+            params![knowledge, scope, namespace],
+        )?;
+    }
+    Ok(())
+}
+
 impl RecordStore {
     /// 停止中の保存領域について、固定Record本体の配信可否を読み取る。
     /// gate は呼び出し側の運用制限。結果はこの読取り時点の判定で、送信許可証にはならない。
@@ -497,7 +531,12 @@ impl RecordWriter {
             if capacity.available <= capacity.reserved_floor.saturating_add(65536) {
                 return Err(StorageError::Capacity);
             }
-            let tx = self.store.conn.transaction()?;
+            let tx = self.store.conn.unchecked_transaction()?;
+            let assess = || {
+                self.store
+                    .assess_record_publication(id, DistributionGate::Open, None)
+            };
+            let before = assess()?;
             advance(&tx)?;
             let previous = match (old.permission, old.explicitly_stopped) {
                 (_, true) => "revoke",
@@ -520,6 +559,11 @@ impl RecordWriter {
             )? != 1
             {
                 return Err(StorageError::Corrupt);
+            }
+            let after = assess()?;
+            if before.as_ref().map(|(class, _)| class) != after.as_ref().map(|(class, _)| class) {
+                advance_disclosure(&tx, before)?;
+                advance_disclosure(&tx, after)?;
             }
             tx.commit()?;
             self.publication_block = None;
@@ -1157,6 +1201,67 @@ mod tests {
                 .record_publication(id, DistributionGate::Open)
                 .unwrap(),
             RecordPublication::Private
+        );
+    }
+
+    #[test]
+    fn manual_disclosure_generation_survives_reopen_and_failed_revocation() {
+        let temp = Temp::new();
+        let record = fixture();
+        let id = record.id();
+        let mut writer = temp.store().begin().unwrap();
+        writer.insert(&record).unwrap();
+        writer.revalidate(EvaluationLimits::default()).unwrap();
+        for reason in ["first", "repeat"] {
+            writer
+                .save_manual_publication_change(
+                    id,
+                    ManualPublicationChange::ApproveUntrusted,
+                    reason,
+                )
+                .unwrap();
+        }
+        let read = |conn: &Connection| {
+            conn.query_row(
+                "SELECT namespace,generation FROM disclosure_generations
+                 WHERE knowledge_id=?1 AND scope_genesis=?2",
+                params![record.identity().knowledge, id.bytes],
+                |r| Ok((r.get::<_, [u8; 32]>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .unwrap()
+        };
+        let (namespace, generation) = read(&writer.store.conn);
+        assert_eq!(generation, 1);
+        writer.finish().unwrap();
+        let mut writer = RecordStore::open(&temp.data(), Limits::default())
+            .unwrap()
+            .begin()
+            .unwrap();
+        writer
+            .save_manual_publication_change(id, ManualPublicationChange::Revoke, "hide")
+            .unwrap();
+        assert_eq!(read(&writer.store.conn), (namespace, 2));
+        writer
+            .store
+            .conn
+            .execute_batch(
+                "CREATE TEMP TRIGGER reject_generation BEFORE UPDATE ON disclosure_generations
+             BEGIN SELECT RAISE(ABORT,'test'); END;",
+            )
+            .unwrap();
+        assert!(
+            writer
+                .save_manual_publication_change(id, ManualPublicationChange::ApproveUntrusted, "show")
+                .is_err()
+        );
+        assert_eq!(read(&writer.store.conn), (namespace, 2));
+        assert!(
+            writer
+                .store
+                .saved_publication_permission(id)
+                .unwrap()
+                .unwrap()
+                .explicitly_stopped
         );
     }
 
