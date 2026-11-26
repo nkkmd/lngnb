@@ -174,7 +174,7 @@ impl RecordStore {
                 ("", None)
             };
             let sql = format!(
-                "SELECT record_id,knowledge_id,genesis,visible_scope,visible_payload FROM disclosure_records{selector}"
+                "SELECT record_id,knowledge_id,genesis,visible_scope,visible_payload,visible_reason FROM disclosure_records{selector}"
             );
             let mut stmt = tx.prepare(&sql)?;
             let mut rows = stmt.query(rusqlite::params_from_iter(key.iter()))?;
@@ -228,16 +228,18 @@ impl RecordStore {
                         None => None,
                     }
                 };
-                let old_payload: Option<String> = row.get(4)?;
+                let old_payload: (Option<String>, Option<String>) = (row.get(4)?, row.get(5)?);
                 let new_payload = if new.is_none() {
-                    None
+                    (None, None)
                 } else if dirty {
                     old_payload.clone()
                 } else {
                     tx.query_row(
-                        "SELECT payload FROM evaluations WHERE record_id=?1",
+                        "SELECT payload,CASE WHEN payload='unavailable' AND payload_reason IN
+                         ('transfer_hash_mismatch','transfer_failed','storage_corruption')
+                         THEN payload_reason END FROM evaluations WHERE record_id=?1",
                         [&id.bytes],
-                        |row| row.get(0),
+                        |row| Ok((row.get(0)?, row.get(1)?)),
                     )?
                 };
                 if old != new || old_payload != new_payload {
@@ -248,10 +250,10 @@ impl RecordStore {
                 }
             }
         }
-        for (id, scope, payload) in updates {
+        for (id, scope, (payload, reason)) in updates {
             tx.execute(
-                "UPDATE disclosure_records SET visible_scope=?1,visible_payload=?2 WHERE record_id=?3",
-                params![scope, payload, id],
+                "UPDATE disclosure_records SET visible_scope=?1,visible_payload=?2,visible_reason=?3 WHERE record_id=?4",
+                params![scope, payload, reason, id],
             )?;
         }
         for (knowledge, scope) in changed {
@@ -425,6 +427,75 @@ impl RecordWriter {
             return Ok(false);
         }
         send(record.bytes()).map_err(StorageError::Io)?;
+        Ok(true)
+    }
+
+    pub(crate) fn send_fixed_verification(
+        &mut self,
+        id: Id,
+        gate: DistributionGate,
+        scope: FixedRecordScope,
+        send: impl FnOnce(&[u8]) -> std::io::Result<()>,
+    ) -> Result<bool> {
+        if !self.began_clean
+            || self.failed
+            || self.publication_block == Some(id)
+            || self.store.blob_recovery.needs_review()
+        {
+            return Ok(false);
+        }
+        let result: Result<_> = (|| {
+            let tx = self.store.conn.unchecked_transaction()?;
+            let (expected, requested) = scope.publication_target();
+            let assessed = self.store.assess_record_publication(id, gate, requested)?;
+            let Some((_, record)) = assessed.filter(|(class, _)| *class == expected) else {
+                return Ok(None);
+            };
+            let genesis = Id {
+                kind: Kind::Record,
+                bytes: record.genesis().map_err(|_| StorageError::Corrupt)?,
+            };
+            let knowledge = Id {
+                kind: Kind::Knowledge,
+                bytes: record.identity().knowledge,
+            };
+            let (label, anchor, key): (_, _, &[u8]) = match scope {
+                FixedRecordScope::Public { .. } => ("public", "pinned", &[]),
+                FixedRecordScope::Untrusted { .. } => ("untrusted", "untrusted", &genesis.bytes),
+            };
+            let (ns, generation, payload, reason) = tx.query_row(
+                "SELECT g.namespace,g.generation,r.visible_payload,r.visible_reason
+                 FROM disclosure_records r JOIN disclosure_generations g
+                 ON g.knowledge_id=r.knowledge_id AND g.scope_genesis=r.visible_scope
+                 WHERE r.record_id=?1 AND r.knowledge_id=?2 AND r.genesis=?3 AND r.visible_scope=?4",
+                params![id.bytes,knowledge.bytes,genesis.bytes,key],
+                |r| Ok((r.get::<_,[u8;32]>(0)?, r.get::<_,i64>(1)?, r.get::<_,Option<String>>(2)?, r.get::<_,Option<String>>(3)?)),
+            )?;
+            let namespace = format!(
+                "ns1_{}",
+                data_encoding::BASE32_NOPAD.encode(&ns).to_ascii_lowercase()
+            );
+            let mut state = serde_json::json!({"namespace": namespace, "generation": generation.to_string(), "scope": label});
+            if label == "untrusted" {
+                state["candidate_genesis_id"] = genesis.to_string().into();
+            }
+            let body = serde_json::json!({
+                "api_version":"lngnb-http-1", "record_id":id.to_string(), "knowledge_id":knowledge.to_string(),
+                "genesis_record_id":genesis.to_string(), "local_state":state, "record_validation":"valid",
+                "rules_version":"lngnb-validation-1", "trust_anchor":anchor, "payload_status":payload,
+                "reasons":reason.into_iter().collect::<Vec<_>>(),
+                "evaluation_ref":format!("lngnb-eval:1:{namespace}:{knowledge}:{label}:{genesis}:{generation}")
+            });
+            tx.commit()?;
+            Ok(Some(body))
+        })();
+        if result.is_err() {
+            self.failed = true;
+        }
+        let Some(body) = result? else {
+            return Ok(false);
+        };
+        send(body.to_string().as_bytes()).map_err(StorageError::Io)?;
         Ok(true)
     }
 
@@ -739,12 +810,17 @@ mod tests {
             .unwrap();
         writer.revalidate(EvaluationLimits::default()).unwrap();
         assert_eq!(state(&writer), expected(2, "unavailable"));
+        writer
+            .observe_blob_failure(blob, "transfer_hash_mismatch")
+            .unwrap();
+        writer.revalidate(EvaluationLimits::default()).unwrap();
+        assert_eq!(state(&writer), expected(3, "unavailable"));
         writer.put_blob(blob, payload.as_slice()).unwrap();
-        assert_eq!(state(&writer), expected(2, "unavailable"));
+        assert_eq!(state(&writer), expected(3, "unavailable"));
         writer.revalidate(EvaluationLimits::default()).unwrap();
-        assert_eq!(state(&writer), expected(3, "verified"));
+        assert_eq!(state(&writer), expected(4, "verified"));
         writer.revalidate(EvaluationLimits::default()).unwrap();
-        assert_eq!(state(&writer), expected(3, "verified"));
+        assert_eq!(state(&writer), expected(4, "verified"));
         writer.finish().unwrap();
     }
 
@@ -969,11 +1045,7 @@ mod tests {
             .unwrap();
         let path = format!("/v1/records/{id}");
         let target = format!("{path}?scope=untrusted&genesis_id={id}");
-        for target in [
-            "/v1/records",
-            "/v1/records/",
-            &format!("{path}/verification"),
-        ] {
+        for target in ["/v1/records", "/v1/records/", &format!("{path}/unknown")] {
             assert!(
                 !route_fixed_record_request(
                     &mut writer,

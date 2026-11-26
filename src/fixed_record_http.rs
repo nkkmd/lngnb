@@ -534,11 +534,27 @@ pub fn route_fixed_record_request(
     let Some(record_id) = path.strip_prefix("/v1/records/") else {
         return Ok(false);
     };
+    let verification = record_id.strip_suffix("/verification");
+    let record_id = verification.unwrap_or(record_id);
     if record_id.is_empty() || record_id.contains('/') {
         return Ok(false);
     }
     if method == "GET" {
-        send_fixed_record_get(writer, gate, record_id, query, send)?;
+        if verification.is_some() {
+            let (Ok(id), Some(scope)) = (Id::parse(Kind::Record, record_id), parse_scope(query))
+            else {
+                send(400, JSON, INVALID)?;
+                return Ok(true);
+            };
+            let mut send = Some(send);
+            if !writer.send_fixed_verification(id, gate, scope, |bytes| {
+                send.take().expect("single response")(200, JSON, bytes)
+            })? {
+                send.expect("response not started")(404, JSON, UNAVAILABLE)?;
+            }
+        } else {
+            send_fixed_record_get(writer, gate, record_id, query, send)?;
+        }
     } else {
         send(405, JSON, METHOD_NOT_ALLOWED)?;
     }
