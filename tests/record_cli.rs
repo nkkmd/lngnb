@@ -585,6 +585,40 @@ fn foreground_https_serves_verified_record_after_failed_connections() {
         client.read_to_end(&mut response).unwrap();
         response
     };
+    let verification = |target| {
+        let mut client = verified_https_client(&cert, address);
+        write!(
+            client,
+            "GET /v1/records/{target}/verification?scope=untrusted&genesis_id={id} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        )
+        .unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        response
+    };
+    for (target, status) in [
+        (id, serde_json::Value::Null),
+        (first.id(), "verified".into()),
+    ] {
+        let response = verification(target);
+        assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        let start = response.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        let body: serde_json::Value = serde_json::from_slice(&response[start..]).unwrap();
+        assert_eq!(body["record_id"], target.to_string());
+        assert_eq!(body["payload_status"], status);
+        assert_eq!(body["reasons"], serde_json::json!([]));
+        assert_eq!(body["trust_anchor"], "untrusted");
+        assert_eq!(body["local_state"]["candidate_genesis_id"], id.to_string());
+        assert_eq!(
+            body["evaluation_ref"],
+            format!(
+                "lngnb-eval:1:{}:{}:untrusted:{id}:{}",
+                body["local_state"]["namespace"].as_str().unwrap(),
+                body["knowledge_id"].as_str().unwrap(),
+                body["local_state"]["generation"].as_str().unwrap()
+            )
+        );
+    }
     for revision in [&first, &shared] {
         let response = get_blob(blob);
         let split = response.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
@@ -605,6 +639,9 @@ fn foreground_https_serves_verified_record_after_failed_connections() {
                 .success()
         );
     }
+    let revoked = verification(first.id());
+    assert!(revoked.starts_with(b"HTTP/1.1 404 Not Found\r\n"));
+    assert_eq!(revoked, verification(lngnb::id::record_id(b"missing")));
     let hidden = get_blob(blob);
     assert!(hidden.starts_with(b"HTTP/1.1 404 Not Found\r\n"));
     assert_eq!(hidden, get_blob(lngnb::id::blob_id(b"missing")));

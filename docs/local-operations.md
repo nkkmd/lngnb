@@ -202,7 +202,7 @@ lngnb key recover-cleanup-start --key-dir PATH --residue .lngnb-key-HEX \
 
 ## 保存領域
 
-試作DBはschema 18のみ対応します。schema 1〜17を自動移行・再初期化せず、旧DBは保持したまま別の新規領域で試験します。
+試作DBはschema 19のみ対応します。schema 1〜18を自動移行・再初期化せず、旧DBは保持したまま別の新規領域で試験します。
 
 保存領域の初期化と状態診断は、対象を明示します。
 
@@ -219,7 +219,7 @@ lngnb key recover-cleanup-start --key-dir PATH --residue .lngnb-key-HEX \
 
 ### 新規資料
 
-新規資料は、schema 18・正常停止状態のデータ領域と、残存物のない鍵領域を明示して作成します。保存領域は[保存領域節の`data init`](#保存領域)で作成できます。資料作成そのものは領域の新規作成・復旧を行いません。期待鍵IDは事前の`key check`等の控えと照合してください。metadata入力は仕様書A2の項目を持つ決定的CBOR mapです。言語ラベルの小文字化・型の既定値補完は署名前に行い、衝突は拒否します。
+新規資料は、schema 19・正常停止状態のデータ領域と、残存物のない鍵領域を明示して作成します。保存領域は[保存領域節の`data init`](#保存領域)で作成できます。資料作成そのものは領域の新規作成・復旧を行いません。期待鍵IDは事前の`key check`等の控えと照合してください。metadata入力は仕様書A2の項目を持つ決定的CBOR mapです。言語ラベルの小文字化・型の既定値補完は署名前に行い、衝突は拒否します。
 
 ```sh
 ./target/release/lngnb document create --data-dir /path/to/existing-data --key-dir /path/to/private-keys --name publisher --expect-key-id EXPECTED_KEY_ID --payload /path/to/body --metadata /path/to/metadata.cbor
