@@ -254,3 +254,7 @@ ENOENT、接続拒否、排他取得、PID不在、metadata一致だけでは、
 保持中socketの個別inode/cookie照会方式は、[実装計画書§5.88](implementation-plan.md#588-工程⑤inodecookieによる保持socket照会の非破壊方式検証)の試験専用probeで検証します。製品の診断/整理操作ではなく、作成元の永続来歴や削除資格はまだ提供しません。
 
 明示した新規主socketに限る、非永続の作成根拠取得/現在照合の内部APIを追加しています（[計画書§5.89](implementation-plan.md#589-工程⑤明示した新規主socketの非永続作成根拠と現在照合)）。同じ根拠/context/pathに束縛した期限付きkernel個別照会も内部APIへ接続しています（[計画書§5.90](implementation-plan.md#590-工程⑤非永続根拠に束縛した期限付きkernel個別照会)）。補助3socketにも非永続作成根拠・共通生存診断を適用しています（[計画書§5.92](implementation-plan.md#592-工程⑤補助3socketの非永続作成根拠と共通生存診断)）。製品CLI・永続来歴・不使用/削除資格には未接続です。ENOENTは対象不在と診断機能未提供を区別できないため取得不能として拒否し、不在の成功値や整理許可を返しません。
+
+### 固定Recordの評価来歴
+
+停止中の領域で `lngnb admin evaluation-history --data-dir PATH --evaluation-ref REF --record-id RECORD_ID` を実行します。固定verificationの応答から評価参照とRecord IDを取得してください。同じ参照は同じ範囲の複数のRecordに共通するため、両方を指定します。JSONには指定世代と、その時点までの対象Recordの最終変更世代、確定済みの本文状態・理由・検証規則が含まれます。公開取消し後も取消し前の参照で当時の状態を確認できます。指定世代に非開示だったRecord、未知の世代、異なる範囲、稼働中の排他競合はエラーで終了します。

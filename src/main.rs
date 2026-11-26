@@ -51,6 +51,7 @@ const HELP: &str = "lngnb — 分散図書館・知識基盤（開発初期段�
   lngnb record unpin --data-dir PATH --knowledge-id ID --reason TEXT
   lngnb record approve-publication --data-dir PATH --record-id ID --mode public|untrusted --reason TEXT
   lngnb record revoke-publication --data-dir PATH --record-id ID --reason TEXT
+  lngnb admin evaluation-history --data-dir PATH --evaluation-ref REF --record-id RECORD_ID
   lngnb document history --data-dir PATH --knowledge-id KNOWLEDGE_ID --genesis-id GENESIS_ID
   lngnb document inspect --data-dir PATH --knowledge-id KNOWLEDGE_ID --genesis-id GENESIS_ID --revision-id REVISION_ID
   lngnb document create --data-dir PATH --key-dir PATH --name NAME --expect-key-id KEY_ID --payload PATH --metadata PATH [--media-type TYPE] [--max-payload-bytes N]

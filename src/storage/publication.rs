@@ -254,18 +254,33 @@ impl RecordStore {
                     for scope in old.iter().chain(new.iter()) {
                         changed.insert((knowledge.bytes, scope.clone()));
                     }
-                    updates.push((id.bytes, new, new_payload));
+                    updates.push((id.bytes, knowledge.bytes, genesis, old, new, new_payload));
                 }
             }
         }
-        for (id, scope, (payload, reason)) in updates {
-            tx.execute(
-                "UPDATE disclosure_records SET visible_scope=?1,visible_payload=?2,visible_reason=?3 WHERE record_id=?4",
-                params![scope, payload, reason, id],
-            )?;
-        }
         for (knowledge, scope) in changed {
             advance_disclosure(tx, &knowledge, &scope)?;
+        }
+        for (id, knowledge, genesis, old, new, (payload, reason)) in updates {
+            tx.execute(
+                "UPDATE disclosure_records SET visible_scope=?1,visible_payload=?2,visible_reason=?3 WHERE record_id=?4",
+                params![new, payload, reason, id],
+            )?;
+            // 移動元には非開示への変更、移動先には新たな開示内容だけを記録する。
+            let removed = old.as_ref().filter(|scope| Some(*scope) != new.as_ref());
+            for scope in removed.into_iter().chain(new.as_ref()) {
+                let visible = Some(scope) == new.as_ref();
+                if tx.execute(
+                    "INSERT INTO disclosure_history(namespace,generation,record_id,genesis,visible,payload,reason,rules)
+                     SELECT namespace,generation,?3,?4,?5,CASE WHEN ?5 THEN ?6 END,
+                     CASE WHEN ?5 THEN ?7 END,'lngnb-validation-1' FROM disclosure_generations
+                     WHERE knowledge_id=?1 AND scope_genesis=?2",
+                    params![knowledge, scope, id, genesis, visible, payload, reason],
+                )? != 1
+                {
+                    return Err(StorageError::Corrupt);
+                }
+            }
         }
         Ok(())
     }
@@ -1519,6 +1534,18 @@ mod tests {
                 .is_err()
         );
         assert_eq!(read(&writer.store.conn), (namespace, 2));
+        let mut stmt = writer.store.conn.prepare(
+            "SELECT generation,visible FROM disclosure_history WHERE namespace=?1 AND record_id=?2
+             AND genesis=?2 AND payload IS NULL AND reason IS NULL ORDER BY generation",
+        ).unwrap();
+        let history = stmt
+            .query_map(params![namespace, id.bytes], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(history, [(1, true), (2, false)]);
         assert!(
             writer
                 .store
