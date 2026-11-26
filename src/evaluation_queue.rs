@@ -459,7 +459,7 @@ impl EvaluationJob {
         if self.pause_at == Some("eval_input_ready") {
             test_pause("eval_input_ready");
         }
-        let tx = self.writer.store.conn.transaction()?;
+        let tx = self.writer.store.conn.unchecked_transaction()?;
         tx.execute(
             "UPDATE evaluation_state SET dirty=1,job_started=1 WHERE singleton=1",
             [],
@@ -485,6 +485,8 @@ impl EvaluationJob {
         }
         if complete {
             publish(&tx, &mut c, limits)?;
+            self.writer.store.refresh_disclosures(&tx, None, None)?;
+            c.budget.check()?;
         }
         advance(&tx)?;
         // 部分ジョブで学習した不正根拠も失わない。評価全体の公開確定とは区別する。
