@@ -1505,6 +1505,36 @@ mod tests {
             )
             .unwrap()
         };
+        let scoped_ids = "SELECT record_id FROM disclosure_records
+            WHERE knowledge_id=?1 AND visible_scope=?2 AND genesis=?3 ORDER BY record_id";
+        let selected = |conn: &Connection, scope: &[u8], genesis: &[u8; 32]| {
+            conn.prepare(scoped_ids)
+                .unwrap()
+                .query_map(params![record.identity().knowledge, scope, genesis], |r| {
+                    r.get::<_, [u8; 32]>(0)
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        let plan: String = writer
+            .store
+            .conn
+            .query_row(
+                &format!("EXPLAIN QUERY PLAN {scoped_ids}"),
+                params![record.identity().knowledge, id.bytes, id.bytes],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(plan.contains("SEARCH") && plan.contains("disclosure_records_by_scope"));
+        assert_eq!(
+            selected(&writer.store.conn, &id.bytes, &id.bytes),
+            [id.bytes]
+        );
+        assert!(selected(&writer.store.conn, &[], &id.bytes).is_empty());
+        let mut other = id.bytes;
+        other[0] ^= 1;
+        assert!(selected(&writer.store.conn, &other, &other).is_empty());
         let (namespace, generation) = read(&writer.store.conn);
         assert_eq!(generation, 1);
         writer.finish().unwrap();
@@ -1516,6 +1546,7 @@ mod tests {
             .save_manual_publication_change(id, ManualPublicationChange::Revoke, "hide")
             .unwrap();
         assert_eq!(read(&writer.store.conn), (namespace, 2));
+        assert!(selected(&writer.store.conn, &id.bytes, &id.bytes).is_empty());
         writer
             .store
             .conn
@@ -1534,6 +1565,7 @@ mod tests {
                 .is_err()
         );
         assert_eq!(read(&writer.store.conn), (namespace, 2));
+        assert!(selected(&writer.store.conn, &id.bytes, &id.bytes).is_empty());
         let mut stmt = writer.store.conn.prepare(
             "SELECT generation,visible FROM disclosure_history WHERE namespace=?1 AND record_id=?2
              AND genesis=?2 AND payload IS NULL AND reason IS NULL ORDER BY generation",

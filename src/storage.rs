@@ -16,7 +16,7 @@ use std::{
 };
 
 pub const IMPLEMENTATION: &str = "lngnb-rust-sqlite-1";
-pub const SCHEMA_VERSION: i64 = 20;
+pub const SCHEMA_VERSION: i64 = 21;
 const DB: &str = "database.sqlite";
 const SCHEMA: &str = "
 CREATE TABLE storage_state (
@@ -255,6 +255,8 @@ CREATE TABLE disclosure_records (
    visible_reason IN ('transfer_hash_mismatch','transfer_failed','storage_corruption')))
 ) STRICT;
 CREATE INDEX disclosure_records_by_knowledge ON disclosure_records(knowledge_id,record_id);
+CREATE INDEX disclosure_records_by_scope ON disclosure_records(knowledge_id,visible_scope,genesis,record_id)
+ WHERE visible_scope IS NOT NULL;
 CREATE TABLE disclosure_generations (
  knowledge_id BLOB NOT NULL CHECK(length(knowledge_id)=32),
  scope_genesis BLOB NOT NULL CHECK(length(scope_genesis) IN (0,32)),
