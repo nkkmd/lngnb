@@ -488,10 +488,8 @@ impl RecordWriter {
                 FixedRecordScope::Untrusted { .. } => ("untrusted", "untrusted", &genesis.bytes),
             };
             let (ns, generation, payload, reason) = tx.query_row(
-                "SELECT g.namespace,g.generation,r.visible_payload,r.visible_reason
-                 FROM disclosure_records r JOIN disclosure_generations g
-                 ON g.knowledge_id=r.knowledge_id AND g.scope_genesis=r.visible_scope
-                 WHERE r.record_id=?1 AND r.knowledge_id=?2 AND r.genesis=?3 AND r.visible_scope=?4",
+                "SELECT namespace,generation,visible_payload,visible_reason FROM scoped_disclosures
+                 WHERE record_id=?1 AND knowledge_id=?2 AND genesis=?3 AND visible_scope=?4",
                 params![id.bytes,knowledge.bytes,genesis.bytes,key],
                 |r| Ok((r.get::<_,[u8;32]>(0)?, r.get::<_,i64>(1)?, r.get::<_,Option<String>>(2)?, r.get::<_,Option<String>>(3)?)),
             )?;
@@ -789,6 +787,51 @@ mod tests {
     use super::*;
 
     use crate::storage::tests::{Temp, fixture, logical_snapshot};
+
+    #[test]
+    fn scoped_rows_exclude_private_records_and_other_genesis_candidates() {
+        let conn = Connection::open_in_memory().unwrap();
+        // This fixture isolates the disclosure projection from Record decoding.
+        conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        let knowledge = [1u8; 32];
+        let empty: &[u8] = &[];
+        let a = [2u8; 32];
+        let b = [3u8; 32];
+        for (scope, namespace, generation) in [(empty, a, 7), (&b[..], b, 9)] {
+            conn.execute(
+                "INSERT INTO disclosure_generations VALUES(?1,?2,?3,?4)",
+                params![knowledge, scope, namespace, generation],
+            )
+            .unwrap();
+        }
+        for (id, genesis, scope) in [(a, a, Some(empty)), (b, b, Some(&b[..])), ([4; 32], a, None)]
+        {
+            conn.execute(
+                "INSERT INTO disclosure_records(record_id,knowledge_id,genesis,visible_scope)
+                 VALUES(?1,?2,?3,?4)",
+                params![id, knowledge, genesis, scope],
+            )
+            .unwrap();
+        }
+        let rows = |scope: &[u8], genesis: [u8; 32]| {
+            conn.prepare(
+                "SELECT record_id,generation FROM scoped_disclosures
+                 WHERE knowledge_id=?1 AND visible_scope=?2 AND genesis=?3 ORDER BY record_id",
+            )
+            .unwrap()
+            .query_map(params![knowledge, scope, genesis], |row| {
+                Ok((row.get::<_, [u8; 32]>(0)?, row.get::<_, i64>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+        };
+        assert_eq!(rows(empty, a), [(a, 7)]);
+        assert_eq!(rows(&b, b), [(b, 9)]);
+        assert!(rows(empty, b).is_empty());
+        assert!(rows(&a, a).is_empty());
+    }
 
     #[test]
     fn disclosed_payload_changes_only_on_committed_visible_status_changes() {

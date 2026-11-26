@@ -16,7 +16,7 @@ use std::{
 };
 
 pub const IMPLEMENTATION: &str = "lngnb-rust-sqlite-1";
-pub const SCHEMA_VERSION: i64 = 20;
+pub const SCHEMA_VERSION: i64 = 21;
 const DB: &str = "database.sqlite";
 const SCHEMA: &str = "
 CREATE TABLE storage_state (
@@ -262,6 +262,13 @@ CREATE TABLE disclosure_generations (
  generation INTEGER NOT NULL CHECK(generation>=1),
  PRIMARY KEY(knowledge_id,scope_genesis)
 ) STRICT;
+CREATE INDEX scoped_disclosure_members ON disclosure_records(knowledge_id,visible_scope,genesis,record_id)
+ WHERE visible_scope IS NOT NULL;
+CREATE VIEW scoped_disclosures AS
+ SELECT r.record_id,r.knowledge_id,r.genesis,r.visible_scope,r.visible_payload,r.visible_reason,
+        g.namespace,g.generation
+ FROM disclosure_records r JOIN disclosure_generations g
+ ON g.knowledge_id=r.knowledge_id AND g.scope_genesis=r.visible_scope;
 CREATE TABLE disclosure_history (
  namespace BLOB NOT NULL REFERENCES disclosure_generations(namespace),
  generation INTEGER NOT NULL CHECK(generation>=1),
