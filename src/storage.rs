@@ -1081,6 +1081,7 @@ pub use sql_inspection::SqlInspectionBudget;
 mod filesystem_tests;
 
 mod publication;
+pub(crate) use publication::FixedRecordState;
 pub use publication::{
     DistributionGate, FixedRecordScope, ManualPublicationChange, PublicationAnchor,
     PublicationPermission, RecordPublication, SavedPublicationPermission,

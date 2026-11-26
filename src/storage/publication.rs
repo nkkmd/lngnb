@@ -2,6 +2,14 @@
 
 use super::*;
 
+pub(crate) struct FixedRecordState {
+    pub namespace: String,
+    pub generation: i64,
+    pub scope: &'static str,
+    pub knowledge: Id,
+    pub genesis: Id,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum PublicationPermission {
     #[default]
@@ -430,12 +438,13 @@ impl RecordWriter {
         Ok(true)
     }
 
-    pub(crate) fn send_fixed_verification(
+    pub(crate) fn send_fixed_representation(
         &mut self,
         id: Id,
         gate: DistributionGate,
         scope: FixedRecordScope,
-        send: impl FnOnce(&[u8]) -> std::io::Result<()>,
+        verification: bool,
+        send: impl FnOnce(&[u8], Option<&FixedRecordState>) -> std::io::Result<()>,
     ) -> Result<bool> {
         if !self.began_clean
             || self.failed
@@ -475,27 +484,40 @@ impl RecordWriter {
                 "ns1_{}",
                 data_encoding::BASE32_NOPAD.encode(&ns).to_ascii_lowercase()
             );
-            let mut state = serde_json::json!({"namespace": namespace, "generation": generation.to_string(), "scope": label});
-            if label == "untrusted" {
-                state["candidate_genesis_id"] = genesis.to_string().into();
-            }
-            let body = serde_json::json!({
-                "api_version":"lngnb-http-1", "record_id":id.to_string(), "knowledge_id":knowledge.to_string(),
-                "genesis_record_id":genesis.to_string(), "local_state":state, "record_validation":"valid",
-                "rules_version":"lngnb-validation-1", "trust_anchor":anchor, "payload_status":payload,
-                "reasons":reason.into_iter().collect::<Vec<_>>(),
-                "evaluation_ref":format!("lngnb-eval:1:{namespace}:{knowledge}:{label}:{genesis}:{generation}")
+            let body = verification.then(|| {
+                let mut state = serde_json::json!({"namespace": namespace, "generation": generation.to_string(), "scope": label});
+                if label == "untrusted" {
+                    state["candidate_genesis_id"] = genesis.to_string().into();
+                }
+                serde_json::json!({
+                    "api_version":"lngnb-http-1", "record_id":id.to_string(), "knowledge_id":knowledge.to_string(),
+                    "genesis_record_id":genesis.to_string(), "local_state":state, "record_validation":"valid",
+                    "rules_version":"lngnb-validation-1", "trust_anchor":anchor, "payload_status":payload,
+                    "reasons":reason.into_iter().collect::<Vec<_>>(),
+                    "evaluation_ref":format!("lngnb-eval:1:{namespace}:{knowledge}:{label}:{genesis}:{generation}")
+                }).to_string()
             });
+            let state = FixedRecordState {
+                namespace,
+                generation,
+                scope: label,
+                knowledge,
+                genesis,
+            };
             tx.commit()?;
-            Ok(Some(body))
+            Ok(Some((record, state, body)))
         })();
         if result.is_err() {
             self.failed = true;
         }
-        let Some(body) = result? else {
+        let Some((record, state, body)) = result? else {
             return Ok(false);
         };
-        send(body.to_string().as_bytes()).map_err(StorageError::Io)?;
+        match body {
+            Some(body) => send(body.as_bytes(), None),
+            None => send(record.bytes(), Some(&state)),
+        }
+        .map_err(StorageError::Io)?;
         Ok(true)
     }
 

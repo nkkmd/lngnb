@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::id::{Id, Kind};
+use crate::storage::FixedRecordState;
 use crate::storage::{DistributionGate, FixedRecordScope, RecordWriter, StorageError};
 
 const JSON: &str = "application/json";
@@ -379,21 +380,13 @@ fn serve_request(
             return Ok(true);
         }
     }
-    route_fixed_record_request(
+    send_record_http(
         writer,
         gate,
         method,
         target,
-        |status, content_type, bytes| {
-            write_response(
-                *reader.get_mut(),
-                write_deadline,
-                method,
-                status,
-                content_type,
-                bytes,
-            )
-        },
+        *reader.get_mut(),
+        write_deadline,
     )
 }
 
@@ -523,8 +516,20 @@ pub fn route_fixed_record_request(
     target: &str,
     send: impl FnOnce(u16, &'static str, &[u8]) -> io::Result<()>,
 ) -> Result<bool, StorageError> {
+    route_record(writer, gate, method, target, |status, mime, bytes, _| {
+        send(status, mime, bytes)
+    })
+}
+
+fn route_record(
+    writer: &mut RecordWriter,
+    gate: DistributionGate,
+    method: &str,
+    target: &str,
+    send: impl FnOnce(u16, &'static str, &[u8], Option<&FixedRecordState>) -> io::Result<()>,
+) -> Result<bool, StorageError> {
     if target.len() > REQUEST_TARGET_LIMIT {
-        send(400, JSON, INVALID)?;
+        send(400, JSON, INVALID, None)?;
         return Ok(true);
     }
     let (path, query) = match target.split_once('?') {
@@ -540,23 +545,20 @@ pub fn route_fixed_record_request(
         return Ok(false);
     }
     if method == "GET" {
-        if verification.is_some() {
-            let (Ok(id), Some(scope)) = (Id::parse(Kind::Record, record_id), parse_scope(query))
-            else {
-                send(400, JSON, INVALID)?;
-                return Ok(true);
-            };
-            let mut send = Some(send);
-            if !writer.send_fixed_verification(id, gate, scope, |bytes| {
-                send.take().expect("single response")(200, JSON, bytes)
-            })? {
-                send.expect("response not started")(404, JSON, UNAVAILABLE)?;
-            }
-        } else {
-            send_fixed_record_get(writer, gate, record_id, query, send)?;
+        let (Ok(id), Some(scope)) = (Id::parse(Kind::Record, record_id), parse_scope(query)) else {
+            send(400, JSON, INVALID, None)?;
+            return Ok(true);
+        };
+        let verify = verification.is_some();
+        let mime = if verify { JSON } else { "application/cbor" };
+        let mut send = Some(send);
+        if !writer.send_fixed_representation(id, gate, scope, verify, |bytes, state| {
+            send.take().expect("single response")(200, mime, bytes, state)
+        })? {
+            send.expect("response not started")(404, JSON, UNAVAILABLE, None)?;
         }
     } else {
-        send(405, JSON, METHOD_NOT_ALLOWED)?;
+        send(405, JSON, METHOD_NOT_ALLOWED, None)?;
     }
     Ok(true)
 }
@@ -572,13 +574,28 @@ pub fn send_fixed_record_response(
     stream: &mut TcpStream,
     deadline: Instant,
 ) -> Result<bool, StorageError> {
-    route_fixed_record_request(
+    send_record_http(writer, gate, method, target, stream, deadline)
+}
+
+fn send_record_http(
+    writer: &mut RecordWriter,
+    gate: DistributionGate,
+    method: &str,
+    target: &str,
+    stream: &mut impl RequestStream,
+    deadline: Instant,
+) -> Result<bool, StorageError> {
+    route_record(
         writer,
         gate,
         method,
         target,
-        |status, content_type, bytes| {
-            write_response(stream, deadline, method, status, content_type, bytes)
+        |status, mime, bytes, state| {
+            let headers = state.map(|s| format!(
+            "LNGNB-State-Namespace: {}\r\nLNGNB-State-Generation: {}\r\nLNGNB-State-Scope: {}\r\nLNGNB-Knowledge-ID: {}\r\nLNGNB-Genesis-ID: {}\r\n",
+            s.namespace, s.generation, s.scope, s.knowledge, s.genesis
+        )).unwrap_or_default();
+            write_response_with_headers(stream, deadline, method, status, mime, bytes, &headers)
         },
     )
 }
@@ -591,6 +608,18 @@ fn write_response(
     content_type: &str,
     bytes: &[u8],
 ) -> io::Result<()> {
+    write_response_with_headers(stream, deadline, method, status, content_type, bytes, "")
+}
+
+fn write_response_with_headers(
+    stream: &mut impl RequestStream,
+    deadline: Instant,
+    method: &str,
+    status: u16,
+    content_type: &str,
+    bytes: &[u8],
+    headers: &str,
+) -> io::Result<()> {
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
@@ -601,7 +630,7 @@ fn write_response(
     let allow = if status == 405 { "Allow: GET\r\n" } else { "" };
     let head = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\n\
-         Content-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n{allow}\r\n",
+         Content-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n{allow}{headers}\r\n",
         bytes.len()
     );
     write_before(stream, deadline, head.as_bytes())?;
