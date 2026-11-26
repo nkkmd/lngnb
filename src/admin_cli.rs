@@ -17,6 +17,7 @@ enum Action {
     Probe,
     Status,
     Evaluate,
+    EvaluationHistory(lngnb::storage::EvaluationReference, lngnb::id::Id),
     ShowConfig,
     SocketInventory,
     Serve(Overrides),
@@ -26,7 +27,7 @@ enum Action {
 pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
     let usage = || {
         AppError::Usage(
-            "admin probe/status/evaluate/serve/config-save/config-show/config-change/socket-inventory の操作・明示領域・設定値を確認してください",
+            "admin probe/status/evaluate/evaluation-history/serve/config-save/config-show/config-change/socket-inventory の操作・明示領域・設定値を確認してください",
         )
     };
     let [action, rest @ ..] = args else {
@@ -35,6 +36,7 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
     if action != "probe"
         && action != "status"
         && action != "evaluate"
+        && action != "evaluation-history"
         && action != "serve"
         && action != "config-save"
         && action != "config-show"
@@ -45,6 +47,8 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
     }
     let accepts_config = action == "serve" || action == "config-save" || action == "config-change";
     let mut data = None;
+    let mut reference = None;
+    let mut record = None;
     let mut dev_http_listen = None;
     let mut https_listen = None;
     let mut https_cert = None;
@@ -75,6 +79,21 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
             return Err(usage());
         }
         match option.to_str() {
+            Some("--evaluation-ref") if action == "evaluation-history" && reference.is_none() => {
+                reference = Some(
+                    lngnb::storage::EvaluationReference::parse(value.to_str().ok_or_else(usage)?)
+                        .ok_or_else(usage)?,
+                );
+            }
+            Some("--record-id") if action == "evaluation-history" && record.is_none() => {
+                record = Some(
+                    lngnb::id::Id::parse(
+                        lngnb::id::Kind::Record,
+                        value.to_str().ok_or_else(usage)?,
+                    )
+                    .map_err(|_| usage())?,
+                );
+            }
             Some("--data-dir") if data.is_none() => data = Some(PathBuf::from(value)),
             Some("--dev-http-listen") if action == "serve" && dev_http_listen.is_none() => {
                 dev_http_listen = Some(
@@ -204,6 +223,8 @@ pub fn parse(args: &[OsString]) -> Result<Command, AppError> {
     }
     let action = if action == "probe" {
         Action::Probe
+    } else if action == "evaluation-history" {
+        Action::EvaluationHistory(reference.ok_or_else(usage)?, record.ok_or_else(usage)?)
     } else if action == "evaluate" {
         Action::Evaluate
     } else if action == "status" {
@@ -305,6 +326,8 @@ pub enum Error {
     StatusOutput,
     Evaluation,
     EvaluationOutput,
+    HistoryRead,
+    HistoryOutput,
     Server(super::admin_server::Error),
     ConfigUnconfirmed,
     ConfigOutput,
@@ -341,6 +364,8 @@ impl fmt::Display for Error {
             Self::ConfigUnconfirmed => "設定保存操作の正常終了を確認できません。旧値または新値の保存済み・未確定の可能性があります。領域を保全し、再実行・再初期化・手動待ち解除をせず確認してください。",
             Self::ConfigOutput => "設定保存とローカル保存sessionの正常終了後、結果出力に失敗しました。保存値は起動へ適用していません。再保存せず確認してください。",
             Self::Evaluation => "保存・評価診断を取得・照合できません。部分件数・健全性は不明です。受理側が保全停止した可能性があるため領域とsocketを保持して確認してください。自動再送・直接DB読込み・残存物整理・再開は行いません。",
+            Self::HistoryRead => "指定世代の評価来歴を照合できません。停止中の保存領域、評価参照とRecord IDを確認してください。",
+            Self::HistoryOutput => "評価来歴の出力に失敗しました。",
             Self::EvaluationOutput => "保存・評価診断の照合後、結果出力に失敗しました。診断は評価確定・公開・正常停止・復旧完了ではありません。",
             Self::Status => "管理受理側の実行時診断を取得・照合できません。保存要求・再送・直接DB読込み・socket削除は行っていません。診断endpointがない旧受理側へは保存経路で再接続しません。",
             Self::StatusOutput => "管理受理側の実行時診断を照合後、結果出力に失敗しました。保存要求は送っていません。公開・正常停止・復旧完了の判定ではありません。",
@@ -352,6 +377,18 @@ impl fmt::Display for Error {
 }
 impl std::error::Error for Error {}
 pub fn run(command: Command, output: &mut impl Write) -> Result<(), Error> {
+    if let Action::EvaluationHistory(reference, record) = &command.action {
+        let store = lngnb::storage::RecordStore::open(&command.data, Default::default())
+            .map_err(|_| Error::HistoryRead)?;
+        let row = reference
+            .lookup(&store, *record)
+            .map_err(|_| Error::HistoryRead)?
+            .ok_or(Error::HistoryRead)?;
+        writeln!(output, "{row}")
+            .and_then(|()| output.flush())
+            .map_err(|_| Error::HistoryOutput)?;
+        return Ok(());
+    }
     if command.action == Action::SocketInventory {
         return super::admin_socket_cli::run(&command.data, output);
     }

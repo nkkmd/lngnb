@@ -597,6 +597,7 @@ fn foreground_https_serves_verified_record_after_failed_connections() {
         client.read_to_end(&mut response).unwrap();
         response
     };
+    let mut revision_reference = String::new();
     for (target, status) in [
         (id, serde_json::Value::Null),
         (first.id(), "verified".into()),
@@ -623,6 +624,9 @@ fn foreground_https_serves_verified_record_after_failed_connections() {
                     1
                 );
             }
+        }
+        if target == first.id() {
+            revision_reference = body["evaluation_ref"].as_str().unwrap().to_owned();
         }
         assert_eq!(body["record_id"], target.to_string());
         assert_eq!(body["payload_status"], status);
@@ -717,6 +721,26 @@ fn foreground_https_serves_verified_record_after_failed_connections() {
 
     server.signal("-TERM");
     assert!(server.wait().success());
+    let history = |reference: &str| {
+        Command::new(env!("CARGO_BIN_EXE_lngnb"))
+            .args(["admin", "evaluation-history", "--data-dir"])
+            .arg(temp.data())
+            .args(["--evaluation-ref", reference, "--record-id"])
+            .arg(first.id().to_string())
+            .output()
+            .unwrap()
+    };
+    let past = history(&revision_reference);
+    assert!(past.status.success());
+    let saved: serde_json::Value = serde_json::from_slice(&past.stdout).unwrap();
+    assert_eq!(saved["payload_status"], "verified");
+    assert_eq!(saved["record_id"], first.id().to_string());
+    let (prefix, _) = revision_reference.rsplit_once(':').unwrap();
+    for suffix in ["0", "01", "9223372036854775807"] {
+        let denied = history(&format!("{prefix}:{suffix}"));
+        assert!(!denied.status.success());
+        assert!(denied.stdout.is_empty());
+    }
     let store = RecordStore::open(&temp.data(), Limits::default()).unwrap();
     assert_eq!(
         store.startup_state().unwrap(),

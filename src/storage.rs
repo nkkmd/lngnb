@@ -16,7 +16,7 @@ use std::{
 };
 
 pub const IMPLEMENTATION: &str = "lngnb-rust-sqlite-1";
-pub const SCHEMA_VERSION: i64 = 19;
+pub const SCHEMA_VERSION: i64 = 20;
 const DB: &str = "database.sqlite";
 const SCHEMA: &str = "
 CREATE TABLE storage_state (
@@ -262,6 +262,22 @@ CREATE TABLE disclosure_generations (
  generation INTEGER NOT NULL CHECK(generation>=1),
  PRIMARY KEY(knowledge_id,scope_genesis)
 ) STRICT;
+CREATE TABLE disclosure_history (
+ namespace BLOB NOT NULL REFERENCES disclosure_generations(namespace),
+ generation INTEGER NOT NULL CHECK(generation>=1),
+ record_id BLOB NOT NULL REFERENCES records(id),
+ genesis BLOB NOT NULL CHECK(length(genesis)=32),
+ visible INTEGER NOT NULL CHECK(visible IN (0,1)),
+ payload TEXT CHECK(payload IS NULL OR (visible=1 AND payload IN ('missing','unavailable','verified'))),
+ reason TEXT CHECK(reason IS NULL OR (payload IS 'unavailable' AND
+   reason IN ('transfer_hash_mismatch','transfer_failed','storage_corruption'))),
+ rules TEXT NOT NULL,
+ PRIMARY KEY(namespace,record_id,generation)
+) STRICT;
+CREATE TRIGGER disclosure_history_no_update BEFORE UPDATE ON disclosure_history
+ BEGIN SELECT RAISE(ABORT,'immutable_disclosure_history'); END;
+CREATE TRIGGER disclosure_history_no_delete BEFORE DELETE ON disclosure_history
+ BEGIN SELECT RAISE(ABORT,'immutable_disclosure_history'); END;
 CREATE TABLE publication_changes (
  generation INTEGER PRIMARY KEY REFERENCES history(generation),
  record_id BLOB NOT NULL REFERENCES records(id),
@@ -1080,6 +1096,8 @@ pub use sql_inspection::SqlInspectionBudget;
 #[path = "storage_filesystem_tests.rs"]
 mod filesystem_tests;
 
+mod evaluation_reference;
+pub use evaluation_reference::EvaluationReference;
 mod publication;
 pub(crate) use publication::FixedRecordState;
 pub use publication::{
