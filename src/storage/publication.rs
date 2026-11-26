@@ -174,7 +174,7 @@ impl RecordStore {
                 ("", None)
             };
             let sql = format!(
-                "SELECT record_id,knowledge_id,genesis,visible_scope FROM disclosure_records{selector}"
+                "SELECT record_id,knowledge_id,genesis,visible_scope,visible_payload FROM disclosure_records{selector}"
             );
             let mut stmt = tx.prepare(&sql)?;
             let mut rows = stmt.query(rusqlite::params_from_iter(key.iter()))?;
@@ -228,18 +228,30 @@ impl RecordStore {
                         None => None,
                     }
                 };
-                if old != new {
+                let old_payload: Option<String> = row.get(4)?;
+                let new_payload = if new.is_none() {
+                    None
+                } else if dirty {
+                    old_payload.clone()
+                } else {
+                    tx.query_row(
+                        "SELECT payload FROM evaluations WHERE record_id=?1",
+                        [&id.bytes],
+                        |row| row.get(0),
+                    )?
+                };
+                if old != new || old_payload != new_payload {
                     for scope in old.iter().chain(new.iter()) {
                         changed.insert((knowledge.bytes, scope.clone()));
                     }
-                    updates.push((id.bytes, new));
+                    updates.push((id.bytes, new, new_payload));
                 }
             }
         }
-        for (id, scope) in updates {
+        for (id, scope, payload) in updates {
             tx.execute(
-                "UPDATE disclosure_records SET visible_scope=?1 WHERE record_id=?2",
-                params![scope, id],
+                "UPDATE disclosure_records SET visible_scope=?1,visible_payload=?2 WHERE record_id=?3",
+                params![scope, payload, id],
             )?;
         }
         for (knowledge, scope) in changed {
@@ -669,6 +681,72 @@ mod tests {
     use super::*;
 
     use crate::storage::tests::{Temp, fixture, logical_snapshot};
+
+    #[test]
+    fn disclosed_payload_changes_only_on_committed_visible_status_changes() {
+        use crate::storage::evaluation::tests::{bytes, rev};
+
+        let temp = Temp::new();
+        let genesis = fixture();
+        let payload = bytes();
+        let blob = crate::id::blob_id(&payload);
+        let mut writer = temp.store().begin().unwrap();
+        writer.insert(&genesis).unwrap();
+        for tag in ["first", "shared"] {
+            let revision = rev(&[], payload.len() as u64, tag);
+            writer.insert(&revision).unwrap();
+            writer
+                .save_manual_publication_change(
+                    revision.id(),
+                    ManualPublicationChange::ApproveUntrusted,
+                    "allow",
+                )
+                .unwrap();
+        }
+        let state = |writer: &RecordWriter| {
+            writer
+                .store
+                .conn
+                .query_row(
+                    "SELECT g.generation, min(r.visible_payload), max(r.visible_payload), count(*)
+                 FROM disclosure_generations g JOIN disclosure_records r
+                 ON g.knowledge_id=r.knowledge_id AND g.scope_genesis=r.visible_scope
+                 WHERE g.scope_genesis=?1 GROUP BY g.generation",
+                    [genesis.id().bytes],
+                    |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, i64>(3)?,
+                        ))
+                    },
+                )
+                .unwrap()
+        };
+        let expected =
+            |generation, status: &str| (generation, status.to_owned(), status.to_owned(), 2);
+        writer.revalidate(EvaluationLimits::default()).unwrap();
+        assert_eq!(state(&writer), expected(1, "missing"));
+        let unrelated = b"unpublished";
+        writer
+            .put_blob(crate::id::blob_id(unrelated), unrelated.as_slice())
+            .unwrap();
+        writer.revalidate(EvaluationLimits::default()).unwrap();
+        assert_eq!(state(&writer), expected(1, "missing"));
+        writer
+            .observe_blob_failure(blob, "transfer_failed")
+            .unwrap();
+        writer.revalidate(EvaluationLimits::default()).unwrap();
+        assert_eq!(state(&writer), expected(2, "unavailable"));
+        writer.put_blob(blob, payload.as_slice()).unwrap();
+        assert_eq!(state(&writer), expected(2, "unavailable"));
+        writer.revalidate(EvaluationLimits::default()).unwrap();
+        assert_eq!(state(&writer), expected(3, "verified"));
+        writer.revalidate(EvaluationLimits::default()).unwrap();
+        assert_eq!(state(&writer), expected(3, "verified"));
+        writer.finish().unwrap();
+    }
 
     #[test]
     fn shared_blob_requires_a_current_verified_public_revision() {
