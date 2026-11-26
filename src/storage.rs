@@ -16,7 +16,7 @@ use std::{
 };
 
 pub const IMPLEMENTATION: &str = "lngnb-rust-sqlite-1";
-pub const SCHEMA_VERSION: i64 = 15;
+pub const SCHEMA_VERSION: i64 = 16;
 const DB: &str = "database.sqlite";
 const SCHEMA: &str = "
 CREATE TABLE storage_state (
@@ -243,6 +243,13 @@ CREATE TABLE history (
  target BLOB, old_state TEXT NOT NULL, new_state TEXT NOT NULL,
  actor TEXT NOT NULL, reason TEXT NOT NULL, rules TEXT NOT NULL,
  at TEXT NOT NULL
+) STRICT;
+CREATE TABLE disclosure_generations (
+ knowledge_id BLOB NOT NULL CHECK(length(knowledge_id)=32),
+ scope_genesis BLOB NOT NULL CHECK(length(scope_genesis) IN (0,32)),
+ namespace BLOB NOT NULL UNIQUE CHECK(length(namespace)=32),
+ generation INTEGER NOT NULL CHECK(generation>=1),
+ PRIMARY KEY(knowledge_id,scope_genesis)
 ) STRICT;
 CREATE TABLE publication_changes (
  generation INTEGER PRIMARY KEY REFERENCES history(generation),
