@@ -565,6 +565,7 @@ fn foreground_https_serves_verified_record_after_failed_connections() {
         .position(|part| part == b"\r\n\r\n")
         .unwrap()
         + 4;
+    let cbor_headers = std::str::from_utf8(&response[..body]).unwrap().to_owned();
     assert_eq!(&response[body..], record.bytes());
     assert_eq!((&stalled).read(&mut [0]).unwrap(), 0);
     let mut development = connect_https_socket(http);
@@ -604,6 +605,25 @@ fn foreground_https_serves_verified_record_after_failed_connections() {
         assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
         let start = response.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
         let body: serde_json::Value = serde_json::from_slice(&response[start..]).unwrap();
+        if target == id {
+            let state = &body["local_state"];
+            for (header, value) in [
+                ("LNGNB-State-Namespace", &state["namespace"]),
+                ("LNGNB-State-Generation", &state["generation"]),
+                ("LNGNB-State-Scope", &state["scope"]),
+                ("LNGNB-Knowledge-ID", &body["knowledge_id"]),
+                ("LNGNB-Genesis-ID", &body["genesis_record_id"]),
+            ] {
+                let expected = format!("{header}: {}", value.as_str().unwrap());
+                assert_eq!(
+                    cbor_headers
+                        .lines()
+                        .filter(|line| *line == expected)
+                        .count(),
+                    1
+                );
+            }
+        }
         assert_eq!(body["record_id"], target.to_string());
         assert_eq!(body["payload_status"], status);
         assert_eq!(body["reasons"], serde_json::json!([]));
