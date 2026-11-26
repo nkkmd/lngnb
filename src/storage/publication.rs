@@ -131,22 +131,7 @@ fn load_permission(conn: &Connection, id: Id) -> Result<Option<SavedPublicationP
 }
 
 /// 空のscope_genesisは通常公開、32 bytesは未確認公開のGenesisを表す。
-fn advance_disclosure(
-    tx: &Transaction<'_>,
-    assessed: Option<(RecordPublication, LocalRecord)>,
-) -> Result<()> {
-    let Some((publication, record)) = assessed else {
-        return Ok(());
-    };
-    let genesis = match publication {
-        RecordPublication::Private => return Ok(()),
-        RecordPublication::Public => None,
-        RecordPublication::UntrustedPublic => {
-            Some(record.genesis().map_err(|_| StorageError::Corrupt)?)
-        }
-    };
-    let scope = genesis.as_ref().map_or(&[][..], |id| id.as_slice());
-    let knowledge = record.identity().knowledge;
+fn advance_disclosure(tx: &Transaction<'_>, knowledge: &[u8; 32], scope: &[u8]) -> Result<()> {
     if tx.execute(
         "UPDATE disclosure_generations SET generation=generation+1
          WHERE knowledge_id=?1 AND scope_genesis=?2",
@@ -165,6 +150,104 @@ fn advance_disclosure(
 }
 
 impl RecordStore {
+    /// 前回確定した公開範囲と比較する。評価待ちの間は新しい公開範囲を採用しない。
+    pub(super) fn refresh_disclosures(
+        &self,
+        tx: &Transaction<'_>,
+        knowledge: Option<Id>,
+        record: Option<Id>,
+    ) -> Result<()> {
+        let started = std::time::Instant::now();
+        let dirty: bool = tx.query_row(
+            "SELECT dirty FROM evaluation_state WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        let mut changed = std::collections::BTreeSet::new();
+        let mut updates = Vec::new();
+        {
+            let (selector, key) = if let Some(id) = record {
+                (" WHERE record_id=?1", Some(id.bytes))
+            } else if let Some(id) = knowledge {
+                (" WHERE knowledge_id=?1", Some(id.bytes))
+            } else {
+                ("", None)
+            };
+            let sql = format!(
+                "SELECT record_id,knowledge_id,genesis,visible_scope FROM disclosure_records{selector}"
+            );
+            let mut stmt = tx.prepare(&sql)?;
+            let mut rows = stmt.query(rusqlite::params_from_iter(key.iter()))?;
+            let mut count = 0;
+            while let Some(row) = rows.next()? {
+                count += 1;
+                if count > self.limits.scan_records
+                    || started.elapsed() >= self.limits.sql_inspection.elapsed
+                {
+                    return Err(StorageError::BudgetExceeded);
+                }
+                let id = Id {
+                    kind: Kind::Record,
+                    bytes: row.get(0)?,
+                };
+                let knowledge = Id {
+                    kind: Kind::Knowledge,
+                    bytes: row.get(1)?,
+                };
+                let genesis: [u8; 32] = row.get(2)?;
+                let old: Option<Vec<u8>> = row.get(3)?;
+                let new = if dirty {
+                    // 直近の確定範囲は維持できるが、失効した根拠だけは直ちに外す。
+                    let permission = load_permission(tx, id)?.ok_or(StorageError::Corrupt)?;
+                    let pinned = self
+                        .saved_pin(knowledge)?
+                        .is_some_and(|pin| pin.bytes == genesis);
+                    match (permission.permission, pinned, old.as_deref()) {
+                        (PublicationPermission::Public, true, Some([])) => old.clone(),
+                        (PublicationPermission::Untrusted, false, Some(scope))
+                            if scope == genesis =>
+                        {
+                            old.clone()
+                        }
+                        _ => None,
+                    }
+                } else {
+                    match self.assess_record_publication(id, DistributionGate::Open, None)? {
+                        Some((class, record)) => {
+                            if record.identity().knowledge != knowledge.bytes
+                                || record.genesis().map_err(|_| StorageError::Corrupt)? != genesis
+                            {
+                                return Err(StorageError::Corrupt);
+                            }
+                            match class {
+                                RecordPublication::Public => Some(Vec::new()),
+                                RecordPublication::UntrustedPublic => Some(genesis.to_vec()),
+                                RecordPublication::Private => None,
+                            }
+                        }
+                        None => None,
+                    }
+                };
+                if old != new {
+                    for scope in old.iter().chain(new.iter()) {
+                        changed.insert((knowledge.bytes, scope.clone()));
+                    }
+                    updates.push((id.bytes, new));
+                }
+            }
+        }
+        for (id, scope) in updates {
+            tx.execute(
+                "UPDATE disclosure_records SET visible_scope=?1 WHERE record_id=?2",
+                params![scope, id],
+            )?;
+        }
+        for (knowledge, scope) in changed {
+            advance_disclosure(tx, &knowledge, &scope)?;
+        }
+        Ok(())
+    }
+
     /// 停止中の保存領域について、固定Record本体の配信可否を読み取る。
     /// gate は呼び出し側の運用制限。結果はこの読取り時点の判定で、送信許可証にはならない。
     pub fn record_publication(&self, id: Id, gate: DistributionGate) -> Result<RecordPublication> {
@@ -532,11 +615,6 @@ impl RecordWriter {
                 return Err(StorageError::Capacity);
             }
             let tx = self.store.conn.unchecked_transaction()?;
-            let assess = || {
-                self.store
-                    .assess_record_publication(id, DistributionGate::Open, None)
-            };
-            let before = assess()?;
             advance(&tx)?;
             let previous = match (old.permission, old.explicitly_stopped) {
                 (_, true) => "revoke",
@@ -560,10 +638,20 @@ impl RecordWriter {
             {
                 return Err(StorageError::Corrupt);
             }
-            let after = assess()?;
-            if before.as_ref().map(|(class, _)| class) != after.as_ref().map(|(class, _)| class) {
-                advance_disclosure(&tx, before)?;
-                advance_disclosure(&tx, after)?;
+            if change != ManualPublicationChange::Revoke {
+                let record = self.store.record(id)?.ok_or(StorageError::Corrupt)?;
+                tx.execute(
+                    "INSERT INTO disclosure_records(record_id,knowledge_id,genesis) VALUES(?1,?2,?3)
+                     ON CONFLICT(record_id) DO NOTHING",
+                    params![id.bytes,record.identity().knowledge,record.genesis().map_err(|_| StorageError::Corrupt)?],
+                )?;
+            }
+            self.store.refresh_disclosures(&tx, None, Some(id))?;
+            if change == ManualPublicationChange::Revoke {
+                tx.execute(
+                    "DELETE FROM disclosure_records WHERE record_id=?1",
+                    [&id.bytes],
+                )?;
             }
             tx.commit()?;
             self.publication_block = None;

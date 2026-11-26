@@ -92,7 +92,7 @@ impl RecordWriter {
             if capacity.available <= capacity.reserved_floor.saturating_add(65536) {
                 return Err(StorageError::Capacity);
             }
-            let tx = self.store.conn.transaction()?;
+            let tx = self.store.conn.unchecked_transaction()?;
             advance(&tx)?;
             if peer_uid.is_some() {
                 tx.execute("UPDATE evaluation_state SET dirty=1 WHERE singleton=1", [])?;
@@ -117,6 +117,7 @@ impl RecordWriter {
             {
                 return Err(StorageError::Corrupt);
             }
+            self.store.refresh_disclosures(&tx, Some(knowledge), None)?;
             tx.commit()?;
             Ok(true)
         })();
@@ -143,6 +144,13 @@ mod tests {
         };
         let mut writer = temp.store().begin().unwrap();
         writer.insert(&record).unwrap();
+        let public_generation = |writer: &RecordWriter| {
+            writer.store.conn.query_row(
+                "SELECT generation FROM disclosure_generations WHERE knowledge_id=?1 AND scope_genesis=X''",
+                [knowledge.bytes],
+                |row| row.get::<_, i64>(0),
+            ).optional().unwrap()
+        };
         writer.revalidate(EvaluationLimits::default()).unwrap();
         writer
             .save_manual_publication_change(id, ManualPublicationChange::ApprovePublic, "approve")
@@ -162,7 +170,11 @@ mod tests {
                 )
                 .unwrap()
         );
+        assert_eq!(public_generation(&writer), None);
         writer.revalidate(EvaluationLimits::default()).unwrap();
+        assert_eq!(public_generation(&writer), Some(1));
+        writer.revalidate(EvaluationLimits::default()).unwrap();
+        assert_eq!(public_generation(&writer), Some(1));
         assert!(
             writer
                 .send_record(
@@ -178,7 +190,9 @@ mod tests {
                 .save_pin_change(knowledge, None, "release", Some(1234))
                 .unwrap()
         );
+        assert_eq!(public_generation(&writer), Some(2));
         writer.revalidate(EvaluationLimits::default()).unwrap();
+        assert_eq!(public_generation(&writer), Some(2));
         assert!(
             !writer
                 .send_record(

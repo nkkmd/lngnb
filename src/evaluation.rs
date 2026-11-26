@@ -620,8 +620,10 @@ impl RecordWriter {
         }
         self.reserved += reserve;
         let result: Result<()> = (|| {
-            let tx = self.store.conn.transaction()?;
+            let tx = self.store.conn.unchecked_transaction()?;
             publish(&tx, &mut computed, limits)?;
+            self.store.refresh_disclosures(&tx, None, None)?;
+            computed.budget.check()?;
             #[cfg(test)]
             if self.evaluation_pause {
                 use std::io::Write;
