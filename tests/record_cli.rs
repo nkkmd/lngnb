@@ -630,6 +630,23 @@ fn foreground_https_serves_verified_record_after_failed_connections() {
                 client.read_to_end(&mut response).unwrap();
                 response
             };
+            let listing = query(&format!(
+                "{knowledge}/records?scope=untrusted&genesis_id={id}&page_size=2"
+            ));
+            assert!(listing.starts_with(b"HTTP/1.1 200 OK\r\n"));
+            let start = listing.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+            let list: serde_json::Value = serde_json::from_slice(&listing[start..]).unwrap();
+            assert_eq!(list["record_ids"].as_array().unwrap().len(), 2);
+            let last = query(&format!(
+                "{knowledge}/records?scope=untrusted&genesis_id={id}&page_size=2&snapshot_id={}&cursor={}",
+                list["snapshot_id"].as_str().unwrap(),
+                list["next_cursor"].as_str().unwrap()
+            ));
+            assert!(last.starts_with(b"HTTP/1.1 200 OK\r\n"));
+            let start = last.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+            let last: serde_json::Value = serde_json::from_slice(&last[start..]).unwrap();
+            assert_eq!(last["listing_complete"], true);
+            assert_eq!(last["record_ids"].as_array().unwrap().len(), 1);
             let resolved = query(&format!(
                 "{knowledge}/resolve?scope=untrusted&genesis_id={id}"
             ));

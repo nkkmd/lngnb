@@ -434,6 +434,71 @@ impl FixedRecordScope {
     }
 }
 
+impl RecordStore {
+    pub(super) fn current_disclosure(
+        &self,
+        tx: &Transaction<'_>,
+        knowledge: Id,
+        scope: FixedRecordScope,
+        key: &[u8],
+    ) -> Result<Option<(Id, [u8; 32], i64)>> {
+        let requested = scope.publication_target().1;
+        let row = tx
+            .query_row(
+                "SELECT r.genesis,g.namespace,g.generation FROM disclosure_records r
+                     JOIN disclosure_generations g ON g.knowledge_id=r.knowledge_id
+                     AND g.scope_genesis=r.visible_scope
+                     JOIN evaluation_state v ON v.singleton=1
+                     JOIN history h ON h.generation=v.generation
+                     JOIN storage_state s ON s.singleton=1 AND s.namespace=h.namespace
+                     WHERE r.knowledge_id=?1 AND r.visible_scope=?2
+                     AND h.new_state='evaluated_local_only' AND h.rules='lngnb-validation-1'
+                     AND h.generation<=s.generation LIMIT 1",
+                params![knowledge.bytes, key],
+                |r| {
+                    Ok((
+                        r.get::<_, [u8; 32]>(0)?,
+                        r.get::<_, [u8; 32]>(1)?,
+                        r.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((bytes, ns, generation)) = row else {
+            return Ok(None);
+        };
+        let genesis = Id {
+            kind: Kind::Record,
+            bytes,
+        };
+        if requested.is_some_and(|id| id != genesis)
+            || (self.saved_pin(knowledge)? == Some(genesis)) != key.is_empty()
+        {
+            return Ok(None);
+        }
+        // 非公開行の追加で立つ全体dirtyは使わない。確定済みの有効な版も、
+        // 自身または祖先に新しい長さ不一致の根拠があれば提示を止める。
+        let blocked: bool = tx.query_row(
+            "WITH RECURSIVE deps(id) AS (
+                       SELECT record_id FROM disclosure_records WHERE knowledge_id=?1
+                       AND visible_scope=?2 AND genesis=?3
+                       UNION SELECT p.parent FROM deps d CROSS JOIN parent_edges p ON p.child=d.id
+                     ) SELECT EXISTS(SELECT 1 FROM deps d
+                       LEFT JOIN evaluations e ON e.record_id=d.id
+                       LEFT JOIN blob_objects b ON b.id=e.payload_blob
+                       LEFT JOIN known_invalid k ON k.record_id=d.id
+                       WHERE e.validation IS NOT 'valid' OR k.record_id IS NOT NULL
+                       OR b.byte_length<>e.declared_length)",
+            params![knowledge.bytes, key, bytes],
+            |r| r.get(0),
+        )?;
+        if blocked {
+            return Ok(None);
+        }
+        Ok(Some((genesis, ns, generation)))
+    }
+}
+
 impl RecordWriter {
     /// 排他writerの下で確定した公開集合とその依存だけを照合する。
     pub(crate) fn knowledge_response(
@@ -458,59 +523,12 @@ impl RecordWriter {
                     FixedRecordScope::Public { .. } => (&[], "public"),
                     FixedRecordScope::Untrusted { genesis_id } => (&genesis_id.bytes, "untrusted"),
                 };
-                let requested = scope.publication_target().1;
-                let row = tx
-                    .query_row(
-                        "SELECT r.genesis,g.namespace,g.generation FROM disclosure_records r
-                     JOIN disclosure_generations g ON g.knowledge_id=r.knowledge_id
-                     AND g.scope_genesis=r.visible_scope
-                     JOIN evaluation_state v ON v.singleton=1
-                     JOIN history h ON h.generation=v.generation
-                     JOIN storage_state s ON s.singleton=1 AND s.namespace=h.namespace
-                     WHERE r.knowledge_id=?1 AND r.visible_scope=?2
-                     AND h.new_state='evaluated_local_only' AND h.rules='lngnb-validation-1'
-                     AND h.generation<=s.generation LIMIT 1",
-                        params![knowledge.bytes, key],
-                        |r| {
-                            Ok((
-                                r.get::<_, [u8; 32]>(0)?,
-                                r.get::<_, [u8; 32]>(1)?,
-                                r.get::<_, i64>(2)?,
-                            ))
-                        },
-                    )
-                    .optional()?;
-                let Some((bytes, ns, generation)) = row else {
+                let Some((genesis, ns, generation)) =
+                    self.store.current_disclosure(&tx, knowledge, scope, key)?
+                else {
                     return Ok(None);
                 };
-                let genesis = Id {
-                    kind: Kind::Record,
-                    bytes,
-                };
-                if requested.is_some_and(|id| id != genesis)
-                    || (self.store.saved_pin(knowledge)? == Some(genesis)) != key.is_empty()
-                {
-                    return Ok(None);
-                }
-                // 非公開行の追加で立つ全体dirtyは使わない。確定済みの有効な版も、
-                // 自身または祖先に新しい長さ不一致の根拠があれば提示を止める。
-                let blocked: bool = tx.query_row(
-                    "WITH RECURSIVE deps(id) AS (
-                       SELECT record_id FROM disclosure_records WHERE knowledge_id=?1
-                       AND visible_scope=?2 AND genesis=?3
-                       UNION SELECT p.parent FROM deps d CROSS JOIN parent_edges p ON p.child=d.id
-                     ) SELECT EXISTS(SELECT 1 FROM deps d
-                       LEFT JOIN evaluations e ON e.record_id=d.id
-                       LEFT JOIN blob_objects b ON b.id=e.payload_blob
-                       LEFT JOIN known_invalid k ON k.record_id=d.id
-                       WHERE e.validation IS NOT 'valid' OR k.record_id IS NOT NULL
-                       OR b.byte_length<>e.declared_length)",
-                    params![knowledge.bytes, key, bytes],
-                    |r| r.get(0),
-                )?;
-                if blocked {
-                    return Ok(None);
-                }
+                let bytes = genesis.bytes;
                 let sql = if resolve {
                     "SELECT h.record_id,r.visible_payload,r.visible_reason,
                        CASE WHEN b.id IS NULL THEN
@@ -1620,7 +1638,7 @@ mod tests {
             .unwrap();
         let path = format!("/v1/records/{id}");
         let target = format!("{path}?scope=untrusted&genesis_id={id}");
-        for target in ["/v1/records", "/v1/records/", &format!("{path}/unknown")] {
+        for target in ["/v1/records/", &format!("{path}/unknown")] {
             assert!(
                 !route_fixed_record_request(
                     &mut writer,
@@ -1637,6 +1655,7 @@ mod tests {
             ("GET", path.as_str(), 404),
             ("PUT", target.as_str(), 405),
             ("GET", "/v1/records/invalid", 400),
+            ("GET", "/v1/records", 400),
             ("GET", &format!("{target}&{}", "x".repeat(16 * 1024)), 400),
         ] {
             assert!(

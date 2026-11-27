@@ -415,6 +415,9 @@ fn fingerprint(m: &std::fs::Metadata) -> String {
 
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
+    pub listing_ids: u32,
+    pub listing_snapshots: u32,
+    pub listing_bytes: u32,
     pub sql_inspection: SqlInspectionBudget,
     pub scan_records: u64,
     pub scan_bytes: u64,
@@ -430,6 +433,9 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
+            listing_ids: 100_000,
+            listing_snapshots: 1024,
+            listing_bytes: 64 * 1024 * 1024,
             sql_inspection: SqlInspectionBudget::default(),
             scan_records: 10_000,
             scan_bytes: 64 * 1024 * 1024,
@@ -934,6 +940,7 @@ pub struct RecordWriter {
     failed: bool,
     began_clean: bool,
     publication_block: Option<Id>,
+    listings: Vec<listing::Snapshot>,
     records: u64,
     bytes: u64,
     reserved: u64,
@@ -952,6 +959,7 @@ impl RecordWriter {
             failed: false,
             began_clean: false,
             publication_block: None,
+            listings: Vec::new(),
             records: 0,
             bytes: 0,
             reserved: 0,
@@ -1116,6 +1124,7 @@ mod filesystem_tests;
 
 mod evaluation_reference;
 pub use evaluation_reference::EvaluationReference;
+pub(crate) mod listing;
 mod publication;
 pub(crate) use publication::FixedRecordState;
 pub use publication::{
