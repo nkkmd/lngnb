@@ -157,6 +157,56 @@ fn advance_disclosure(tx: &Transaction<'_>, knowledge: &[u8; 32], scope: &[u8]) 
     Ok(())
 }
 
+/// 公開Revisionの祖先だけをたどる。非公開の中間版は候補に含めない。
+fn replace_disclosure_heads(
+    tx: &Transaction<'_>,
+    knowledge: &[u8; 32],
+    scope: &[u8],
+    limits: Limits,
+    started: std::time::Instant,
+) -> Result<()> {
+    let budget = limits
+        .sql_inspection
+        .within(started, limits.sql_inspection.elapsed);
+    let heads = sql_inspection::run(tx, budget, || {
+        let mut stmt = tx.prepare(
+            "WITH RECURSIVE members(id) AS MATERIALIZED (
+                SELECT record_id FROM disclosure_records WHERE knowledge_id=?1
+                AND visible_scope=?2 AND record_id<>genesis LIMIT ?3
+             ), ancestors(id) AS (
+                SELECT p.parent FROM members m CROSS JOIN parent_edges p ON p.child=m.id
+                UNION
+                SELECT p.parent FROM ancestors a CROSS JOIN parent_edges p ON p.child=a.id LIMIT ?3
+             )
+             SELECT NULL WHERE (SELECT count(*) FROM members)>=?3
+                OR (SELECT count(*) FROM ancestors)>=?3
+             UNION ALL SELECT id FROM (SELECT id FROM members EXCEPT SELECT id FROM ancestors)",
+        )?;
+        let limit = i64::try_from(limits.scan_records)
+            .unwrap_or(i64::MAX)
+            .saturating_add(1);
+        let mut rows = stmt.query(params![knowledge, scope, limit])?;
+        let mut heads = Vec::new();
+        while let Some(row) = rows.next()? {
+            let id: Option<[u8; 32]> = row.get(0)?;
+            heads.push(id.ok_or(StorageError::BudgetExceeded)?);
+        }
+        Ok(heads)
+    })?;
+    tx.execute(
+        "DELETE FROM disclosure_heads WHERE knowledge_id=?1 AND scope_genesis=?2",
+        params![knowledge, scope],
+    )?;
+    let mut insert = tx.prepare("INSERT INTO disclosure_heads VALUES(?1,?2,?3)")?;
+    for id in heads {
+        if started.elapsed() >= limits.sql_inspection.elapsed {
+            return Err(StorageError::BudgetExceeded);
+        }
+        insert.execute(params![knowledge, scope, id])?;
+    }
+    Ok(())
+}
+
 impl RecordStore {
     /// 前回確定した公開範囲と比較する。評価待ちの間は新しい公開範囲を採用しない。
     pub(super) fn refresh_disclosures(
@@ -172,6 +222,7 @@ impl RecordStore {
             |row| row.get(0),
         )?;
         let mut changed = std::collections::BTreeSet::new();
+        let mut membership_changed = std::collections::BTreeSet::new();
         let mut updates = Vec::new();
         {
             let (selector, key) = if let Some(id) = record {
@@ -253,6 +304,9 @@ impl RecordStore {
                 if old != new || old_payload != new_payload {
                     for scope in old.iter().chain(new.iter()) {
                         changed.insert((knowledge.bytes, scope.clone()));
+                        if old != new {
+                            membership_changed.insert((knowledge.bytes, scope.clone()));
+                        }
                     }
                     updates.push((id.bytes, knowledge.bytes, genesis, old, new, new_payload));
                 }
@@ -281,6 +335,9 @@ impl RecordStore {
                     return Err(StorageError::Corrupt);
                 }
             }
+        }
+        for (knowledge, scope) in membership_changed {
+            replace_disclosure_heads(tx, &knowledge, &scope, self.limits, started)?;
         }
         Ok(())
     }
@@ -789,6 +846,89 @@ mod tests {
     use super::*;
 
     use crate::storage::tests::{Temp, fixture, logical_snapshot};
+
+    #[test]
+    fn scoped_heads_follow_private_parents_and_commit_with_generation() {
+        use crate::storage::evaluation::tests::rev;
+
+        let temp = Temp::new();
+        let mut writer = temp.store().begin().unwrap();
+        let genesis = fixture();
+        let root = rev(&[], 14, "root");
+        let hidden = rev(&[root.id()], 14, "hidden");
+        let left = rev(&[hidden.id()], 14, "left");
+        let right = rev(&[root.id()], 14, "right");
+        let merge = rev(&[left.id(), right.id()], 14, "merge");
+        for record in [&genesis, &root, &hidden, &left, &right, &merge] {
+            writer.insert(record).unwrap();
+        }
+        writer.revalidate(EvaluationLimits::default()).unwrap();
+        let state = |writer: &RecordWriter, scope: &[u8]| {
+            let conn = &writer.store.conn;
+            let knowledge = genesis.identity().knowledge;
+            let generation: Option<i64> = conn
+                .query_row(
+                    "SELECT generation FROM disclosure_generations
+                     WHERE knowledge_id=?1 AND scope_genesis=?2",
+                    params![knowledge, scope],
+                    |row| row.get(0),
+                )
+                .optional()
+                .unwrap();
+            let heads = conn
+                .prepare(
+                    "SELECT record_id FROM disclosure_heads WHERE knowledge_id=?1
+                     AND scope_genesis=?2 ORDER BY record_id",
+                )
+                .unwrap()
+                .query_map(params![knowledge, scope], |row| row.get::<_, [u8; 32]>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            (generation, heads)
+        };
+        let scope = genesis.id().bytes;
+        let approve = ManualPublicationChange::ApproveUntrusted;
+        for record in [&genesis, &root, &left, &right] {
+            writer
+                .save_manual_publication_change(record.id(), approve, "allow")
+                .unwrap();
+        }
+        let mut branches = vec![left.id().bytes, right.id().bytes];
+        branches.sort();
+        assert_eq!(state(&writer, &scope), (Some(4), branches.clone()));
+        assert_eq!(state(&writer, &[]), (None, vec![]));
+        let private_child = rev(&[right.id()], 14, "private child");
+        writer.insert(&private_child).unwrap();
+        writer.revalidate(EvaluationLimits::default()).unwrap();
+        assert_eq!(state(&writer, &scope), (Some(4), branches.clone()));
+        writer
+            .save_manual_publication_change(merge.id(), approve, "allow")
+            .unwrap();
+        assert_eq!(state(&writer, &scope), (Some(5), vec![merge.id().bytes]));
+        writer
+            .save_manual_publication_change(merge.id(), ManualPublicationChange::Revoke, "hide")
+            .unwrap();
+        assert_eq!(state(&writer, &scope), (Some(6), branches));
+        writer
+            .save_manual_publication_change(merge.id(), approve, "allow")
+            .unwrap();
+        writer
+            .store
+            .conn
+            .execute_batch(
+                "CREATE TEMP TRIGGER fail_heads BEFORE INSERT ON disclosure_heads
+                 BEGIN SELECT RAISE(ABORT,'test'); END;",
+            )
+            .unwrap();
+        assert!(
+            writer
+                .save_manual_publication_change(merge.id(), ManualPublicationChange::Revoke, "hide")
+                .is_err()
+        );
+        assert_eq!(state(&writer, &scope), (Some(7), vec![merge.id().bytes]));
+        assert!(writer.failed || writer.publication_block == Some(merge.id()));
+    }
 
     #[test]
     fn disclosed_payload_changes_only_on_committed_visible_status_changes() {
