@@ -1060,6 +1060,23 @@ mod tests {
             (generation, heads)
         };
         let scope = genesis.id().bytes;
+        let listing = |writer: &RecordWriter, scope_key: &[u8], genesis_key: &[u8]| {
+            writer
+                .store
+                .conn
+                .prepare(
+                    "SELECT record_id,disclosure_epoch FROM record_listing_members
+                 WHERE knowledge_id=?1 AND visible_scope=?2 AND genesis=?3 ORDER BY record_id",
+                )
+                .unwrap()
+                .query_map(
+                    params![genesis.identity().knowledge, scope_key, genesis_key],
+                    |row| Ok((row.get::<_, [u8; 32]>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
         let approve = ManualPublicationChange::ApproveUntrusted;
         for record in [&genesis, &root, &left, &right] {
             writer
@@ -1070,18 +1087,41 @@ mod tests {
         branches.sort();
         assert_eq!(state(&writer, &scope), (Some(4), branches.clone()));
         assert_eq!(state(&writer, &[]), (None, vec![]));
+        let initial = listing(&writer, &scope, &scope);
+        let mut ids = vec![scope, root.id().bytes, left.id().bytes, right.id().bytes];
+        ids.sort();
+        assert_eq!(
+            initial,
+            ids.into_iter().map(|id| (id, 0)).collect::<Vec<_>>()
+        );
+        assert!(listing(&writer, &[], &scope).is_empty());
+        assert!(listing(&writer, &scope, &[0; 32]).is_empty());
         let private_child = rev(&[right.id()], 14, "private child");
         writer.insert(&private_child).unwrap();
         writer.revalidate(EvaluationLimits::default()).unwrap();
         assert_eq!(state(&writer, &scope), (Some(4), branches.clone()));
+        assert_eq!(listing(&writer, &scope, &scope), initial);
         writer
             .save_manual_publication_change(merge.id(), approve, "allow")
             .unwrap();
         assert_eq!(state(&writer, &scope), (Some(5), vec![merge.id().bytes]));
+        let expanded = listing(&writer, &scope, &scope);
+        assert_eq!(expanded.len(), initial.len() + 1);
+        assert!(expanded.iter().all(|(_, epoch)| *epoch == 0));
         writer
             .save_manual_publication_change(merge.id(), ManualPublicationChange::Revoke, "hide")
             .unwrap();
         assert_eq!(state(&writer, &scope), (Some(6), branches));
+        writer.finish().unwrap();
+        let mut writer = RecordStore::open(&temp.data(), Limits::default())
+            .unwrap()
+            .begin()
+            .unwrap();
+        let reduced = listing(&writer, &scope, &scope);
+        assert_eq!(
+            reduced,
+            initial.iter().map(|(id, _)| (*id, 6)).collect::<Vec<_>>()
+        );
         writer
             .save_manual_publication_change(merge.id(), approve, "allow")
             .unwrap();
@@ -1099,6 +1139,10 @@ mod tests {
                 .is_err()
         );
         assert_eq!(state(&writer, &scope), (Some(7), vec![merge.id().bytes]));
+        assert_eq!(
+            listing(&writer, &scope, &scope),
+            expanded.iter().map(|(id, _)| (*id, 6)).collect::<Vec<_>>()
+        );
         assert!(writer.failed || writer.publication_block == Some(merge.id()));
     }
 
