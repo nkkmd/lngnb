@@ -261,6 +261,10 @@ ENOENT、接続拒否、排他取得、PID不在、metadata一致だけでは、
 
 同じ条件で `GET /v1/knowledge/{knowledge_id}/resolve` を指定すると、候補解決・検証・完全性・鮮度と、応答の評価時刻を返します。検証欄には現在公開できる候補版の本文状態と公開可能な理由が入ります。その本文状態の変更が未確定なら再評価まで503になります。現段階では一般開示する同期元の観測がないため、完全性と鮮度の配列は空です。世界全体の取得完了や欠落ゼロを意味しません。
 
+### 公開Record一覧
+
+`GET /v1/knowledge/{knowledge_id}/records?genesis_id=...` と `GET /v1/records?knowledge_id=...&genesis_id=...` は同じ一覧を返します。未確認公開は `scope=untrusted` を指定します。初回のRecord ID集合を生ID順で固定し、後続ページは同じ範囲・mode・page_sizeに `snapshot_id` と `next_cursor` の値を `cursor` として指定します。期限は10分、既定100件、最大500件です。追加公開は新しい一覧に反映します。公開縮小・期限切れ・再起動等で409/snapshot_invalidを受けたら最初から取得します。両モードとも一覧の値はRecord IDです。本文は別途現在の配信条件で取得します。
+
 ### 固定Recordの評価来歴
 
 停止中の領域で `lngnb admin evaluation-history --data-dir PATH --evaluation-ref REF --record-id RECORD_ID` を実行します。固定verificationの応答から評価参照とRecord IDを取得してください。同じ参照は同じ範囲の複数のRecordに共通するため、両方を指定します。JSONには指定世代と、その時点までの対象Recordの最終変更世代、確定済みの本文状態・理由・検証規則が含まれます。公開取消し後も取消し前の参照で当時の状態を確認できます。指定世代に非開示だったRecord、未知の世代、異なる範囲、稼働中の排他競合はエラーで終了します。

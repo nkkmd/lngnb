@@ -13,6 +13,8 @@ const JSON: &str = "application/json";
 const INVALID: &[u8] = br#"{"api_version":"lngnb-http-1","error":{"code":"invalid_request","message":"Invalid request","retry_after_seconds":null}}"#;
 const UNAVAILABLE: &[u8] = br#"{"api_version":"lngnb-http-1","error":{"code":"not_available","message":"This Record is unavailable on this relay","retry_after_seconds":null}}"#;
 
+const SNAPSHOT_INVALID: &[u8] = br#"{"api_version":"lngnb-http-1","error":{"code":"snapshot_invalid","message":"Snapshot unavailable","retry_after_seconds":null}}"#;
+const POLICY_LIMIT: &[u8] = br#"{"api_version":"lngnb-http-1","error":{"code":"policy_limit","message":"Listing limit reached","retry_after_seconds":null}}"#;
 const KNOWLEDGE_UNAVAILABLE: &[u8] = br#"{"api_version":"lngnb-http-1","error":{"code":"not_available","message":"This Knowledge is unavailable on this relay","retry_after_seconds":null}}"#;
 const STORAGE_UNAVAILABLE: &[u8] = br#"{"api_version":"lngnb-http-1","error":{"code":"storage_unavailable","message":"Service unavailable","retry_after_seconds":null}}"#;
 
@@ -539,6 +541,27 @@ fn route_record(
         Some((path, query)) => (path, Some(query)),
         None => (target, None),
     };
+    let listing_path = path
+        .strip_prefix("/v1/knowledge/")
+        .and_then(|p| p.strip_suffix("/records"));
+    if path == "/v1/records" || listing_path.is_some_and(|s| !s.is_empty() && !s.contains('/')) {
+        use crate::storage::listing::Page;
+        if method != "GET" {
+            send(405, JSON, METHOD_NOT_ALLOWED, None)?;
+        } else if let Some((listing, token, cursor)) = parse_listing(listing_path, query) {
+            match writer.record_page(listing, token, cursor, gate) {
+                Ok(Page::Available(body)) => send(200, JSON, body.as_bytes(), None)?,
+                Ok(Page::Invalid) => send(409, JSON, SNAPSHOT_INVALID, None)?,
+                Ok(Page::Hidden) => send(404, JSON, KNOWLEDGE_UNAVAILABLE, None)?,
+                Err(StorageError::BudgetExceeded) => send(503, JSON, POLICY_LIMIT, None)?,
+                Err(StorageError::RandomUnavailable) => send(503, JSON, STORAGE_UNAVAILABLE, None)?,
+                Err(error) => return Err(error),
+            }
+        } else {
+            send(400, JSON, INVALID, None)?;
+        }
+        return Ok(true);
+    }
     if let Some(raw) = path.strip_prefix("/v1/knowledge/") {
         let resolve = raw.strip_suffix("/resolve");
         let raw = resolve.unwrap_or(raw);
@@ -651,6 +674,7 @@ fn write_response_with_headers(
         400 => "Bad Request",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        409 => "Conflict",
         503 => "Service Unavailable",
         _ => return Err(io::ErrorKind::InvalidInput.into()),
     };
@@ -740,6 +764,68 @@ pub fn send_fixed_record_get(
         send.expect("response not started")(404, JSON, UNAVAILABLE)?;
     }
     Ok(())
+}
+
+type ListingRequest = (
+    crate::storage::listing::Listing,
+    Option<[u8; 32]>,
+    Option<[u8; 32]>,
+);
+
+fn parse_listing(path_id: Option<&str>, query: Option<&str>) -> Option<ListingRequest> {
+    use crate::storage::listing::{Listing, parse_token};
+    let mut fields = std::collections::BTreeMap::new();
+    for param in query?.split('&') {
+        let (key, raw) = param.split_once('=')?;
+        if fields.insert(key, decode_value(raw)?).is_some() {
+            return None;
+        }
+    }
+    let query_id = fields.remove("knowledge_id");
+    let knowledge = Id::parse(Kind::Knowledge, path_id.xor(query_id.as_deref())?).ok()?;
+    let genesis = Id::parse(Kind::Record, &fields.remove("genesis_id")?).ok()?;
+    let untrusted = match fields.remove("scope").as_deref().unwrap_or("public") {
+        "public" => false,
+        "untrusted" => true,
+        _ => return None,
+    };
+    let with_payloads = match fields.remove("mode").as_deref().unwrap_or("metadata") {
+        "metadata" => false,
+        "with_payloads" => true,
+        _ => return None,
+    };
+    let page_size = match fields.remove("page_size") {
+        None => 100,
+        Some(raw) => {
+            let n = raw.parse::<usize>().ok()?;
+            if !(1..=500).contains(&n) || n.to_string() != raw {
+                return None;
+            }
+            n
+        }
+    };
+    let token = match fields.remove("snapshot_id") {
+        Some(s) => Some(parse_token(&s, "st1_")?),
+        None => None,
+    };
+    let cursor = match fields.remove("cursor") {
+        Some(s) => Some(parse_token(&s, "cu1_")?),
+        None => None,
+    };
+    if !fields.is_empty() || cursor.is_some() && token.is_none() {
+        return None;
+    }
+    Some((
+        Listing {
+            knowledge,
+            genesis,
+            untrusted,
+            with_payloads,
+            page_size,
+        },
+        token,
+        cursor,
+    ))
 }
 
 fn parse_scope(query: Option<&str>) -> Option<FixedRecordScope> {
