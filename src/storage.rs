@@ -16,7 +16,7 @@ use std::{
 };
 
 pub const IMPLEMENTATION: &str = "lngnb-rust-sqlite-1";
-pub const SCHEMA_VERSION: i64 = 23;
+pub const SCHEMA_VERSION: i64 = 24;
 const DB: &str = "database.sqlite";
 const SCHEMA: &str = "
 CREATE TABLE storage_state (
@@ -284,6 +284,14 @@ CREATE TABLE disclosure_history (
  rules TEXT NOT NULL,
  PRIMARY KEY(namespace,record_id,generation)
 ) STRICT;
+CREATE INDEX disclosure_removals ON disclosure_history(namespace,genesis,generation) WHERE visible=0;
+CREATE VIEW record_listing_members AS
+ SELECT r.knowledge_id,r.genesis,r.visible_scope,r.record_id,g.namespace,
+        COALESCE((SELECT max(h.generation) FROM disclosure_history h
+                  WHERE h.namespace=g.namespace AND h.genesis=r.genesis AND h.visible=0),0)
+        AS disclosure_epoch
+ FROM disclosure_records r JOIN disclosure_generations g
+ ON g.knowledge_id=r.knowledge_id AND g.scope_genesis=r.visible_scope;
 CREATE TRIGGER disclosure_history_no_update BEFORE UPDATE ON disclosure_history
  BEGIN SELECT RAISE(ABORT,'immutable_disclosure_history'); END;
 CREATE TRIGGER disclosure_history_no_delete BEFORE DELETE ON disclosure_history
