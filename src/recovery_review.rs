@@ -231,7 +231,7 @@ impl RecordStore {
         ]))
         .map_err(|_| StorageError::InvalidRecoveryReview)?;
         // 履歴と現在評価を同じ境界で確定。cleanはここでは記録しない。
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.unchecked_transaction()?;
         if tx.query_row(
             "SELECT generation FROM storage_state WHERE singleton=1",
             [],
@@ -241,6 +241,7 @@ impl RecordStore {
             return Err(StorageError::StaleRecoveryReview);
         }
         publish(&tx, &mut computed, limits)?;
+        self.refresh_disclosures(&tx, None, None)?;
         advance(&tx)?;
         audit(
             &tx,

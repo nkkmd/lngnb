@@ -435,6 +435,118 @@ impl FixedRecordScope {
 }
 
 impl RecordWriter {
+    /// 排他writerの下で確定した公開集合とその依存だけを照合する。
+    pub(crate) fn knowledge_response(
+        &mut self,
+        knowledge: Id,
+        scope: FixedRecordScope,
+        gate: DistributionGate,
+    ) -> Result<Option<String>> {
+        if gate == DistributionGate::Closed
+            || !self.began_clean
+            || self.failed
+            || self.publication_block.is_some()
+            || self.store.blob_recovery.needs_review()
+        {
+            return Ok(None);
+        }
+        let result = (|| {
+            let tx = self.store.conn.unchecked_transaction()?;
+            let body = sql_inspection::run(&tx, self.store.limits.sql_inspection, || {
+                let (key, label): (&[u8], _) = match &scope {
+                    FixedRecordScope::Public { .. } => (&[], "public"),
+                    FixedRecordScope::Untrusted { genesis_id } => (&genesis_id.bytes, "untrusted"),
+                };
+                let requested = scope.publication_target().1;
+                let row = tx
+                    .query_row(
+                        "SELECT r.genesis,g.namespace,g.generation FROM disclosure_records r
+                     JOIN disclosure_generations g ON g.knowledge_id=r.knowledge_id
+                     AND g.scope_genesis=r.visible_scope
+                     JOIN evaluation_state v ON v.singleton=1
+                     JOIN history h ON h.generation=v.generation
+                     JOIN storage_state s ON s.singleton=1 AND s.namespace=h.namespace
+                     WHERE r.knowledge_id=?1 AND r.visible_scope=?2
+                     AND h.new_state='evaluated_local_only' AND h.rules='lngnb-validation-1'
+                     AND h.generation<=s.generation LIMIT 1",
+                        params![knowledge.bytes, key],
+                        |r| {
+                            Ok((
+                                r.get::<_, [u8; 32]>(0)?,
+                                r.get::<_, [u8; 32]>(1)?,
+                                r.get::<_, i64>(2)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+                let Some((bytes, ns, generation)) = row else {
+                    return Ok(None);
+                };
+                let genesis = Id {
+                    kind: Kind::Record,
+                    bytes,
+                };
+                if requested.is_some_and(|id| id != genesis)
+                    || (self.store.saved_pin(knowledge)? == Some(genesis)) != key.is_empty()
+                {
+                    return Ok(None);
+                }
+                // 非公開行の追加で立つ全体dirtyは使わない。確定済みの有効な版も、
+                // 自身または祖先に新しい長さ不一致の根拠があれば提示を止める。
+                let blocked: bool = tx.query_row(
+                    "WITH RECURSIVE deps(id) AS (
+                       SELECT record_id FROM disclosure_records WHERE knowledge_id=?1
+                       AND visible_scope=?2 AND genesis=?3
+                       UNION SELECT p.parent FROM deps d CROSS JOIN parent_edges p ON p.child=d.id
+                     ) SELECT EXISTS(SELECT 1 FROM deps d
+                       LEFT JOIN evaluations e ON e.record_id=d.id
+                       LEFT JOIN blob_objects b ON b.id=e.payload_blob
+                       LEFT JOIN known_invalid k ON k.record_id=d.id
+                       WHERE e.validation IS NOT 'valid' OR k.record_id IS NOT NULL
+                       OR b.byte_length<>e.declared_length)",
+                    params![knowledge.bytes, key, bytes],
+                    |r| r.get(0),
+                )?;
+                if blocked {
+                    return Ok(None);
+                }
+                let mut stmt = tx.prepare(
+                    "SELECT record_id FROM disclosure_heads WHERE knowledge_id=?1
+                     AND scope_genesis=?2 ORDER BY record_id",
+                )?;
+                let mut heads = Vec::new();
+                let mut rows = stmt.query(params![knowledge.bytes, key])?;
+                while let Some(row) = rows.next()? {
+                    if heads.len() as u64 >= self.store.limits.scan_records {
+                        return Err(StorageError::BudgetExceeded);
+                    }
+                    let id = Id {
+                        kind: Kind::Record,
+                        bytes: row.get(0)?,
+                    };
+                    heads.push(id.to_string());
+                }
+                let namespace = format!(
+                    "ns1_{}",
+                    data_encoding::BASE32_NOPAD.encode(&ns).to_ascii_lowercase()
+                );
+                let mut state = serde_json::json!({"namespace":namespace,"generation":generation.to_string(),"scope":label});
+                if !key.is_empty() {
+                    state["candidate_genesis_id"] = genesis.to_string().into();
+                }
+                Ok(Some(serde_json::json!({"api_version":"lngnb-http-1","knowledge_id":knowledge.to_string(),
+                    "scope":label,"local_state":state,"genesis_record_id":genesis.to_string(),
+                    "publisher_verified":key.is_empty(),"trust_anchor":if key.is_empty() { "pinned" } else { "untrusted" },"heads":heads}).to_string()))
+            })?;
+            tx.commit()?;
+            Ok(body)
+        })();
+        if result.is_err() && !matches!(result, Err(StorageError::BudgetExceeded)) {
+            self.failed = true;
+        }
+        result
+    }
+
     /// 排他writerを保持したまま固定Recordの配信可否を判定して送信する。
     /// 呼び出し側はゲートの変更を同じ所有者で直列化し、指定経路へ期限付きで同期送信する。
     pub fn send_record(
@@ -928,6 +1040,121 @@ mod tests {
         );
         assert_eq!(state(&writer, &scope), (Some(7), vec![merge.id().bytes]));
         assert!(writer.failed || writer.publication_block == Some(merge.id()));
+    }
+
+    #[test]
+    fn knowledge_response_isolated_from_other_genesis_and_private_changes() {
+        use crate::cbor::Value;
+        use crate::storage::evaluation::tests::{bytes, rev, set};
+
+        let temp = Temp::new();
+        let mut writer = temp.store().begin().unwrap();
+        let genesis = fixture();
+        let knowledge = Id {
+            kind: Kind::Knowledge,
+            bytes: genesis.identity().knowledge,
+        };
+        let other_key = ed25519_dalek::SigningKey::from_bytes(&[1; 32]);
+        let mut body = genesis.body().clone();
+        set(
+            &mut body,
+            "publisher_public_key",
+            Value::Bytes(other_key.verifying_key().to_bytes().to_vec()),
+        );
+        let other = LocalRecord::sign(body, &other_key).unwrap();
+        let revision = rev(&[], bytes().len() as u64 + 1, "mismatch when received");
+        for record in [&genesis, &revision, &other] {
+            writer.insert(record).unwrap();
+        }
+        writer.revalidate(EvaluationLimits::default()).unwrap();
+        writer
+            .save_pin(knowledge, Some(genesis.id()), "pin")
+            .unwrap();
+        writer
+            .save_manual_publication_change(
+                revision.id(),
+                ManualPublicationChange::ApprovePublic,
+                "allow",
+            )
+            .unwrap();
+        let public = FixedRecordScope::Public { genesis_id: None };
+        let untrusted = FixedRecordScope::Untrusted {
+            genesis_id: other.id(),
+        };
+        let read = |w: &mut RecordWriter, scope| {
+            w.knowledge_response(knowledge, scope, DistributionGate::Open)
+                .unwrap()
+        };
+        let before = read(&mut writer, public).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&before).unwrap();
+        assert_eq!(
+            json["heads"],
+            serde_json::json!([revision.id().to_string()])
+        );
+        assert!(json["local_state"].get("candidate_genesis_id").is_none());
+        assert!(read(&mut writer, untrusted).is_none());
+        assert!(
+            read(
+                &mut writer,
+                FixedRecordScope::Public {
+                    genesis_id: Some(other.id())
+                }
+            )
+            .is_none()
+        );
+        writer
+            .save_manual_publication_change(
+                other.id(),
+                ManualPublicationChange::ApproveUntrusted,
+                "allow",
+            )
+            .unwrap();
+        let isolated = read(&mut writer, untrusted).unwrap();
+        writer.insert(&rev(&[], 14, "private")).unwrap();
+        assert_eq!(read(&mut writer, public).as_deref(), Some(before.as_str()));
+        assert!(
+            writer
+                .knowledge_response(knowledge, public, DistributionGate::Closed)
+                .unwrap()
+                .is_none()
+        );
+        let payload = bytes();
+        writer
+            .put_blob(crate::id::blob_id(&payload), payload.as_slice())
+            .unwrap();
+        assert!(read(&mut writer, public).is_none());
+        assert_eq!(read(&mut writer, untrusted), Some(isolated));
+        writer
+            .save_manual_publication_change(other.id(), ManualPublicationChange::Revoke, "hide")
+            .unwrap();
+        assert!(read(&mut writer, untrusted).is_none());
+        writer.revalidate(EvaluationLimits::default()).unwrap();
+        writer
+            .save_manual_publication_change(
+                genesis.id(),
+                ManualPublicationChange::ApprovePublic,
+                "allow",
+            )
+            .unwrap();
+        assert!(read(&mut writer, public).is_some());
+        writer
+            .store
+            .conn
+            .execute_batch(
+                "CREATE TEMP TRIGGER fail_revoke BEFORE UPDATE ON disclosure_generations
+             BEGIN SELECT RAISE(ABORT,'test'); END;",
+            )
+            .unwrap();
+        assert!(
+            writer
+                .save_manual_publication_change(
+                    genesis.id(),
+                    ManualPublicationChange::Revoke,
+                    "hide"
+                )
+                .is_err()
+        );
+        assert!(read(&mut writer, public).is_none());
     }
 
     #[test]

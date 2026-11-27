@@ -13,6 +13,9 @@ const JSON: &str = "application/json";
 const INVALID: &[u8] = br#"{"api_version":"lngnb-http-1","error":{"code":"invalid_request","message":"Invalid request","retry_after_seconds":null}}"#;
 const UNAVAILABLE: &[u8] = br#"{"api_version":"lngnb-http-1","error":{"code":"not_available","message":"This Record is unavailable on this relay","retry_after_seconds":null}}"#;
 
+const KNOWLEDGE_UNAVAILABLE: &[u8] = br#"{"api_version":"lngnb-http-1","error":{"code":"not_available","message":"This Knowledge is unavailable on this relay","retry_after_seconds":null}}"#;
+const STORAGE_UNAVAILABLE: &[u8] = br#"{"api_version":"lngnb-http-1","error":{"code":"storage_unavailable","message":"Service unavailable","retry_after_seconds":null}}"#;
+
 const BLOB_UNAVAILABLE: &[u8] = br#"{"api_version":"lngnb-http-1","error":{"code":"not_available","message":"This Blob is unavailable on this relay","retry_after_seconds":null}}"#;
 
 const REQUEST_TARGET_LIMIT: usize = 16 * 1024;
@@ -536,6 +539,25 @@ fn route_record(
         Some((path, query)) => (path, Some(query)),
         None => (target, None),
     };
+    if let Some(raw) = path.strip_prefix("/v1/knowledge/") {
+        if raw.is_empty() || raw.contains('/') {
+            return Ok(false);
+        }
+        if method != "GET" {
+            send(405, JSON, METHOD_NOT_ALLOWED, None)?;
+        } else if let (Ok(id), Some(scope)) = (Id::parse(Kind::Knowledge, raw), parse_scope(query))
+        {
+            match writer.knowledge_response(id, scope, gate) {
+                Ok(Some(body)) => send(200, JSON, body.as_bytes(), None)?,
+                Ok(None) => send(404, JSON, KNOWLEDGE_UNAVAILABLE, None)?,
+                Err(StorageError::BudgetExceeded) => send(503, JSON, STORAGE_UNAVAILABLE, None)?,
+                Err(error) => return Err(error),
+            }
+        } else {
+            send(400, JSON, INVALID, None)?;
+        }
+        return Ok(true);
+    }
     let Some(record_id) = path.strip_prefix("/v1/records/") else {
         return Ok(false);
     };
@@ -625,6 +647,7 @@ fn write_response_with_headers(
         400 => "Bad Request",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        503 => "Service Unavailable",
         _ => return Err(io::ErrorKind::InvalidInput.into()),
     };
     let allow = if status == 405 { "Allow: GET\r\n" } else { "" };
