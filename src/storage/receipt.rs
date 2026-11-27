@@ -128,6 +128,7 @@ mod tests {
             match table.as_str() {
                 "quarantine_records" => assert_eq!(new.len(), 1),
                 "record_receipts" => assert_eq!(new.len(), 2),
+                "record_inspection" => assert_ne!(old, new),
                 _ => assert_eq!(old, new, "{table}"),
             }
         }
@@ -153,6 +154,37 @@ mod tests {
             expected.extend(secret);
             assert_eq!(verifier, Sha256::digest(expected).to_vec());
         }
+    }
+
+    #[test]
+    fn both_startup_paths_check_quarantine_even_with_a_valid_local_copy() {
+        use super::{InspectionBudget, Limits, RecordInspection, RecordStore, StorageError};
+        let tmp = Temp::new();
+        let mut writer = tmp.store().begin().unwrap();
+        let record = fixture();
+        writer.insert(&record).unwrap();
+        writer.receive_record(&record).unwrap();
+        writer.finish().unwrap();
+        let conn = rusqlite::Connection::open(tmp.data().join(super::DB)).unwrap();
+        conn.execute(
+            "UPDATE quarantine_records SET bytes=zeroblob(length(bytes))",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(matches!(
+            RecordStore::open(&tmp.data(), Limits::default()),
+            Err(StorageError::Corrupt)
+        ));
+        let mut scan = RecordInspection::open(&tmp.data(), Limits::default()).unwrap();
+        let one = InspectionBudget {
+            records: 1,
+            ..InspectionBudget::default()
+        };
+        assert_eq!(scan.step(one).unwrap().checked_records, 1);
+        scan.pause().unwrap();
+        let mut scan = RecordInspection::open(&tmp.data(), Limits::default()).unwrap();
+        assert!(matches!(scan.step(one), Err(StorageError::Corrupt)));
     }
 
     #[test]
