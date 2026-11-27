@@ -630,7 +630,29 @@ fn foreground_https_serves_verified_record_after_failed_connections() {
                 client.read_to_end(&mut response).unwrap();
                 response
             };
+            let resolved = query(&format!(
+                "{knowledge}/resolve?scope=untrusted&genesis_id={id}"
+            ));
+            assert!(resolved.starts_with(b"HTTP/1.1 200 OK\r\n"));
+            let start = resolved.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+            let resolved: serde_json::Value = serde_json::from_slice(&resolved[start..]).unwrap();
+            assert_eq!(resolved["local_state"], metadata["local_state"]);
+            assert_eq!(resolved["resolution"]["heads"], metadata["heads"]);
+            assert_eq!(resolved["resolution"]["status"], "single");
+            assert_eq!(
+                resolved["verification"]["revisions"],
+                serde_json::json!([{
+                    "revision_id":shared.id().to_string(),"record_validation":"valid",
+                    "publisher_verified":false,"payload_status":"verified","reasons":[]
+                }])
+            );
+            assert_eq!(
+                resolved["completeness"],
+                serde_json::json!({"world_complete":false,"scopes":[]})
+            );
+            assert_eq!(resolved["freshness"], serde_json::json!({"sources":[]}));
             let unavailable = query(knowledge);
+            assert_eq!(unavailable, query(&format!("{knowledge}/resolve")));
             assert!(unavailable.starts_with(b"HTTP/1.1 404 Not Found\r\n"));
             let missing = lngnb::id::Id {
                 kind: lngnb::id::Kind::Knowledge,

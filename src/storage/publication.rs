@@ -441,6 +441,7 @@ impl RecordWriter {
         knowledge: Id,
         scope: FixedRecordScope,
         gate: DistributionGate,
+        resolve: bool,
     ) -> Result<Option<String>> {
         if gate == DistributionGate::Closed
             || !self.began_clean
@@ -510,12 +511,32 @@ impl RecordWriter {
                 if blocked {
                     return Ok(None);
                 }
-                let mut stmt = tx.prepare(
+                let sql = if resolve {
+                    "SELECT h.record_id,r.visible_payload,r.visible_reason,
+                       CASE WHEN b.id IS NULL THEN
+                         (r.visible_payload='missing' AND f.reason IS NULL) OR
+                         (r.visible_payload='unavailable' AND r.visible_reason IS f.reason)
+                       ELSE r.visible_payload='verified' OR
+                         (r.visible_payload='unavailable' AND r.visible_reason='storage_corruption') END
+                     FROM disclosure_heads h
+                     LEFT JOIN disclosure_records r ON r.record_id=h.record_id
+                       AND r.knowledge_id=h.knowledge_id AND r.visible_scope=h.scope_genesis AND r.genesis=?3
+                     LEFT JOIN evaluations e ON e.record_id=r.record_id
+                     LEFT JOIN blobs b ON b.id=e.payload_blob
+                     LEFT JOIN blob_failures f ON f.id=e.payload_blob
+                     WHERE h.knowledge_id=?1 AND h.scope_genesis=?2 ORDER BY h.record_id"
+                } else {
                     "SELECT record_id FROM disclosure_heads WHERE knowledge_id=?1
-                     AND scope_genesis=?2 ORDER BY record_id",
-                )?;
+                     AND scope_genesis=?2 ORDER BY record_id"
+                };
+                let mut stmt = tx.prepare(sql)?;
                 let mut heads = Vec::new();
-                let mut rows = stmt.query(params![knowledge.bytes, key])?;
+                let mut revisions = Vec::new();
+                let mut rows = if resolve {
+                    stmt.query(params![knowledge.bytes, key, bytes])?
+                } else {
+                    stmt.query(params![knowledge.bytes, key])?
+                };
                 while let Some(row) = rows.next()? {
                     if heads.len() as u64 >= self.store.limits.scan_records {
                         return Err(StorageError::BudgetExceeded);
@@ -523,8 +544,21 @@ impl RecordWriter {
                     let id = Id {
                         kind: Kind::Record,
                         bytes: row.get(0)?,
-                    };
-                    heads.push(id.to_string());
+                    }
+                    .to_string();
+                    if resolve {
+                        let payload: String = row.get(1)?;
+                        let reason: Option<String> = row.get(2)?;
+                        if !row.get::<_, Option<bool>>(3)?.unwrap_or(false) {
+                            return Err(StorageError::EvaluationInputPending);
+                        }
+                        revisions.push(serde_json::json!({
+                            "revision_id":id, "record_validation":"valid",
+                            "publisher_verified":key.is_empty(), "payload_status":payload,
+                            "reasons":reason.into_iter().collect::<Vec<_>>()
+                        }));
+                    }
+                    heads.push(id);
                 }
                 let namespace = format!(
                     "ns1_{}",
@@ -534,6 +568,27 @@ impl RecordWriter {
                 if !key.is_empty() {
                     state["candidate_genesis_id"] = genesis.to_string().into();
                 }
+                if resolve {
+                    let status = match heads.len() {
+                        0 => "none",
+                        1 => "single",
+                        _ => "multiple",
+                    };
+                    let evaluated_at: String =
+                        tx.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')", [], |r| {
+                            r.get(0)
+                        })?;
+                    // この経路で状態案内できるのは現在許可したvalidな候補だけ。
+                    // 同期元の一般開示は未接続なので観測を含めない。
+                    return Ok(Some(serde_json::json!({
+                        "api_version":"lngnb-http-1", "record_profile":crate::record::PROFILE,
+                        "knowledge_id":knowledge.to_string(), "local_state":state, "evaluated_at":evaluated_at,
+                        "resolution":{"status":status,"heads":heads,"scope":label,"genesis_record_id":genesis.to_string(),"has_pending_candidates":false},
+                        "verification":{"rules_version":"lngnb-validation-1","trust_anchor":if key.is_empty() { "pinned" } else { "untrusted" },
+                            "local_operation":"normal","revisions":revisions},
+                        "completeness":{"world_complete":false,"scopes":[]}, "freshness":{"sources":[]}
+                    }).to_string()));
+                }
                 Ok(Some(serde_json::json!({"api_version":"lngnb-http-1","knowledge_id":knowledge.to_string(),
                     "scope":label,"local_state":state,"genesis_record_id":genesis.to_string(),
                     "publisher_verified":key.is_empty(),"trust_anchor":if key.is_empty() { "pinned" } else { "untrusted" },"heads":heads}).to_string()))
@@ -541,7 +596,12 @@ impl RecordWriter {
             tx.commit()?;
             Ok(body)
         })();
-        if result.is_err() && !matches!(result, Err(StorageError::BudgetExceeded)) {
+        if result.is_err()
+            && !matches!(
+                result,
+                Err(StorageError::BudgetExceeded | StorageError::EvaluationInputPending)
+            )
+        {
             self.failed = true;
         }
         result
@@ -1082,9 +1142,23 @@ mod tests {
             genesis_id: other.id(),
         };
         let read = |w: &mut RecordWriter, scope| {
-            w.knowledge_response(knowledge, scope, DistributionGate::Open)
+            w.knowledge_response(knowledge, scope, DistributionGate::Open, false)
                 .unwrap()
         };
+        let resolve = |w: &mut RecordWriter, scope| {
+            w.knowledge_response(knowledge, scope, DistributionGate::Open, true)
+                .unwrap()
+                .map(|body| {
+                    let mut json: serde_json::Value = serde_json::from_str(&body).unwrap();
+                    json.as_object_mut()
+                        .unwrap()
+                        .remove("evaluated_at")
+                        .unwrap();
+                    json
+                })
+        };
+        let published = resolve(&mut writer, public).unwrap();
+        assert_eq!(published["verification"]["trust_anchor"], "pinned");
         let before = read(&mut writer, public).unwrap();
         let json: serde_json::Value = serde_json::from_str(&before).unwrap();
         assert_eq!(
@@ -1110,11 +1184,18 @@ mod tests {
             )
             .unwrap();
         let isolated = read(&mut writer, untrusted).unwrap();
+        let other_resolved = resolve(&mut writer, untrusted).unwrap();
+        assert_eq!(other_resolved["resolution"]["status"], "none");
+        assert_eq!(
+            other_resolved["verification"]["revisions"],
+            serde_json::json!([])
+        );
+        assert_eq!(resolve(&mut writer, public), Some(published));
         writer.insert(&rev(&[], 14, "private")).unwrap();
         assert_eq!(read(&mut writer, public).as_deref(), Some(before.as_str()));
         assert!(
             writer
-                .knowledge_response(knowledge, public, DistributionGate::Closed)
+                .knowledge_response(knowledge, public, DistributionGate::Closed, false)
                 .unwrap()
                 .is_none()
         );
@@ -1124,6 +1205,8 @@ mod tests {
             .unwrap();
         assert!(read(&mut writer, public).is_none());
         assert_eq!(read(&mut writer, untrusted), Some(isolated));
+        assert_eq!(resolve(&mut writer, untrusted), Some(other_resolved));
+        assert!(resolve(&mut writer, public).is_none());
         writer
             .save_manual_publication_change(other.id(), ManualPublicationChange::Revoke, "hide")
             .unwrap();
@@ -1155,6 +1238,7 @@ mod tests {
                 .is_err()
         );
         assert!(read(&mut writer, public).is_none());
+        assert!(resolve(&mut writer, public).is_none());
     }
 
     #[test]
@@ -1203,10 +1287,41 @@ mod tests {
             |generation, status: &str| (generation, status.to_owned(), status.to_owned(), 2);
         writer.revalidate(EvaluationLimits::default()).unwrap();
         assert_eq!(state(&writer), expected(1, "missing"));
+        let resolve = |w: &mut RecordWriter| {
+            w.knowledge_response(
+                Id {
+                    kind: Kind::Knowledge,
+                    bytes: genesis.identity().knowledge,
+                },
+                FixedRecordScope::Untrusted {
+                    genesis_id: genesis.id(),
+                },
+                DistributionGate::Open,
+                true,
+            )
+            .map(|body| {
+                let mut json: serde_json::Value = serde_json::from_str(&body.unwrap()).unwrap();
+                let time = json
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("evaluated_at")
+                    .unwrap();
+                assert_eq!(time.as_str().unwrap().len(), 24);
+                json
+            })
+        };
+        let initial = resolve(&mut writer).unwrap();
+        assert_eq!(initial["resolution"]["status"], "multiple");
+        assert_eq!(initial["resolution"]["has_pending_candidates"], false);
+        assert_eq!(
+            initial["verification"]["revisions"][0]["payload_status"],
+            "missing"
+        );
         let unrelated = b"unpublished";
         writer
             .put_blob(crate::id::blob_id(unrelated), unrelated.as_slice())
             .unwrap();
+        assert_eq!(initial, resolve(&mut writer).unwrap());
         writer.revalidate(EvaluationLimits::default()).unwrap();
         assert_eq!(state(&writer), expected(1, "missing"));
         writer
@@ -1214,15 +1329,27 @@ mod tests {
             .unwrap();
         writer.revalidate(EvaluationLimits::default()).unwrap();
         assert_eq!(state(&writer), expected(2, "unavailable"));
+        assert_eq!(
+            resolve(&mut writer).unwrap()["verification"]["revisions"][0]["reasons"],
+            serde_json::json!(["transfer_failed"])
+        );
         writer
             .observe_blob_failure(blob, "transfer_hash_mismatch")
             .unwrap();
         writer.revalidate(EvaluationLimits::default()).unwrap();
         assert_eq!(state(&writer), expected(3, "unavailable"));
         writer.put_blob(blob, payload.as_slice()).unwrap();
+        assert!(matches!(
+            resolve(&mut writer),
+            Err(StorageError::EvaluationInputPending)
+        ));
         assert_eq!(state(&writer), expected(3, "unavailable"));
         writer.revalidate(EvaluationLimits::default()).unwrap();
         assert_eq!(state(&writer), expected(4, "verified"));
+        assert_eq!(
+            resolve(&mut writer).unwrap()["verification"]["revisions"][0]["payload_status"],
+            "verified"
+        );
         writer.revalidate(EvaluationLimits::default()).unwrap();
         assert_eq!(state(&writer), expected(4, "verified"));
         writer.finish().unwrap();

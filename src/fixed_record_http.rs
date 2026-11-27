@@ -540,6 +540,8 @@ fn route_record(
         None => (target, None),
     };
     if let Some(raw) = path.strip_prefix("/v1/knowledge/") {
+        let resolve = raw.strip_suffix("/resolve");
+        let raw = resolve.unwrap_or(raw);
         if raw.is_empty() || raw.contains('/') {
             return Ok(false);
         }
@@ -547,10 +549,12 @@ fn route_record(
             send(405, JSON, METHOD_NOT_ALLOWED, None)?;
         } else if let (Ok(id), Some(scope)) = (Id::parse(Kind::Knowledge, raw), parse_scope(query))
         {
-            match writer.knowledge_response(id, scope, gate) {
+            match writer.knowledge_response(id, scope, gate, resolve.is_some()) {
                 Ok(Some(body)) => send(200, JSON, body.as_bytes(), None)?,
                 Ok(None) => send(404, JSON, KNOWLEDGE_UNAVAILABLE, None)?,
-                Err(StorageError::BudgetExceeded) => send(503, JSON, STORAGE_UNAVAILABLE, None)?,
+                Err(StorageError::BudgetExceeded | StorageError::EvaluationInputPending) => {
+                    send(503, JSON, STORAGE_UNAVAILABLE, None)?
+                }
                 Err(error) => return Err(error),
             }
         } else {
