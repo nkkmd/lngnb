@@ -36,7 +36,7 @@ pub struct InspectionProgress {
 pub(super) struct Checkpoint {
     epoch: i64,
     phase: String,
-    cursor: Option<[u8; 32]>,
+    cursor: Option<Vec<u8>>,
     count: i64,
     bytes: i64,
     blob_files: i64,
@@ -76,9 +76,7 @@ fn checkpoint_inner(conn: &Connection) -> Result<Checkpoint> {
     let (epoch,phase,raw,count,bytes,generation,blob_files,blob_bytes):StoredCheckpoint=conn.query_row(
         "SELECT source_epoch,phase,cursor,checked_records,checked_bytes,checkpoint_generation,checked_blob_files,checked_blob_bytes FROM record_inspection WHERE singleton=1",[],
         |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?)))?;
-    let cursor: Option<[u8; 32]> = raw
-        .map(|b| b.try_into().map_err(|_| StorageError::Corrupt))
-        .transpose()?;
+    let cursor = raw;
     if epoch < 0
         || count < 0
         || bytes < 0
@@ -94,14 +92,14 @@ fn checkpoint_inner(conn: &Connection) -> Result<Checkpoint> {
     if phase == "idle" && (cursor.is_some() || generation.is_some()) {
         return Err(StorageError::Corrupt);
     }
-    if let Some(id) = cursor {
+    if let Some(id) = &cursor {
         let (n, total): (i64, i64) = conn.query_row(
-            "SELECT count(*),coalesce(sum(length(bytes)),0) FROM records WHERE id<=?1",
+            "SELECT count(*),coalesce(sum(size),0) FROM stored_record_sizes WHERE scan_key<=?1",
             [&id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
         let exists: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM records WHERE id=?1)",
+            "SELECT EXISTS(SELECT 1 FROM stored_record_sizes WHERE scan_key=?1)",
             [&id],
             |r| r.get(0),
         )?;
@@ -110,7 +108,8 @@ fn checkpoint_inner(conn: &Connection) -> Result<Checkpoint> {
         }
     }
     if matches!(phase.as_str(), "blobs" | "complete") {
-        let total: i64 = conn.query_row("SELECT count(*) FROM records", [], |r| r.get(0))?;
+        let total: i64 =
+            conn.query_row("SELECT count(*) FROM stored_record_sizes", [], |r| r.get(0))?;
         if total != count {
             return Err(StorageError::Corrupt);
         }
@@ -133,7 +132,7 @@ fn checkpoint_inner(conn: &Connection) -> Result<Checkpoint> {
             } else {
                 "record_inspection_pending"
             };
-            if target != cursor.map(|c| c.to_vec())
+            if target != cursor
                 || new != expected
                 || reason != "record_inspection_checkpoint"
                 || old.split(':').nth(1) != Some(format!("epoch={epoch}").as_str())
@@ -188,7 +187,7 @@ fn save_blob(
     };
     audit(
         &tx,
-        new.cursor.as_ref().map(|c| c.as_slice()),
+        new.cursor.as_deref(),
         &previous,
         state,
         "record_inspection_checkpoint",
@@ -283,7 +282,7 @@ impl RecordInspection {
         let mut new = Checkpoint {
             epoch: old.epoch,
             phase: old.phase.clone(),
-            cursor: old.cursor,
+            cursor: old.cursor.clone(),
             count: old.count,
             bytes: old.bytes,
             blob_files: old.blob_files,
@@ -294,12 +293,12 @@ impl RecordInspection {
             let mut n = 0u64;
             let mut total = 0u64;
             loop {
-                let next: Option<(Vec<u8>, i64)> = match new.cursor {
+                let next: Option<(Vec<u8>, i64)> = match &new.cursor {
                     Some(cursor) => self
                         .store
                         .conn
                         .query_row(
-                            "SELECT id,length(bytes) FROM records WHERE id>?1 ORDER BY id LIMIT 1",
+                            "SELECT scan_key,size FROM stored_record_sizes WHERE scan_key>?1 ORDER BY scan_key LIMIT 1",
                             [cursor],
                             |r| Ok((r.get(0)?, r.get(1)?)),
                         )
@@ -308,7 +307,7 @@ impl RecordInspection {
                         .store
                         .conn
                         .query_row(
-                            "SELECT id,length(bytes) FROM records ORDER BY id LIMIT 1",
+                            "SELECT scan_key,size FROM stored_record_sizes ORDER BY scan_key LIMIT 1",
                             [],
                             |r| Ok((r.get(0)?, r.get(1)?)),
                         )
@@ -318,7 +317,7 @@ impl RecordInspection {
                     new.phase = "blobs".into();
                     break;
                 };
-                if key.len() != 32 || length <= 0 || length > MAX_RECORD as i64 {
+                if length <= 0 || length > MAX_RECORD as i64 {
                     return Err(StorageError::Corrupt);
                 }
                 if n >= budget.records
@@ -330,13 +329,7 @@ impl RecordInspection {
                     }
                     break;
                 }
-                let key: [u8; 32] = key.try_into().map_err(|_| StorageError::Corrupt)?;
-                self.store
-                    .record(Id {
-                        kind: Kind::Record,
-                        bytes: key,
-                    })?
-                    .ok_or(StorageError::Corrupt)?;
+                self.store.check_stored_record(&key)?;
                 n += 1;
                 total += length as u64;
                 new.cursor = Some(key);

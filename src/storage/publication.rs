@@ -1252,6 +1252,23 @@ mod tests {
             other_resolved["verification"]["revisions"],
             serde_json::json!([])
         );
+        let pending = rev(&[], 14, "received privately");
+        writer.receive_record(&pending).unwrap();
+        for scope in [public, untrusted] {
+            assert!(
+                !writer
+                    .send_fixed_record(pending.id(), DistributionGate::Open, scope, |_| panic!(
+                        "quarantine disclosed"
+                    ))
+                    .unwrap()
+            );
+        }
+        assert_eq!(read(&mut writer, untrusted).as_ref(), Some(&isolated));
+        assert_eq!(
+            resolve(&mut writer, untrusted).as_ref(),
+            Some(&other_resolved)
+        );
+        assert_eq!(read(&mut writer, public).as_ref(), Some(&before));
         assert_eq!(resolve(&mut writer, public), Some(published));
         writer.insert(&rev(&[], 14, "private")).unwrap();
         assert_eq!(read(&mut writer, public).as_deref(), Some(before.as_str()));

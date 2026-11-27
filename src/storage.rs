@@ -16,7 +16,7 @@ use std::{
 };
 
 pub const IMPLEMENTATION: &str = "lngnb-rust-sqlite-1";
-pub const SCHEMA_VERSION: i64 = 24;
+pub const SCHEMA_VERSION: i64 = 25;
 const DB: &str = "database.sqlite";
 const SCHEMA: &str = "
 CREATE TABLE storage_state (
@@ -45,11 +45,26 @@ CREATE TABLE records (
 ) STRICT;
 CREATE TRIGGER records_no_update BEFORE UPDATE ON records BEGIN SELECT RAISE(ABORT,'immutable_record'); END;
 CREATE TRIGGER records_no_delete BEFORE DELETE ON records BEGIN SELECT RAISE(ABORT,'immutable_record'); END;
+CREATE TABLE quarantine_records (
+ id BLOB PRIMARY KEY NOT NULL CHECK(length(id)=32),
+ bytes BLOB NOT NULL CHECK(length(bytes) BETWEEN 1 AND 2097152)
+) STRICT;
+-- 同一IDが両領域にあっても、分割起動検査では各コピーを別々に検査する。
+CREATE INDEX quarantine_inspection_key ON quarantine_records(CAST(id || x'01' AS BLOB));
+CREATE VIEW stored_record_sizes AS
+ SELECT id AS scan_key,length(bytes) AS size FROM records
+ UNION ALL SELECT CAST(id || x'01' AS BLOB),length(bytes) FROM quarantine_records;
+CREATE TABLE record_receipts (
+ id BLOB PRIMARY KEY NOT NULL CHECK(length(id)=32),
+ verifier BLOB NOT NULL CHECK(length(verifier)=32),
+ record_id BLOB NOT NULL REFERENCES quarantine_records(id),
+ received_at INTEGER NOT NULL
+) STRICT;
 CREATE TABLE record_inspection (
  singleton INTEGER PRIMARY KEY CHECK(singleton=1),
  source_epoch INTEGER NOT NULL CHECK(source_epoch>=0),
  phase TEXT NOT NULL CHECK(phase IN ('idle','records','blobs','complete')),
- cursor BLOB CHECK(cursor IS NULL OR length(cursor)=32),
+ cursor BLOB CHECK(cursor IS NULL OR length(cursor) IN (32,33)),
  checked_records INTEGER NOT NULL CHECK(checked_records>=0),
  checked_bytes INTEGER NOT NULL CHECK(checked_bytes>=0),
  checkpoint_generation INTEGER,
@@ -70,6 +85,12 @@ CREATE TABLE blob_inspection_files (
  PRIMARY KEY(area,name)
 ) STRICT;
 CREATE TRIGGER record_invalidates_inspection AFTER INSERT ON records BEGIN
+ UPDATE record_inspection SET source_epoch=source_epoch+1,
+ phase=CASE WHEN phase IN ('records','blobs') THEN 'records' ELSE 'idle' END,
+ cursor=NULL,checked_records=0,checked_bytes=0,checkpoint_generation=NULL,checked_blob_files=0,checked_blob_bytes=0;
+ DELETE FROM blob_inspection_files; DELETE FROM blob_inspection_inventory;
+END;
+CREATE TRIGGER quarantine_invalidates_inspection AFTER INSERT ON quarantine_records BEGIN
  UPDATE record_inspection SET source_epoch=source_epoch+1,
  phase=CASE WHEN phase IN ('records','blobs') THEN 'records' ELSE 'idle' END,
  cursor=NULL,checked_records=0,checked_bytes=0,checkpoint_generation=NULL,checked_blob_files=0,checked_blob_bytes=0;
@@ -821,7 +842,7 @@ impl RecordStore {
     fn check_records(&self) -> Result<()> {
         let mut statement = self
             .conn
-            .prepare("SELECT id,length(bytes) FROM records ORDER BY id")?;
+            .prepare("SELECT scan_key,size FROM stored_record_sizes ORDER BY scan_key")?;
         let mut rows = statement.query([])?;
         let mut total = 0u64;
         let mut count = 0u64;
@@ -829,7 +850,7 @@ impl RecordStore {
             count = count.checked_add(1).ok_or(StorageError::BudgetExceeded)?;
             let id: Vec<u8> = row.get(0)?;
             let length: i64 = row.get(1)?;
-            if length <= 0 || length > MAX_RECORD as i64 || id.len() != 32 {
+            if length <= 0 || length > MAX_RECORD as i64 {
                 return Err(StorageError::Corrupt);
             }
             total = total
@@ -838,11 +859,7 @@ impl RecordStore {
             if count > self.limits.scan_records || total > self.limits.scan_bytes {
                 return Err(StorageError::BudgetExceeded);
             }
-            let id = Id {
-                kind: Kind::Record,
-                bytes: id.try_into().map_err(|_| StorageError::Corrupt)?,
-            };
-            self.record(id)?.ok_or(StorageError::Corrupt)?;
+            self.check_stored_record(&id)?;
         }
         let check: String = sql_inspection::run(&self.conn, self.limits.sql_inspection, || {
             Ok(self
@@ -871,6 +888,23 @@ impl RecordStore {
             [],
             |r| r.get(0),
         )?)
+    }
+    // サイズ確認と予算判定後、同じロック下の対象コピーだけを読む。
+    fn check_stored_record(&self, scan_key: &[u8]) -> Result<()> {
+        let (raw_id, query) = match scan_key {
+            [id @ .., 1] if id.len() == 32 => {
+                (id, "SELECT bytes FROM quarantine_records WHERE id=?1")
+            }
+            id if id.len() == 32 => (id, "SELECT bytes FROM records WHERE id=?1"),
+            _ => return Err(StorageError::Corrupt),
+        };
+        let id = Id {
+            kind: Kind::Record,
+            bytes: raw_id.try_into().map_err(|_| StorageError::Corrupt)?,
+        };
+        let bytes: Vec<u8> = self.conn.query_row(query, [raw_id], |row| row.get(0))?;
+        LocalRecord::check(&bytes, Some(id)).map_err(|_| StorageError::Corrupt)?;
+        Ok(())
     }
     pub fn record(&self, id: Id) -> Result<Option<LocalRecord>> {
         if id.kind != Kind::Record {
@@ -1133,3 +1167,6 @@ pub use publication::{
 };
 
 mod pin;
+
+mod receipt;
+pub use receipt::RecordReceipt;

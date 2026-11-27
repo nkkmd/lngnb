@@ -297,6 +297,8 @@ mod tests {
         let token = page["snapshot_id"].as_str().unwrap();
         let cursor = page["next_cursor"].as_str().unwrap();
         assert_eq!(page["listing_complete"], false);
+        w.receive_record(&rev(&[], 14, "pending submission"))
+            .unwrap();
         let again = format!("{alias}&snapshot_id={token}");
         assert_eq!(get(&mut w, &again).1, page);
         let next = format!("{again}&cursor={cursor}");
