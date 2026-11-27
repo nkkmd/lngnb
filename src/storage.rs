@@ -16,7 +16,7 @@ use std::{
 };
 
 pub const IMPLEMENTATION: &str = "lngnb-rust-sqlite-1";
-pub const SCHEMA_VERSION: i64 = 24;
+pub const SCHEMA_VERSION: i64 = 25;
 const DB: &str = "database.sqlite";
 const SCHEMA: &str = "
 CREATE TABLE storage_state (
@@ -45,6 +45,16 @@ CREATE TABLE records (
 ) STRICT;
 CREATE TRIGGER records_no_update BEFORE UPDATE ON records BEGIN SELECT RAISE(ABORT,'immutable_record'); END;
 CREATE TRIGGER records_no_delete BEFORE DELETE ON records BEGIN SELECT RAISE(ABORT,'immutable_record'); END;
+CREATE TABLE quarantine_records (
+ id BLOB PRIMARY KEY NOT NULL CHECK(length(id)=32),
+ bytes BLOB NOT NULL CHECK(length(bytes) BETWEEN 1 AND 2097152)
+) STRICT;
+CREATE TABLE record_receipts (
+ id BLOB PRIMARY KEY NOT NULL CHECK(length(id)=32),
+ verifier BLOB NOT NULL CHECK(length(verifier)=32),
+ record_id BLOB NOT NULL REFERENCES quarantine_records(id),
+ received_at INTEGER NOT NULL
+) STRICT;
 CREATE TABLE record_inspection (
  singleton INTEGER PRIMARY KEY CHECK(singleton=1),
  source_epoch INTEGER NOT NULL CHECK(source_epoch>=0),
@@ -1133,3 +1143,6 @@ pub use publication::{
 };
 
 mod pin;
+
+mod receipt;
+pub use receipt::RecordReceipt;
