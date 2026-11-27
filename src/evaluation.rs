@@ -717,7 +717,7 @@ fn publish(tx: &Transaction<'_>, computed: &mut Computed, limits: EvaluationLimi
             )?;
         }
         tx.execute(
-            "INSERT INTO evaluations(record_id,validation,payload,reason,related,payload_reason,payload_blob) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            "INSERT INTO evaluations(record_id,validation,payload,reason,related,payload_reason,payload_blob,declared_length) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
             params![
                 &row.record_id.bytes,
                 row.validation.text(),
@@ -725,7 +725,8 @@ fn publish(tx: &Transaction<'_>, computed: &mut Computed, limits: EvaluationLimi
                 row.reason.map(Reason::code),
                 row.related.map(|id| id.bytes),
                 row.payload_reason.map(PayloadReason::code),
-                computed.nodes[&row.record_id.bytes].payload.map(|(blob, _)| blob)
+                computed.nodes[&row.record_id.bytes].payload.map(|(blob, _)| blob),
+                computed.nodes[&row.record_id.bytes].payload.map(|(_, length)| length)
             ],
         )?;
     }

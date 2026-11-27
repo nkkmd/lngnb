@@ -607,6 +607,47 @@ fn foreground_https_serves_verified_record_after_failed_connections() {
         let start = response.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
         let body: serde_json::Value = serde_json::from_slice(&response[start..]).unwrap();
         if target == id {
+            let knowledge = body["knowledge_id"].as_str().unwrap();
+            let mut client = verified_https_client(&cert, address);
+            write!(client, "GET /v1/knowledge/{knowledge}?scope=untrusted&genesis_id={id} HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+            let mut response = Vec::new();
+            client.read_to_end(&mut response).unwrap();
+            assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+            let start = response.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+            let metadata: serde_json::Value = serde_json::from_slice(&response[start..]).unwrap();
+            assert_eq!(
+                metadata,
+                serde_json::json!({"knowledge_id":knowledge,"genesis_record_id":id.to_string(),"api_version":"lngnb-http-1","scope":"untrusted","trust_anchor":"untrusted","publisher_verified":false,"heads":[shared.id().to_string()],"local_state":body["local_state"]})
+            );
+            let query = |target: &str| {
+                let mut client = verified_https_client(&cert, address);
+                write!(
+                    client,
+                    "GET /v1/knowledge/{target} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                )
+                .unwrap();
+                let mut response = Vec::new();
+                client.read_to_end(&mut response).unwrap();
+                response
+            };
+            let unavailable = query(knowledge);
+            assert!(unavailable.starts_with(b"HTTP/1.1 404 Not Found\r\n"));
+            let missing = lngnb::id::Id {
+                kind: lngnb::id::Kind::Knowledge,
+                bytes: [0; 32],
+            };
+            assert_eq!(unavailable, query(&missing.to_string()));
+            assert_eq!(
+                unavailable,
+                query(&format!(
+                    "{knowledge}?scope=untrusted&genesis_id={}",
+                    shared.id()
+                ))
+            );
+            assert!(
+                query(&format!("{knowledge}?scope=untrusted"))
+                    .starts_with(b"HTTP/1.1 400 Bad Request\r\n")
+            );
             let state = &body["local_state"];
             for (header, value) in [
                 ("LNGNB-State-Namespace", &state["namespace"]),

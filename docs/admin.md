@@ -95,7 +95,7 @@
 ## 固定RecordのHTTPS待受け
 
 `lngnb admin serve --data-dir PATH --https-listen IP:PORT --https-cert CERT.pem --https-key KEY.pem`
-で固定RecordとBlobの取得をTLS 1.3・HTTP/1.1で受け付けます。HTTPSを使う場合は3項目を一緒に指定します。
+で固定Record・Blobの取得とKnowledge状態照会をTLS 1.3・HTTP/1.1で受け付けます。HTTPSを使う場合は3項目を一緒に指定します。
 試験用のローカル待受けには `127.0.0.1:0` を指定でき、実際のアドレスは起動時の出力で確認できます。
 秘密鍵は実効UIDの所有とし、グループとその他の権限を外します。証明書と鍵の読込みや照合に失敗すると起動を拒否します。
 
@@ -254,6 +254,10 @@ ENOENT、接続拒否、排他取得、PID不在、metadata一致だけでは、
 保持中socketの個別inode/cookie照会方式は、[実装計画書§5.88](implementation-plan.md#588-工程⑤inodecookieによる保持socket照会の非破壊方式検証)の試験専用probeで検証します。製品の診断/整理操作ではなく、作成元の永続来歴や削除資格はまだ提供しません。
 
 明示した新規主socketに限る、非永続の作成根拠取得/現在照合の内部APIを追加しています（[計画書§5.89](implementation-plan.md#589-工程⑤明示した新規主socketの非永続作成根拠と現在照合)）。同じ根拠/context/pathに束縛した期限付きkernel個別照会も内部APIへ接続しています（[計画書§5.90](implementation-plan.md#590-工程⑤非永続根拠に束縛した期限付きkernel個別照会)）。補助3socketにも非永続作成根拠・共通生存診断を適用しています（[計画書§5.92](implementation-plan.md#592-工程⑤補助3socketの非永続作成根拠と共通生存診断)）。製品CLI・永続来歴・不使用/削除資格には未接続です。ENOENTは対象不在と診断機能未提供を区別できないため取得不能として拒否し、不在の成功値や整理許可を返しません。
+
+### Knowledge状態照会
+
+`GET /v1/knowledge/{knowledge_id}` は通常公開を既定とし、未確認公開では `scope=untrusted&genesis_id=...` を指定します。応答の `heads` と `local_state` は同じ公開範囲・同じ読取時点に対応します。Genesisだけを公開した範囲では `heads` は空です。公開対象のない範囲は404です。
 
 ### 固定Recordの評価来歴
 
