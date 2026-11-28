@@ -1152,7 +1152,7 @@ pub use evaluation::{
     Assessment, EvaluationBlobBudget, EvaluationBlobProgress, EvaluationInputBudget,
     EvaluationInputProgress, EvaluationJob, EvaluationLimits, EvaluationProgress,
     EvaluationSnapshot, EvaluationStepBudget, EvidenceRecoveryReview, PayloadReason, PayloadStatus,
-    Reason, Validation,
+    QuarantineAssessment, Reason, Validation,
 };
 
 #[path = "record_inspection.rs"]
