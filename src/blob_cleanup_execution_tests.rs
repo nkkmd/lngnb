@@ -66,8 +66,8 @@ fn outstanding_plan_cannot_remove_a_preexisting_quarantine_reference() {
     let record = rev(&[], 14, "private reference");
     let tx = w.store.conn.transaction().unwrap();
     tx.execute(
-        "INSERT INTO quarantine_records VALUES(?1,?2)",
-        params![record.id().bytes, record.bytes()],
+        "INSERT INTO quarantine_records(id,bytes,payload_id,declared_length) VALUES(?1,?2,?3,?4)",
+        params![record.id().bytes, record.bytes(), plan.blob_id.bytes, 14],
     )
     .unwrap();
     tx.execute(

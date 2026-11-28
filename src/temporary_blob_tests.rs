@@ -319,7 +319,7 @@ fn clock_rollback_rejects_new_promise_and_keeps_old_one() {
 }
 #[test]
 fn old_schemas_are_rejected_without_mutation_or_automatic_migration() {
-    for version in 1..=8 {
+    for version in 1..SCHEMA_VERSION {
         let t = Temp::new();
         drop(t.store());
         let c = Connection::open(t.data().join(DB)).unwrap();

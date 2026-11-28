@@ -10,6 +10,137 @@ pub struct RecordReceipt {
     pub secret: Zeroizing<String>,
 }
 
+/// 管理用の本文照合結果。各隔離Revisionの宣言に対して判定する。
+#[derive(Debug, PartialEq, Eq)]
+pub enum QuarantinePayload {
+    NoPayload,
+    Missing,
+    Retained,
+    LengthMismatch { declared: u64, actual: u64 },
+}
+
+fn inspect_payload(
+    conn: &Connection,
+    root: &OwnedFd,
+    budget: u64,
+    id: Id,
+) -> Result<QuarantinePayload> {
+    let mut scan_key = id.bytes.to_vec();
+    scan_key.push(1);
+    let checked = RecordStore::checked_stored_record(conn, &scan_key)?;
+    let Some((bytes, declared)) = checked.payload().map_err(|_| StorageError::Corrupt)? else {
+        return Ok(QuarantinePayload::NoPayload);
+    };
+    let Some((_, actual)) = RecordStore::verified_blob(
+        conn,
+        root,
+        budget,
+        Id {
+            kind: Kind::Blob,
+            bytes,
+        },
+    )?
+    else {
+        return Ok(QuarantinePayload::Missing);
+    };
+    Ok(if actual == declared {
+        QuarantinePayload::Retained
+    } else {
+        QuarantinePayload::LengthMismatch { declared, actual }
+    })
+}
+
+impl RecordStore {
+    /// 採用済みの隔離入力について現在の本文を再検査する管理用内部照合。
+    pub fn quarantine_payload(&self, record: Id) -> Result<Option<QuarantinePayload>> {
+        if record.kind != Kind::Record {
+            return Ok(None);
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        let adopted: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM quarantine_records WHERE id=?1 AND adopted=1)",
+            [record.bytes],
+            |r| r.get(0),
+        )?;
+        let result = if adopted {
+            Some(inspect_payload(
+                &tx,
+                &self.dir,
+                self.limits.scan_blob_bytes,
+                record,
+            )?)
+        } else {
+            None
+        };
+        tx.commit()?;
+        Ok(result)
+    }
+}
+
+impl RecordWriter {
+    /// 隔離入力を本文照合・保持の対象へ採用する。投稿者への受付応答とは別の操作。
+    pub fn adopt_quarantine_record(
+        &mut self,
+        record: Id,
+        byte_limit: u64,
+    ) -> Result<Option<QuarantinePayload>> {
+        if self.failed {
+            return Err(StorageError::UnresolvedFailure);
+        }
+        if record.kind != Kind::Record {
+            return Ok(None);
+        }
+        let result = (|| {
+            let capacity = self.store.capacity()?;
+            let tx = self.store.conn.transaction()?;
+            let existing: Option<bool> = tx
+                .query_row(
+                    "SELECT adopted FROM quarantine_records WHERE id=?1",
+                    [record.bytes],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let Some(adopted) = existing else {
+                return Ok(None);
+            };
+            let state = inspect_payload(
+                &tx,
+                &self.store.dir,
+                self.store.limits.scan_blob_bytes,
+                record,
+            )?;
+            if !adopted {
+                if capacity.available <= capacity.reserved_floor.saturating_add(65536) {
+                    return Err(StorageError::Capacity);
+                }
+                tx.execute(
+                    "UPDATE quarantine_records SET adopted=1 WHERE id=?1",
+                    [record.bytes],
+                )?;
+                let size: u64 = sql_inspection::run(&tx, self.store.limits.sql_inspection, || {
+                    Ok(tx.query_row(
+                        "SELECT coalesce(sum(byte_length),0) FROM quarantine_blob_usage",
+                        [],
+                        |r| r.get(0),
+                    )?)
+                })?;
+                if size > byte_limit {
+                    return Err(StorageError::Capacity);
+                }
+            }
+            tx.commit()?;
+            Ok(Some(state))
+        })();
+        if result
+            .as_ref()
+            .is_err_and(|err| !matches!(err, StorageError::BudgetExceeded | StorageError::Capacity))
+        {
+            self.failed = true;
+        }
+        result
+    }
+}
+
 struct Credentials {
     id: [u8; 32],
     secret: Zeroizing<[u8; 32]>,
@@ -23,13 +154,16 @@ impl Credentials {
         max_bytes: u64,
         max_receipts: u64,
     ) -> Result<()> {
+        let payload = record.payload().map_err(|_| StorageError::Corrupt)?;
+        let blob = payload.map(|(id, _)| id);
+        let length = payload.map(|(_, n)| n);
         tx.execute(
-            "INSERT INTO quarantine_records VALUES(?1,?2) ON CONFLICT(id) DO NOTHING",
-            params![record.id().bytes, record.bytes()],
+            "INSERT INTO quarantine_records(id,bytes,payload_id,declared_length) VALUES(?1,?2,?3,?4) ON CONFLICT(id) DO NOTHING",
+            params![record.id().bytes, record.bytes(), blob, length],
         )?;
         let identical: bool = tx.query_row(
-            "SELECT bytes=?2 FROM quarantine_records WHERE id=?1",
-            params![record.id().bytes, record.bytes()],
+            "SELECT bytes=?2 AND payload_id IS ?3 AND declared_length IS ?4 FROM quarantine_records WHERE id=?1",
+            params![record.id().bytes, record.bytes(), blob, length],
             |row| row.get(0),
         )?;
         if !identical {
@@ -119,6 +253,125 @@ impl RecordWriter {
 #[cfg(test)]
 mod tests {
     use crate::storage::tests::{Temp, fixture, logical_snapshot};
+
+    #[test]
+    fn quarantine_adoption_checks_real_bytes_and_charges_shared_payload_once() {
+        use super::{Limits, QuarantinePayload::*, RecordStore, StorageError, TemporaryLimits};
+        use crate::storage::evaluation::tests::{bytes, rev};
+        for blob_first in [false, true] {
+            let t = Temp::new();
+            let mut w = t.store().begin().unwrap();
+            let good = rev(&[], 14, "correct");
+            let bad = rev(&[], 15, "conflict");
+            let blob = crate::id::blob_id(&bytes());
+            if blob_first {
+                w.stage_blob(blob, bytes().as_slice(), 1, TemporaryLimits::default())
+                    .unwrap();
+            }
+            for record in [&good, &bad] {
+                w.receive_record(record).unwrap();
+            }
+            assert_eq!(w.store.quarantine_payload(good.id()).unwrap(), None);
+            if blob_first {
+                assert!(matches!(
+                    w.adopt_quarantine_record(good.id(), 13),
+                    Err(StorageError::Capacity)
+                ));
+                assert_eq!(w.store.quarantine_payload(good.id()).unwrap(), None);
+            }
+            let expected = if blob_first { Retained } else { Missing };
+            assert_eq!(
+                w.adopt_quarantine_record(good.id(), 14).unwrap(),
+                Some(expected)
+            );
+            let second = w.adopt_quarantine_record(bad.id(), 14).unwrap();
+            assert_eq!(
+                second,
+                Some(if blob_first {
+                    LengthMismatch {
+                        declared: 15,
+                        actual: 14,
+                    }
+                } else {
+                    Missing
+                })
+            );
+            if !blob_first {
+                w.stage_blob(blob, bytes().as_slice(), 1, TemporaryLimits::default())
+                    .unwrap();
+            }
+            assert_eq!(
+                w.adopt_quarantine_record(good.id(), 14).unwrap(),
+                Some(Retained)
+            );
+            assert!(w.record(good.id()).unwrap().is_none());
+            w.finish().unwrap();
+            let store = RecordStore::open(&t.data(), Limits::default()).unwrap();
+            assert_eq!(
+                store.quarantine_payload(bad.id()).unwrap(),
+                Some(LengthMismatch {
+                    declared: 15,
+                    actual: 14
+                })
+            );
+            let usage: (i64, i64) = store
+                .conn
+                .query_row(
+                    "SELECT count(*),sum(byte_length) FROM quarantine_blob_usage",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(usage, (1, 14));
+        }
+    }
+
+    #[test]
+    fn altered_payload_declaration_is_not_accepted_on_reopen() {
+        use super::{Limits, RecordStore, StorageError};
+        use crate::storage::evaluation::tests::rev;
+        let t = Temp::new();
+        let mut w = t.store().begin().unwrap();
+        let record = rev(&[], 14, "signed declaration");
+        w.receive_record(&record).unwrap();
+        w.finish().unwrap();
+        let db = rusqlite::Connection::open(t.data().join(super::DB)).unwrap();
+        db.execute(
+            "UPDATE quarantine_records SET declared_length=declared_length+1",
+            [],
+        )
+        .unwrap();
+        drop(db);
+        assert!(matches!(
+            RecordStore::open(&t.data(), Limits::default()),
+            Err(StorageError::Corrupt)
+        ));
+    }
+
+    #[test]
+    fn corrupt_existing_blob_blocks_adoption_but_does_not_change_receipt() {
+        use super::{StorageError, TemporaryLimits, blobs};
+        use crate::storage::evaluation::tests::{bytes, rev};
+        let t = Temp::new();
+        let mut w = t.store().begin().unwrap();
+        let blob = crate::id::blob_id(&bytes());
+        w.stage_blob(blob, bytes().as_slice(), 1, TemporaryLimits::default())
+            .unwrap();
+        std::fs::write(
+            t.data().join("blobs").join(blobs::hex(&blob.bytes)),
+            vec![0; 14],
+        )
+        .unwrap();
+        let record = rev(&[], 14, "private receipt");
+        w.receive_record(&record).unwrap();
+        let before = logical_snapshot(&w.store.conn);
+        assert!(matches!(
+            w.adopt_quarantine_record(record.id(), 14),
+            Err(StorageError::Corrupt)
+        ));
+        assert_eq!(before, logical_snapshot(&w.store.conn));
+        assert!(w.finish().is_err());
+    }
 
     #[test]
     fn receipt_retry_changes_only_private_rows() {

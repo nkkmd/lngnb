@@ -80,7 +80,7 @@ fn temporary_budget_inner(
     limits: TemporaryLimits,
 ) -> Result<()> {
     let (count, size, present): (i64,i64,bool) = conn.query_row(
-        "SELECT (SELECT count(*) FROM temporary_blob_holds),coalesce((SELECT sum(byte_length) FROM blobs WHERE id IN (SELECT blob_id FROM temporary_blob_holds)),0),EXISTS(SELECT 1 FROM blobs b WHERE b.id=?1 AND EXISTS(SELECT 1 FROM temporary_blob_holds t WHERE t.blob_id=b.id))",
+        "SELECT (SELECT count(*) FROM temporary_blob_holds),coalesce((SELECT sum(byte_length) FROM quarantine_blob_usage),0),EXISTS(SELECT 1 FROM quarantine_blob_usage WHERE id=?1)",
         [&id.bytes], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
     if count < 0 || size < 0 {
         return Err(StorageError::Corrupt);
@@ -263,11 +263,20 @@ impl RecordStore {
     }
     /// 保持台帳にある正常な本文だけを返すローカル読取り。一般配信資格ではない。
     pub fn blob(&self, id: Id) -> Result<Option<File>> {
+        Self::verified_blob(&self.conn, &self.dir, self.limits.scan_blob_bytes, id)
+            .map(|found| found.map(|(file, _)| file))
+    }
+
+    pub(super) fn verified_blob(
+        conn: &Connection,
+        root: &OwnedFd,
+        budget: u64,
+        id: Id,
+    ) -> Result<Option<(File, u64)>> {
         if id.kind != Kind::Blob {
             return Err(StorageError::InvalidBlobId);
         }
-        let length: Option<i64> = self
-            .conn
+        let length: Option<i64> = conn
             .query_row(
                 "SELECT byte_length FROM blobs WHERE id=?1",
                 [&id.bytes],
@@ -277,9 +286,9 @@ impl RecordStore {
         match length {
             None => Ok(None),
             Some(n) if n >= 0 => {
-                let dir = blob_directory(&self.dir, "blobs")?;
-                match verify_file(&dir, id, Some(n as u64), self.limits.scan_blob_bytes) {
-                    Ok((file, _)) => Ok(Some(file)),
+                let dir = blob_directory(root, "blobs")?;
+                match verify_file(&dir, id, Some(n as u64), budget) {
+                    Ok(verified) => Ok(Some(verified)),
                     Err(StorageError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
                         Err(StorageError::Corrupt)
                     }

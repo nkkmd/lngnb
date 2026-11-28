@@ -16,7 +16,7 @@ use std::{
 };
 
 pub const IMPLEMENTATION: &str = "lngnb-rust-sqlite-1";
-pub const SCHEMA_VERSION: i64 = 25;
+pub const SCHEMA_VERSION: i64 = 26;
 const DB: &str = "database.sqlite";
 const SCHEMA: &str = "
 CREATE TABLE storage_state (
@@ -47,8 +47,13 @@ CREATE TRIGGER records_no_update BEFORE UPDATE ON records BEGIN SELECT RAISE(ABO
 CREATE TRIGGER records_no_delete BEFORE DELETE ON records BEGIN SELECT RAISE(ABORT,'immutable_record'); END;
 CREATE TABLE quarantine_records (
  id BLOB PRIMARY KEY NOT NULL CHECK(length(id)=32),
- bytes BLOB NOT NULL CHECK(length(bytes) BETWEEN 1 AND 2097152)
+ bytes BLOB NOT NULL CHECK(length(bytes) BETWEEN 1 AND 2097152),
+ payload_id BLOB CHECK(payload_id IS NULL OR length(payload_id)=32),
+ declared_length INTEGER CHECK(declared_length IS NULL OR declared_length>=0),
+ adopted INTEGER NOT NULL DEFAULT 0 CHECK(adopted IN (0,1)),
+ CHECK((payload_id IS NULL)=(declared_length IS NULL))
 ) STRICT;
+CREATE INDEX quarantine_payload ON quarantine_records(payload_id) WHERE payload_id IS NOT NULL;
 -- 同一IDが両領域にあっても、分割起動検査では各コピーを別々に検査する。
 CREATE INDEX quarantine_inspection_key ON quarantine_records(CAST(id || x'01' AS BLOB));
 CREATE VIEW stored_record_sizes AS
@@ -122,6 +127,12 @@ CREATE TABLE temporary_blob_holds (
 ) STRICT;
 CREATE INDEX temporary_by_blob ON temporary_blob_holds(blob_id);
 CREATE TRIGGER temporary_no_update BEFORE UPDATE ON temporary_blob_holds BEGIN SELECT RAISE(ABORT,'immutable_temporary_promise'); END;
+-- 仮保存と隔離参照が重なっても、実在する同一Blobの実長は一度だけ課金する。
+CREATE VIEW quarantine_blob_usage AS
+ SELECT b.id,b.byte_length FROM blobs b WHERE b.id IN (
+ SELECT blob_id FROM temporary_blob_holds
+ UNION SELECT q.payload_id FROM quarantine_records q WHERE q.adopted=1 AND q.payload_id IS NOT NULL
+ AND NOT EXISTS(SELECT 1 FROM manual_blob_holds m WHERE m.blob_id=q.payload_id));
 CREATE TRIGGER temporary_no_delete BEFORE DELETE ON temporary_blob_holds BEGIN SELECT RAISE(ABORT,'temporary_cleanup_unimplemented'); END;
 CREATE TRIGGER blob_invalidates_inspection AFTER INSERT ON blobs BEGIN
  UPDATE record_inspection SET source_epoch=source_epoch+1,
@@ -891,18 +902,33 @@ impl RecordStore {
     }
     // サイズ確認と予算判定後、同じロック下の対象コピーだけを読む。
     fn checked_stored_record(conn: &Connection, scan_key: &[u8]) -> Result<LocalRecord> {
-        let (raw_id, query) = match scan_key {
-            [id @ .., 1] if id.len() == 32 => {
-                (id, "SELECT bytes FROM quarantine_records WHERE id=?1")
+        if let [raw_id @ .., 1] = scan_key {
+            if raw_id.len() == 32 {
+                let id = Id {
+                    kind: Kind::Record,
+                    bytes: raw_id.try_into().map_err(|_| StorageError::Corrupt)?,
+                };
+                let (bytes, blob, length): (Vec<u8>, Option<[u8;32]>, Option<u64>) = conn.query_row(
+                    "SELECT bytes,payload_id,declared_length FROM quarantine_records WHERE id=?1",
+                    [raw_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+                )?;
+                let record =
+                    LocalRecord::check(&bytes, Some(id)).map_err(|_| StorageError::Corrupt)?;
+                let payload = record.payload().map_err(|_| StorageError::Corrupt)?;
+                if (blob, length) != (payload.map(|p| p.0), payload.map(|p| p.1)) {
+                    return Err(StorageError::Corrupt);
+                }
+                return Ok(record);
             }
-            id if id.len() == 32 => (id, "SELECT bytes FROM records WHERE id=?1"),
-            _ => return Err(StorageError::Corrupt),
-        };
+        }
         let id = Id {
             kind: Kind::Record,
-            bytes: raw_id.try_into().map_err(|_| StorageError::Corrupt)?,
+            bytes: scan_key.try_into().map_err(|_| StorageError::Corrupt)?,
         };
-        let bytes: Vec<u8> = conn.query_row(query, [raw_id], |row| row.get(0))?;
+        let bytes: Vec<u8> =
+            conn.query_row("SELECT bytes FROM records WHERE id=?1", [scan_key], |row| {
+                row.get(0)
+            })?;
         LocalRecord::check(&bytes, Some(id)).map_err(|_| StorageError::Corrupt)
     }
     pub fn record(&self, id: Id) -> Result<Option<LocalRecord>> {
@@ -1168,4 +1194,4 @@ pub use publication::{
 mod pin;
 
 mod receipt;
-pub use receipt::RecordReceipt;
+pub use receipt::{QuarantinePayload, RecordReceipt};
