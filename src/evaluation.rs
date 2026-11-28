@@ -169,6 +169,13 @@ enum BlobFact {
     Verified(u64),
     Unavailable,
 }
+/// 採用済み隔離Recordの管理用診断。pinと発行鍵の一致は本文の移行許可と別に扱う。
+#[derive(Debug, PartialEq, Eq)]
+pub struct QuarantineAssessment {
+    pub assessment: Assessment,
+    pub pinned_genesis_publisher: bool,
+}
+
 struct Computed {
     snapshot: EvaluationSnapshot,
     nodes: BTreeMap<Key, Node>,
@@ -185,6 +192,64 @@ impl RecordStore {
     /// 異常起動時も診断できるが、手動確認待ちを解除せず公開資格も付与しない。
     pub fn evaluate(&self, limits: EvaluationLimits) -> Result<EvaluationSnapshot> {
         Ok(self.compute_evaluation(limits)?.snapshot)
+    }
+    /// 通常保存と採用済み隔離入力を同じ読取りtransactionで再検査する。
+    /// 結果を通常評価・公開索引・受付票へ書き戻さない。
+    pub fn evaluate_quarantined_record(
+        &self,
+        id: Id,
+        limits: EvaluationLimits,
+    ) -> Result<Option<QuarantineAssessment>> {
+        if id.kind != Kind::Record {
+            return Ok(None);
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        let adopted: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM quarantine_records WHERE id=?1 AND adopted=1)",
+            [id.bytes],
+            |r| r.get(0),
+        )?;
+        if !adopted {
+            return Ok(None);
+        }
+        let budget = Budget {
+            start: Instant::now(),
+            limits,
+        };
+        let (nodes, epoch) = sql_inspection::run(
+            &tx,
+            self.limits
+                .sql_inspection
+                .within(budget.start, limits.elapsed),
+            || self.collect_nodes(&budget, true),
+        )?;
+        let node = nodes.get(&id.bytes).ok_or(StorageError::Corrupt)?;
+        let pinned_genesis_publisher = node.identity.kind == RecordKind::Revision
+            && base_result(node, &nodes).is_none()
+            && self.saved_pin(Id {
+                kind: Kind::Knowledge,
+                bytes: node.identity.knowledge,
+            })? == Some(record_id(node.genesis));
+        let computed = self.evaluation_from_nodes(nodes, budget, epoch, false)?;
+        if computed.storage_fault {
+            return Err(StorageError::Corrupt);
+        }
+        let records = evaluate_graph(
+            &computed.nodes,
+            &computed.blobs,
+            &computed.known,
+            &computed.budget,
+        )?;
+        let assessment = records
+            .into_iter()
+            .find(|a| a.record_id == id)
+            .ok_or(StorageError::Corrupt)?;
+        computed.validate_evidence(&self.dir, &tx)?;
+        tx.commit()?;
+        Ok(Some(QuarantineAssessment {
+            assessment,
+            pinned_genesis_publisher,
+        }))
     }
     pub(super) fn diagnostic_evaluation(
         &self,
@@ -218,23 +283,36 @@ impl RecordStore {
         self.evaluation_from_nodes(nodes, budget, record_epoch, true)
     }
     fn collect_evaluation_nodes(&self, budget: &Budget) -> Result<(BTreeMap<Key, Node>, i64)> {
+        self.collect_nodes(budget, false)
+    }
+    fn collect_nodes(
+        &self,
+        budget: &Budget,
+        include_adopted: bool,
+    ) -> Result<(BTreeMap<Key, Node>, i64)> {
         let limits = budget.limits;
         budget.check()?;
         let record_epoch = preparation::epoch(&self.conn)?;
         let mut nodes = BTreeMap::new();
         let mut byte_budget = limits.record_bytes;
         let mut edge_budget = limits.edges;
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id,length(bytes) FROM records ORDER BY id")?;
+        let query = if include_adopted {
+            "SELECT id,length(bytes),0 FROM records UNION ALL
+             SELECT id,length(bytes),1 FROM quarantine_records WHERE adopted=1"
+        } else {
+            "SELECT id,length(bytes),0 FROM records ORDER BY id"
+        };
+        let mut stmt = self.conn.prepare(query)?;
         let mut rows = stmt.query([])?;
+        let mut remaining_records = limits.records;
         while let Some(row) = rows.next()? {
             budget.check()?;
-            if nodes.len() as u64 >= limits.records {
-                return Err(StorageError::BudgetExceeded);
-            }
+            remaining_records = remaining_records
+                .checked_sub(1)
+                .ok_or(StorageError::BudgetExceeded)?;
             let raw: Vec<u8> = row.get(0)?;
             let key: Key = raw.try_into().map_err(|_| StorageError::Corrupt)?;
+            let quarantined: bool = row.get(2)?;
             let n: i64 = row.get(1)?;
             if n <= 0 || n > MAX_RECORD as i64 {
                 return Err(StorageError::Corrupt);
@@ -242,12 +320,18 @@ impl RecordStore {
             byte_budget = byte_budget
                 .checked_sub(n as u64)
                 .ok_or(StorageError::BudgetExceeded)?;
-            let record = self.record(record_id(key))?.ok_or(StorageError::Corrupt)?;
+            let record = if quarantined {
+                let mut scan_key = key.to_vec();
+                scan_key.push(1);
+                Self::checked_stored_record(&self.conn, &scan_key)?
+            } else {
+                self.record(record_id(key))?.ok_or(StorageError::Corrupt)?
+            };
             let node = Node::from_record(&record)?;
             edge_budget = edge_budget
                 .checked_sub(node.parents.len() as u64)
                 .ok_or(StorageError::BudgetExceeded)?;
-            nodes.insert(key, node);
+            nodes.insert(record.id().bytes, node);
         }
         Ok((nodes, record_epoch))
     }

@@ -1176,3 +1176,138 @@ fn appended_retained_blob_is_corruption_not_a_policy_limit() {
         );
     }
 }
+
+#[test]
+fn adopted_quarantine_ancestors_and_pinned_signer_are_independent() {
+    use crate::storage::tests::logical_snapshot;
+    let t = Temp::new();
+    let mut w = t.store().begin().unwrap();
+    let genesis = fixture();
+    let knowledge = Id {
+        kind: Kind::Knowledge,
+        bytes: genesis.identity().knowledge,
+    };
+    let parent = rev(&[], 14, "private parent");
+    let child = rev(&[parent.id()], 14, "private child");
+    let wrong = LocalRecord::sign(
+        child.body().clone(),
+        &ed25519_dalek::SigningKey::from_bytes(&[3; 32]),
+    )
+    .unwrap();
+    let evaluate = |w: &RecordWriter, record: &LocalRecord| {
+        w.store
+            .evaluate_quarantined_record(record.id(), EvaluationLimits::default())
+            .unwrap()
+    };
+    for record in [&parent, &child, &wrong] {
+        w.receive_record(record).unwrap();
+    }
+    assert!(evaluate(&w, &child).is_none());
+    for record in [&child, &wrong] {
+        w.adopt_quarantine_record(record.id(), 1024).unwrap();
+    }
+    let result = evaluate(&w, &child).unwrap();
+    assert_eq!(result.assessment.reason, Some(Reason::MissingGenesis));
+    assert!(!result.pinned_genesis_publisher);
+    w.insert(&genesis).unwrap();
+    w.save_pin(knowledge, Some(genesis.id()), "pin").unwrap();
+    let result = evaluate(&w, &child).unwrap();
+    assert_eq!(result.assessment.reason, Some(Reason::MissingParent));
+    assert!(result.pinned_genesis_publisher);
+    let denied = evaluate(&w, &wrong).unwrap();
+    assert_eq!(denied.assessment.reason, Some(Reason::WrongPublisher));
+    assert!(!denied.pinned_genesis_publisher);
+    w.adopt_quarantine_record(parent.id(), 1024).unwrap();
+    let before = logical_snapshot(&w.store.conn);
+    assert_eq!(
+        evaluate(&w, &child).unwrap().assessment.validation,
+        Validation::Valid
+    );
+    assert!(matches!(
+        w.store.evaluate_quarantined_record(
+            child.id(),
+            EvaluationLimits {
+                records: 1,
+                ..EvaluationLimits::default()
+            }
+        ),
+        Err(StorageError::BudgetExceeded)
+    ));
+    assert_eq!(logical_snapshot(&w.store.conn), before);
+    assert!(w.record(child.id()).unwrap().is_none());
+    w.save_pin(knowledge, None, "withdraw").unwrap();
+    assert!(!evaluate(&w, &child).unwrap().pinned_genesis_publisher);
+    w.finish().unwrap();
+}
+
+#[test]
+fn private_evaluation_keeps_same_knowledge_genesis_candidates_separate() {
+    let t = Temp::new();
+    let mut w = t.store().begin().unwrap();
+    let genesis = fixture();
+    let knowledge = Id {
+        kind: Kind::Knowledge,
+        bytes: genesis.identity().knowledge,
+    };
+    w.insert(&genesis).unwrap();
+    w.save_pin(knowledge, Some(genesis.id()), "pin").unwrap();
+    let other_key = ed25519_dalek::SigningKey::from_bytes(&[5; 32]);
+    let mut body = genesis.body().clone();
+    set(
+        &mut body,
+        "publisher_public_key",
+        Value::Bytes(other_key.verifying_key().to_bytes().to_vec()),
+    );
+    let other = LocalRecord::sign(body, &other_key).unwrap();
+    let mut body = revision().body().clone();
+    set(
+        &mut body,
+        "genesis_record_id",
+        Value::Bytes(other.id().bytes.to_vec()),
+    );
+    let sibling = LocalRecord::sign(body, &other_key).unwrap();
+    let cross = rev(&[sibling.id()], 14, "cross genesis");
+    for record in [&other, &sibling, &cross] {
+        w.receive_record(record).unwrap();
+        w.adopt_quarantine_record(record.id(), 1024).unwrap();
+    }
+    let evaluate = |id| {
+        w.store
+            .evaluate_quarantined_record(id, EvaluationLimits::default())
+            .unwrap()
+            .unwrap()
+    };
+    let separate = evaluate(sibling.id());
+    assert_eq!(separate.assessment.validation, Validation::Valid);
+    assert!(!separate.pinned_genesis_publisher);
+    let cross = evaluate(cross.id());
+    assert_eq!(cross.assessment.reason, Some(Reason::InvalidParent));
+    assert!(cross.pinned_genesis_publisher);
+    w.finish().unwrap();
+}
+
+#[test]
+fn private_parent_length_conflict_and_lost_blob_do_not_become_valid() {
+    let t = Temp::new();
+    let mut w = t.store().begin().unwrap();
+    let parent = rev(&[], 15, "declared mismatch");
+    let child = rev(&[parent.id()], 14, "descendant");
+    w.insert(&fixture()).unwrap();
+    let body = bytes();
+    let blob = id::blob_id(&body);
+    w.put_blob(blob, body.as_slice()).unwrap();
+    for record in [&parent, &child] {
+        w.receive_record(record).unwrap();
+        w.adopt_quarantine_record(record.id(), 1024).unwrap();
+    }
+    let diagnose = || {
+        w.store
+            .evaluate_quarantined_record(child.id(), EvaluationLimits::default())
+    };
+    assert_eq!(
+        diagnose().unwrap().unwrap().assessment.reason,
+        Some(Reason::InvalidParent)
+    );
+    std::fs::remove_file(t.data().join("blobs").join(blobs::hex(&blob.bytes))).unwrap();
+    assert!(matches!(diagnose(), Err(StorageError::Corrupt)));
+}
