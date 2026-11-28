@@ -859,7 +859,7 @@ impl RecordStore {
             if count > self.limits.scan_records || total > self.limits.scan_bytes {
                 return Err(StorageError::BudgetExceeded);
             }
-            self.check_stored_record(&id)?;
+            Self::checked_stored_record(&self.conn, &id)?;
         }
         let check: String = sql_inspection::run(&self.conn, self.limits.sql_inspection, || {
             Ok(self
@@ -890,7 +890,7 @@ impl RecordStore {
         )?)
     }
     // サイズ確認と予算判定後、同じロック下の対象コピーだけを読む。
-    fn check_stored_record(&self, scan_key: &[u8]) -> Result<()> {
+    fn checked_stored_record(conn: &Connection, scan_key: &[u8]) -> Result<LocalRecord> {
         let (raw_id, query) = match scan_key {
             [id @ .., 1] if id.len() == 32 => {
                 (id, "SELECT bytes FROM quarantine_records WHERE id=?1")
@@ -902,9 +902,8 @@ impl RecordStore {
             kind: Kind::Record,
             bytes: raw_id.try_into().map_err(|_| StorageError::Corrupt)?,
         };
-        let bytes: Vec<u8> = self.conn.query_row(query, [raw_id], |row| row.get(0))?;
-        LocalRecord::check(&bytes, Some(id)).map_err(|_| StorageError::Corrupt)?;
-        Ok(())
+        let bytes: Vec<u8> = conn.query_row(query, [raw_id], |row| row.get(0))?;
+        LocalRecord::check(&bytes, Some(id)).map_err(|_| StorageError::Corrupt)
     }
     pub fn record(&self, id: Id) -> Result<Option<LocalRecord>> {
         if id.kind != Kind::Record {

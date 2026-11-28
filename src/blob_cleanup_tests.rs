@@ -118,6 +118,52 @@ fn record_arrival_cancels_pending_plan_in_the_same_transaction() {
     }
 }
 #[test]
+fn quarantined_reference_protects_before_and_after_blob_arrival() {
+    for blob_first in [false, true] {
+        let t = Temp::new();
+        let mut w = t.store().begin().unwrap();
+        let before = blob_first.then(|| {
+            let blob = stage(&mut w);
+            let _ = plan(&mut w, blob);
+            blob
+        });
+        let revision = rev(&[], 15, "quarantined length mismatch");
+        w.receive_record(&revision).unwrap();
+        w.receive_record(&revision).unwrap();
+        let blob = before.unwrap_or_else(|| stage(&mut w));
+        if blob_first {
+            assert_eq!(
+                w.store.blob_cleanup_plans(1).unwrap()[0]
+                    .cancellation
+                    .as_deref(),
+                Some("record_reference")
+            );
+        }
+        assert!(w.record(revision.id()).unwrap().is_none());
+        assert_eq!(
+            w.plan_at(
+                blob.id,
+                CleanupBudget::default(),
+                blob.expires_at,
+                |_, _| Ok(())
+            )
+            .unwrap(),
+            CleanupDecision::Protected
+        );
+        w.insert(&revision).unwrap();
+        let snapshot = w.blob_protection(ProtectionBudget::default()).unwrap();
+        assert_eq!(snapshot.blobs[0].referencing_records, vec![revision.id()]);
+        assert!(matches!(
+            w.blob_protection(ProtectionBudget {
+                records: 1,
+                ..ProtectionBudget::default()
+            }),
+            Err(StorageError::BudgetExceeded)
+        ));
+        w.finish().unwrap();
+    }
+}
+#[test]
 fn manual_retention_and_new_temporary_promise_cancel_only_their_target() {
     for manual in [true, false] {
         let t = Temp::new();
@@ -329,7 +375,7 @@ fn plan_insert_and_history_failures_roll_back_generation_without_removing_bytes(
 }
 #[test]
 fn record_and_both_retention_changes_roll_back_if_plan_cancellation_cannot_persist() {
-    for operation in 0..3 {
+    for operation in 0..4 {
         for reject_history in [false, true] {
             let t = Temp::new();
             let mut w = t.store().begin().unwrap();
@@ -341,6 +387,7 @@ fn record_and_both_retention_changes_roll_back_if_plan_cancellation_cannot_persi
             let result = match operation {
                 0 => w.insert(&r).map(|_| ()),
                 1 => w.put_blob(a.id, Cursor::new(bytes())).map(|_| ()),
+                3 => w.receive_record(&r).map(|_| ()),
                 _ => w
                     .stage_blob(a.id, Cursor::new(bytes()), 1, TemporaryLimits::default())
                     .map(|_| ()),
@@ -348,6 +395,8 @@ fn record_and_both_retention_changes_roll_back_if_plan_cancellation_cannot_persi
             assert!(result.is_err());
             assert_eq!(w.store.generation().unwrap(), g);
             assert!(w.store.record(r.id()).unwrap().is_none());
+            assert_eq!(count(&w.store, "record_receipts"), 0);
+            assert_eq!(count(&w.store, "quarantine_records"), 0);
             assert_eq!(count(&w.store, "manual_blob_holds"), 0);
             assert_eq!(count(&w.store, "temporary_blob_holds"), 1);
             assert_eq!(w.store.blob_cleanup_plans(1).unwrap(), vec![p]);

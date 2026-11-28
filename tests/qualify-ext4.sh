@@ -36,6 +36,9 @@ findmnt --target "$area" --output SOURCE,FSTYPE,OPTIONS,SIZE
 cargo test --locked --offline --lib storage::filesystem_tests:: -- --ignored --test-threads=1 --nocapture
 # SQL拒否/FULLとprocess killはENOSPCと分けて、同じ隔離ext4上で再実行する。
 cargo test --locked --offline --lib storage::tests:: -- --test-threads=1
+cargo test --locked --offline --lib storage::cleanup::execution::tests::outstanding_plan_cannot_remove_a_preexisting_quarantine_reference -- --exact --test-threads=1
+cargo test --locked --offline --lib storage::cleanup::tests::quarantined_reference_protects_before_and_after_blob_arrival -- --exact --test-threads=1
+cargo test --locked --offline --lib storage::cleanup::tests::record_and_both_retention_changes_roll_back_if_plan_cancellation_cannot_persist -- --exact --test-threads=1
 cargo test --locked --offline --lib storage::receipt::tests:: -- --test-threads=1
 cargo test --locked --offline --lib storage::blobs::tests::file_io_fault_points_never_create_durable_success -- --exact --test-threads=1
 cargo test --locked --offline --lib storage::blobs::tests::process_kill_between_placement_and_database_commit -- --exact --test-threads=1

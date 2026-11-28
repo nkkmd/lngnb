@@ -59,6 +59,38 @@ fn recover(s: &mut RecordStore, r: &CleanupExecution, p: &BlobCleanupPlan) -> Cl
     .unwrap()
 }
 #[test]
+fn outstanding_plan_cannot_remove_a_preexisting_quarantine_reference() {
+    let t = Temp::new();
+    let (mut w, plan) = setup(&t);
+    // schema 25の従来の受付で、整理予定に取消記録がない配置を再現する。
+    let record = rev(&[], 14, "private reference");
+    let tx = w.store.conn.transaction().unwrap();
+    tx.execute(
+        "INSERT INTO quarantine_records VALUES(?1,?2)",
+        params![record.id().bytes, record.bytes()],
+    )
+    .unwrap();
+    tx.execute(
+        "INSERT INTO record_receipts VALUES(randomblob(32),randomblob(32),?1,unixepoch())",
+        [record.id().bytes],
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    w.finish().unwrap();
+    let mut w = reopen(&t).begin().unwrap();
+    assert!(matches!(
+        w.execute_at(
+            plan.plan_id,
+            CleanupBudget::default(),
+            plan.planned_at,
+            |_, _| Ok(())
+        ),
+        Err(StorageError::ProtectionChanged)
+    ));
+    assert_eq!(std::fs::read(path(&t)).unwrap(), bytes());
+    assert_eq!(count(&w.store, "blob_cleanup_runs"), 0);
+}
+#[test]
 fn expired_unreferenced_blob_is_removed_but_objects_promises_and_history_remain() {
     let t = Temp::new();
     let (mut w, p) = setup(&t);

@@ -152,15 +152,18 @@ pub(super) fn collect(
     let mut rows = BTreeMap::new();
     let mut inputs = BTreeMap::new();
     // 派生要約を使わず、一次Recordから全参照を再構成する。
-    let mut stmt = conn.prepare("SELECT id,length(bytes) FROM records ORDER BY id")?;
+    let mut stmt =
+        conn.prepare("SELECT scan_key,size FROM stored_record_sizes ORDER BY scan_key")?;
     let mut query = stmt.query([])?;
     let mut bytes = 0u64;
+    let mut copies = 0u64;
     while let Some(row) = query.next()? {
         check()?;
-        if inputs.len() as u64 >= budget.records {
+        if copies >= budget.records {
             return Err(StorageError::BudgetExceeded);
         }
-        let id = key(row.get(0)?)?;
+        copies += 1;
+        let scan_key: Vec<u8> = row.get(0)?;
         let n: i64 = row.get(1)?;
         if !(1..=MAX_RECORD as i64).contains(&n) {
             return Err(StorageError::Corrupt);
@@ -171,17 +174,18 @@ pub(super) fn collect(
         if bytes > budget.record_bytes {
             return Err(StorageError::BudgetExceeded);
         }
-        let raw: Vec<u8> =
-            conn.query_row("SELECT bytes FROM records WHERE id=?1", [&id], |r| r.get(0))?;
-        let record =
-            LocalRecord::check(&raw, Some(record_id(id))).map_err(|_| StorageError::Corrupt)?;
+        let record = RecordStore::checked_stored_record(conn, &scan_key)?;
         let payload = record.payload().map_err(|_| StorageError::Corrupt)?;
         if let Some((blob, _)) = payload {
-            entry(&mut rows, blob, budget.targets)?
-                .referencing_records
-                .push(record_id(id));
+            let refs = &mut entry(&mut rows, blob, budget.targets)?.referencing_records;
+            // scan_key順では、同じIDの通常コピーと隔離コピーは隣接する。
+            if refs.last() != Some(&record.id()) {
+                refs.push(record.id());
+            }
         }
-        inputs.insert(id, payload);
+        if scan_key.len() == 32 {
+            inputs.insert(record.id().bytes, payload);
+        }
     }
     drop(query);
     drop(stmt);
