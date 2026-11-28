@@ -329,7 +329,7 @@ impl RecordInspection {
                     }
                     break;
                 }
-                self.store.check_stored_record(&key)?;
+                RecordStore::checked_stored_record(&self.store.conn, &key)?;
                 n += 1;
                 total += length as u64;
                 new.cursor = Some(key);

@@ -86,6 +86,14 @@ impl RecordWriter {
             }
             let tx = self.store.conn.transaction()?;
             credentials.persist(&tx, record, max_bytes, max_receipts)?;
+            if let Some((blob, _)) = record.payload().map_err(|_| StorageError::Corrupt)? {
+                cleanup::cancel(
+                    &tx,
+                    &blob,
+                    "record_reference",
+                    self.store.limits.sql_inspection,
+                )?;
+            }
             tx.commit()?;
             Ok(())
         })();
