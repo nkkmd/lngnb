@@ -1254,6 +1254,9 @@ mod tests {
         );
         let pending = rev(&[], 14, "received privately");
         writer.receive_record(&pending).unwrap();
+        writer
+            .adopt_quarantine_record(pending.id(), 256 * 1024 * 1024)
+            .unwrap();
         for scope in [public, untrusted] {
             assert!(
                 !writer
