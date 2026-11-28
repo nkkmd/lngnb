@@ -16,7 +16,7 @@ use std::{
 };
 
 pub const IMPLEMENTATION: &str = "lngnb-rust-sqlite-1";
-pub const SCHEMA_VERSION: i64 = 26;
+pub const SCHEMA_VERSION: i64 = 27;
 const DB: &str = "database.sqlite";
 const SCHEMA: &str = "
 CREATE TABLE storage_state (
@@ -51,8 +51,12 @@ CREATE TABLE quarantine_records (
  payload_id BLOB CHECK(payload_id IS NULL OR length(payload_id)=32),
  declared_length INTEGER CHECK(declared_length IS NULL OR declared_length>=0),
  adopted INTEGER NOT NULL DEFAULT 0 CHECK(adopted IN (0,1)),
+ managed_genesis BLOB REFERENCES records(id) CHECK(managed_genesis IS NULL OR (adopted=1 AND payload_id IS NOT NULL)),
+ managed_generation INTEGER REFERENCES history(generation),
+ CHECK((managed_generation IS NULL)=(managed_genesis IS NULL)),
  CHECK((payload_id IS NULL)=(declared_length IS NULL))
 ) STRICT;
+CREATE INDEX managed_quarantine_payload ON quarantine_records(managed_genesis,payload_id) WHERE managed_genesis IS NOT NULL;
 CREATE INDEX quarantine_payload ON quarantine_records(payload_id) WHERE payload_id IS NOT NULL;
 -- 同一IDが両領域にあっても、分割起動検査では各コピーを別々に検査する。
 CREATE INDEX quarantine_inspection_key ON quarantine_records(CAST(id || x'01' AS BLOB));
@@ -131,7 +135,8 @@ CREATE TRIGGER temporary_no_update BEFORE UPDATE ON temporary_blob_holds BEGIN S
 CREATE VIEW quarantine_blob_usage AS
  SELECT b.id,b.byte_length FROM blobs b WHERE b.id IN (
  SELECT blob_id FROM temporary_blob_holds
- UNION SELECT q.payload_id FROM quarantine_records q WHERE q.adopted=1 AND q.payload_id IS NOT NULL
+ EXCEPT SELECT payload_id FROM quarantine_records WHERE managed_genesis IS NOT NULL
+ UNION SELECT q.payload_id FROM quarantine_records q WHERE q.adopted=1 AND q.payload_id IS NOT NULL AND q.managed_genesis IS NULL
  AND NOT EXISTS(SELECT 1 FROM manual_blob_holds m WHERE m.blob_id=q.payload_id));
 CREATE TRIGGER temporary_no_delete BEFORE DELETE ON temporary_blob_holds BEGIN SELECT RAISE(ABORT,'temporary_cleanup_unimplemented'); END;
 CREATE TRIGGER blob_invalidates_inspection AFTER INSERT ON blobs BEGIN
@@ -345,6 +350,7 @@ CREATE TABLE pin_changes (
  new_genesis BLOB REFERENCES records(id),
  CHECK(old_genesis IS NOT new_genesis)
 ) STRICT;
+CREATE INDEX pin_by_genesis ON pin_changes(new_genesis,generation) WHERE new_genesis IS NOT NULL;
 CREATE INDEX history_pin_by_knowledge ON history(target,generation)
  WHERE new_state='pin_saved_local_only';
 CREATE TRIGGER pin_changes_no_update BEFORE UPDATE ON pin_changes
@@ -635,6 +641,7 @@ fn check_format(conn: &Connection, budget: SqlInspectionBudget) -> Result<()> {
         "admin_config_saved_local_only",
         "publication_saved_local_only",
         "pin_saved_local_only",
+        "payload_managed_local_only",
         "stored_local_only",
         "blob_retained_local_only",
         "blob_staged_local_only",
@@ -1193,5 +1200,6 @@ pub use publication::{
 
 mod pin;
 
+mod managed_payload;
 mod receipt;
 pub use receipt::{QuarantinePayload, RecordReceipt};
