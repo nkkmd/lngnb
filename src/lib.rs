@@ -15,6 +15,7 @@ pub mod secret_terminal;
 pub mod server_tls;
 #[cfg(target_os = "linux")]
 pub mod storage;
+pub mod submission_token;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
