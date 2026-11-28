@@ -117,6 +117,12 @@ impl RecordWriter {
             {
                 return Err(StorageError::Corrupt);
             }
+            if let Some(old) = previous {
+                tx.execute(
+                    "UPDATE quarantine_records SET managed_genesis=NULL,managed_generation=NULL WHERE managed_genesis=?1",
+                    [old.bytes],
+                )?;
+            }
             self.store.refresh_disclosures(&tx, Some(knowledge), None)?;
             tx.commit()?;
             Ok(true)

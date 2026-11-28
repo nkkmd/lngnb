@@ -80,7 +80,7 @@ fn temporary_budget_inner(
     limits: TemporaryLimits,
 ) -> Result<()> {
     let (count, size, present): (i64,i64,bool) = conn.query_row(
-        "SELECT (SELECT count(*) FROM temporary_blob_holds),coalesce((SELECT sum(byte_length) FROM quarantine_blob_usage),0),EXISTS(SELECT 1 FROM quarantine_blob_usage WHERE id=?1)",
+        "SELECT (SELECT count(*) FROM temporary_blob_holds),coalesce((SELECT sum(byte_length) FROM quarantine_blob_usage),0),(EXISTS(SELECT 1 FROM quarantine_blob_usage WHERE id=?1) OR EXISTS(SELECT 1 FROM quarantine_records q JOIN blobs b ON b.id=q.payload_id WHERE b.id=?1 AND q.managed_genesis IS NOT NULL))",
         [&id.bytes], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
     if count < 0 || size < 0 {
         return Err(StorageError::Corrupt);
@@ -110,6 +110,20 @@ fn validate_holds_inner(conn: &Connection) -> Result<()> {
             SELECT 1 FROM blobs b
             WHERE NOT EXISTS(SELECT 1 FROM manual_blob_holds m WHERE m.blob_id=b.id)
               AND NOT EXISTS(SELECT 1 FROM temporary_blob_holds t WHERE t.blob_id=b.id)
+        ) OR EXISTS(
+            SELECT 1 FROM quarantine_records q LEFT JOIN history h ON h.generation=q.managed_generation
+            LEFT JOIN blobs b ON b.id=q.payload_id
+            WHERE q.managed_genesis IS NOT NULL AND (b.byte_length IS NOT q.declared_length
+                OR h.target IS NOT q.id OR h.new_state IS NOT 'payload_managed_local_only'
+                OR h.namespace IS NOT (SELECT namespace FROM storage_state WHERE singleton=1)
+                OR h.rules IS NOT 'lngnb-validation-1'
+                OR h.generation>(SELECT generation FROM storage_state WHERE singleton=1)
+                OR NOT EXISTS(SELECT 1 FROM pin_changes p JOIN history ph ON ph.generation=p.generation
+                    WHERE p.new_genesis=q.managed_genesis AND p.generation<h.generation
+                    AND ph.new_state='pin_saved_local_only' AND NOT EXISTS(
+                        SELECT 1 FROM history later WHERE later.target=ph.target
+                        AND later.new_state='pin_saved_local_only' AND later.generation>p.generation))
+                OR h.reason IS NOT 'manage_payload:'||lower(hex(q.managed_genesis))||':'||lower(hex(q.payload_id)))
         ) OR EXISTS(
             SELECT 1 FROM manual_blob_holds m LEFT JOIN blobs b ON b.id=m.blob_id
             WHERE b.id IS NULL

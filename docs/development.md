@@ -46,7 +46,7 @@ cargo build --locked --offline --release
 
 Blobの明示保持・本文参照・既知不正根拠に加え、期限付き内部仮保存の台帳と保護根拠の診断を追加しています。削除予定の記録・保持変更による取消しに加え、未参照・期限終了の本文を再検査して整理し、中断時に明示復旧する内部経路を追加しています。過去の約束と履歴は保全します。HTTP受付票・公開制御・バックアップとの整理結合は未実装です。
 
-schema 26の内部操作では、隔離Recordの受付後に `adopt_quarantine_record` で本文参照を採用できます。既存本文のハッシュ・実長を検査し、指定容量内で採用を確定します。後着した本文は `quarantine_payload` で再照合でき、同じBlobに異なる宣言長があればRevisionごとに結果を返します。`evaluate_quarantined_record` は同じ読取りスナップショットで親依存・発行鍵を再評価します。親不足の状態とpin済みGenesisの発行鍵への一致は別々に確認できます。管理対象への移行・HTTP投稿は後続です。
+schema 27の内部操作では、隔離Recordの受付後に `adopt_quarantine_record` で本文参照を採用できます。既存本文のハッシュ・実長を検査し、指定容量内で採用を確定します。後着した本文は `quarantine_payload` で再照合でき、同じBlobに異なる宣言長があればRevisionごとに結果を返します。`evaluate_quarantined_record` は同じ読取りスナップショットで親依存・発行鍵を再評価します。親不足の状態とpin済みGenesisの発行鍵への一致は別々に確認できます。`promote_quarantine_payload` は現在のpinと署名・本文実体を再照合し、Revisionの参照を管理対象へ移します。既定の管理枠はKnowledge・Genesisごとに1 GiBで、同じ本文を一度だけ計上します。pin変更時には旧Genesisに基づく管理区分を解除します。HTTP投稿は後続です。
 
 ## 鍵管理の内部APIと未接続範囲
 
